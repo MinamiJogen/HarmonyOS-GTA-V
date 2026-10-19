@@ -56,6 +56,10 @@
 
 ## 运行原理
 
+![GTA V 在 HarmonyOS 的运行原理：构建时生成 ARM64 AOT，设备端执行，并连接图形、音频、输入与资源接口](docs/assets/architecture-harmonyos.png)
+
+[查看 SVG 矢量图](docs/assets/architecture-harmonyos.svg)
+
 项目构建时，Wasmtime 将 WebAssembly 程序预编译为 ARM64 AOT 代码，再嵌入 HAP 的原生库并随应用签名；设备启动后执行这些预编译代码，无需在设备上进行 JIT 编译。
 
 ArkTS 界面通过 C++ / Node-API 连接 Rust 运行时。运行时提供文件访问、线程和输入等宿主接口，通过 **wgpu → Vulkan → XComponent / NativeWindow** 呈现画面，通过 **OHAudio** 输出音频，并在设备支持时使用华为 XEngine 空间超分。
