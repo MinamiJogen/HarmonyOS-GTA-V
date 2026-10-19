@@ -1,0 +1,8 @@
+{
+  "name": "entry",
+  "version": "0.8.0",
+  "dependencies": {
+    "libharmony_probe.so": "file:./src/main/cpp/types/libharmony_probe",
+    "libgraphics_frame_surface.so": "file:./src/main/cpp/types/libgraphics_frame_surface"
+  }
+}

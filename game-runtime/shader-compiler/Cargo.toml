@@ -1,0 +1,9 @@
+[package]
+name = "muguet-shader-review"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+naga = { version = "=30.0.1", features = ["wgsl-in", "spv-out"] }
+regex = "1"
+serde_json = "1"
+[workspace]

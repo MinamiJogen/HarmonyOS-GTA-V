@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.16)
+project(muguet_native_diagnostics LANGUAGES CXX)
+
+add_library(muguet_vulkan_probe STATIC src/vulkan_probe.cpp)
+set_target_properties(muguet_vulkan_probe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(muguet_vulkan_probe PUBLIC cxx_std_17)
+target_include_directories(muguet_vulkan_probe PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(muguet_vulkan_probe PUBLIC dl)
+
+add_library(muguet_vulkan_buffer_probe STATIC src/vulkan_buffer_probe.cpp)
+set_target_properties(muguet_vulkan_buffer_probe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(muguet_vulkan_buffer_probe PUBLIC cxx_std_17)
+target_compile_definitions(muguet_vulkan_buffer_probe PRIVATE MUGUET_VULKAN_BUFFER_PROBE_STANDALONE=0)
+target_include_directories(muguet_vulkan_buffer_probe PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(muguet_vulkan_buffer_probe PUBLIC libvulkan.so)
+
+option(MUGUET_BUILD_VULKAN_CLI "Build standalone enumeration CLI" OFF)
+if(MUGUET_BUILD_VULKAN_CLI)
+  add_executable(muguet-vulkan-probe src/vulkan_probe.cpp)
+  target_compile_definitions(muguet-vulkan-probe PRIVATE MUGUET_VULKAN_PROBE_STANDALONE=1)
+  target_compile_features(muguet-vulkan-probe PRIVATE cxx_std_17)
+  target_link_libraries(muguet-vulkan-probe PRIVATE dl)
+endif()

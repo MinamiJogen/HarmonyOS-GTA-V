@@ -1,0 +1,11 @@
+[package]
+name = "muguet-ohos-aot-compiler"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+anyhow = "1"
+wasmtime = { version = "=49.0.0", default-features = false, features = ["std", "runtime", "threads", "anyhow", "cranelift"] }
+wasmparser = "=0.258.3"
+wasm-encoder = { version = "=0.258.3", features = ["wasmparser"] }
+
+[workspace]

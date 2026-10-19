@@ -1,0 +1,5 @@
+{
+  "name": "libgraphics_frame_surface.so",
+  "version": "1.0.0",
+  "types": "./Index.d.ts"
+}

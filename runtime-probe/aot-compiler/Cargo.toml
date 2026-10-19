@@ -1,0 +1,6 @@
+[package]
+name = "probe-aot-compiler"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+wasmtime = { version = "=49.0.0", default-features = false, features = ["std", "runtime", "threads", "anyhow", "cranelift", "wat"] }

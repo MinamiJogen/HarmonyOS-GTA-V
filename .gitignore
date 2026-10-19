@@ -1,0 +1,83 @@
+# Local editor and build state.
+.DS_Store
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.deveco/
+.hvigor/
+.cxx/
+node_modules/
+oh_modules/
+target/
+build/
+logs/
+artifacts/
+/dist/
+/native-diagnostics/bin/
+
+# Toolchains and local upstream reference checkouts are not project sources.
+/.tools/
+/runtime-probe/.toolchain/
+/upstream/muguet/
+/upstream/*.bundle
+
+# Keep signing material and machine-specific settings private.
+.signing/
+*.p12
+*.p7b
+*.cer
+*.pem
+*.key
+*.keystore
+*.jks
+.env
+.env.*
+build-profile.local.json5
+local.properties
+*.pfx
+*.mobileprovision
+*.entitlements.local
+
+# Local assistant sessions and design prompts are not project source.
+/.codex/
+/.agents/
+/.ai-work/
+/.local-prompts/
+/docs/assets/*-prompt.txt
+
+# Editor swap files, scratch files and temporary backups.
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+*.bak
+*.backup
+*.bundle
+*.log
+*.dmp
+
+# Game content and all game-derived build products stay local.
+/playgta5-offline.zip
+*.zip
+*.tar
+*.tar.gz
+*.7z
+/resources/
+*.wasm
+*.cwasm
+*.rpf
+*.hap
+*.app
+*.hsp
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Device captures can contain game assets, shader dumps and private metadata.
+evidence/
+/releases/
+/native-diagnostics/isolated-driver-snapshot/feasibility-report.json

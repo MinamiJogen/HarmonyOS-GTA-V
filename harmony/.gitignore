@@ -1,0 +1,12 @@
+/.hvigor/
+/node_modules/
+/oh_modules/
+/entry/oh_modules/
+/entry/build/
+/build/
+/local.properties
+/build-profile.local.json5
+/.signing/
+/.cxx/
+/entry/.cxx/
+/.idea/

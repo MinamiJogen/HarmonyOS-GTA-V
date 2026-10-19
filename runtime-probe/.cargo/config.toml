@@ -1,0 +1,9 @@
+# Same crates.io content; Cargo verifies the registry checksums in Cargo.lock.
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[http]
+timeout = 60
+[net]
+retry = 2

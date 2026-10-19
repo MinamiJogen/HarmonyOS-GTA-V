@@ -1,0 +1,23 @@
+[package]
+name = "harmony-runtime-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+wasmtime-runtime = ["dep:wasmtime"]
+
+[dependencies]
+wasmtime = { version = "=49.0.0", optional = true, default-features = false, features = ["std", "runtime", "threads", "anyhow"] }
+
+[workspace]
+members = ["aot-compiler"]
+default-members = ["."]
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = "thin"

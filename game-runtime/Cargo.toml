@@ -1,0 +1,36 @@
+[package]
+name = "muguet-game-runtime"
+version = "0.8.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+autobins = false
+[lib]
+crate-type = ["staticlib", "rlib"]
+[dependencies]
+rustc-hash = "2"
+wasmtime = { version = "=49.0.0", default-features = false, features = ["std", "runtime", "threads", "anyhow"] }
+anyhow = "1"
+libc = "0.2"
+serde_json = "1"
+sha2 = "=0.10.9"
+ash = { version = "=0.38.0", default-features = false }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
+pollster = "1"
+regex = "1"
+bcdec_rs = "0.2"
+raw-window-handle = "0.6.2"
+audiopus_sys = { version = "0.2", features = ["static"] }
+[features]
+default = []
+jit = []
+[workspace]
+exclude = ["aot-compiler"]
+default-members = ["."]
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+[patch.crates-io]
+wgpu-core = { path = "vendor/wgpu-core" }
+wgpu-hal = { path = "vendor/wgpu-hal" }

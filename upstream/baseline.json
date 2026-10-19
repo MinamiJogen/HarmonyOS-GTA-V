@@ -1,0 +1,17 @@
+{
+  "captured_at": "2026-10-17T06:55:49.101647+00:00",
+  "source_url": "https://github.com/c22dev/muguet",
+  "commit": "1a0300d3cfc5f87ce2fa1ccb365c013e5238e322",
+  "git_bundle": "upstream/muguet-1a0300d.bundle",
+  "key_file_sha256": {
+    "Cargo.toml": "10a1f5e6ebaace1f7ccc8041ae4b8e9596b87394511e3ae2126c0a6e9001e201",
+    "Cargo.lock": "d230a5811825eef81fff08c3add267545e86efc5a617ce18085d235511cd9d37",
+    "src/main.rs": "c879c4b67740c4e28a04f18eea206c499a082c4eb144b57fb818d5c47bedd8cc",
+    "src/patch.rs": "53e76feca0451aa3ab09c13690a3c513df64fc927e320b03213347b85e0a7702",
+    "ios/Launcher.swift": "eab1f2a327f2a6dd06f2841f795db9123193861bfcdea05005052c08538ffee1",
+    "src/import.rs": "fba72cd0a33a0ce51f7fe1103bc66d779f52865eacc7d4b8e420c699acbcb4b1",
+    "vendor/wgpu-core/Cargo.toml": "06c74b9cbe9c068faa052df17b4adb32f441eab530d88128e9a0bfa49082bb54",
+    "vendor/winit/Cargo.toml": "c9e4dc9350bc65d2ed848532ef82facb73f70a3693b8b662520658545bedfe76"
+  },
+  "scope": "Source snapshot only. No game assets or game runtime validation."
+}
