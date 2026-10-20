@@ -18,14 +18,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 fn manifest_files() -> Vec<(String, u64)> {
-    let text = std::fs::read_to_string(data_dir().join("manifest.json")).expect("manifest.json");
-    let v: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
-    v["files"]
-        .as_array()
-        .expect("files")
-        .iter()
-        .map(|f| (f[0].as_str().unwrap_or("").to_string(), f[1].as_u64().unwrap_or(0)))
-        .collect()
+    crate::resource_view::files().to_vec()
 }
 
 fn atomic_i32(mem: &SharedMemory, addr: u64) -> &AtomicI32 {
@@ -79,6 +72,25 @@ fn serve_loop(mem: SharedMemory, table: u64) {
                         0
                     } else {
                         len = len.min(size - off);
+
+                        // The manifest and derived frontend come from the same
+                        // immutable view, including for arbitrary partial reads.
+                        if let Some(bytes) = crate::resource_view::overridden(path) {
+                            let (base, mlen) = mem_base_len(&mem);
+                            let result = crate::host_memory::span(mlen, dst, len, 1, "io.frontend_destination")
+                                .and_then(|destination| usize::try_from(off).ok().and_then(|start| {
+                                    start.checked_add(destination.len()).and_then(|end| bytes.get(start..end))
+                                        .map(|source| {
+                                            crate::heapcheck::note(dst, len, "derived frontend read");
+                                            unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), base.add(destination.start), source.len()); }
+                                            source.len() as i32
+                                        })
+                                })).unwrap_or(-1);
+                            atomic_i32(&mem, w + 28).store(result, Ordering::SeqCst);
+                            atomic_i32(&mem, w).store(2, Ordering::SeqCst);
+                            let _ = mem.atomic_notify(w, 1);
+                            continue;
+                        }
 
                         if !handles.contains_key(&id) {
                             if handles.len() >= MAX_OPEN { handles.clear(); }

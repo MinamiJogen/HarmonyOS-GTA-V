@@ -2,10 +2,12 @@
 // Constantin Clerc (c22dev) - 0.1
 
 use crate::RT;
-use std::collections::HashSet;
+#[path = "input_ownership.rs"]
+mod ownership;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+static GUEST_SCRIPT_TICK: AtomicU64 = AtomicU64::new(0);
 static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
 static BLOCK: AtomicU64 = AtomicU64::new(0);
 // Status-only observation of the last mapped-key write attempt.
@@ -13,7 +15,8 @@ static LAST_KEY_BASE_VALID: AtomicI32 = AtomicI32::new(-1);
 static LAST_KEY_VK: AtomicI32 = AtomicI32::new(-1);
 static LAST_KEY_PRESSED: AtomicBool = AtomicBool::new(false);
 static SIZE: Mutex<(i32, i32)> = Mutex::new((1280, 720));
-static HELD: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static HELD: LazyLock<Mutex<ownership::Keys>> = LazyLock::new(|| Mutex::new(ownership::Keys::default()));
+static BUTTON_OWNERS: LazyLock<Mutex<ownership::Buttons>> = LazyLock::new(|| Mutex::new(ownership::Buttons::default()));
 
 const MX: u64 = 0;
 const MY: u64 = 1;
@@ -111,8 +114,9 @@ pub fn set_locked(locked: bool) {
     POINTER_LOCKED.store(locked, Ordering::Relaxed);
     if let Some(l) = word(LOCKED) { l.store(locked as i32, Ordering::SeqCst); }
 }
-fn release_all() {
+pub fn release_all() {
     HELD.lock().unwrap().clear();
+    BUTTON_OWNERS.lock().unwrap().clear();
     for i in 0..=255u8 { if let Some(k) = key_byte(i) { k.store(0, Ordering::SeqCst); } }
     if let Some(b) = word(BTN) { b.store(0, Ordering::SeqCst); }
     for i in [DX, DY, DZ] { if let Some(w) = word(i) { w.store(0, Ordering::SeqCst); } }
@@ -170,29 +174,18 @@ fn start_menu_key(code: &str) {
     }
 }
 
-pub fn key(winit_name: &str, pressed: bool, repeat: bool, text: Option<&str>, ctrl_or_cmd: bool) {
+pub fn key(winit_name: &str, pressed: bool, repeat: bool, text: Option<&str>, ctrl_or_cmd: bool) -> bool {
     let code = dom_code(winit_name);
-    if pressed && !repeat { start_menu_key(code); }
-
-    let v = vk(code);
-    if let Some(v) = v {
-        LAST_KEY_VK.store(v as i32, Ordering::Relaxed);
-        LAST_KEY_PRESSED.store(pressed, Ordering::Relaxed);
-        if let Some(k) = key_byte(v) {
-            k.store(if pressed { 0x80 } else { 0 }, Ordering::SeqCst);
-            LAST_KEY_BASE_VALID.store(1, Ordering::Relaxed);
-        } else { LAST_KEY_BASE_VALID.store(0, Ordering::Relaxed); }
-    }
     {
         let mut held = HELD.lock().unwrap();
-        if pressed { held.insert(code.to_string()); } else { held.remove(code); }
+        if !held.legacy(code, pressed) {return false;}
+        write_held_key(code, held.contains(code));
         for (src, target) in FLY_ALIAS {
-            let down = held.contains(src) || held.contains(target);
-            if let Some(k) = vk(target).and_then(key_byte) { k.store(if down { 0x80 } else { 0 }, Ordering::SeqCst); }
+            write_held_key(target, held.legacy_contains(src) || held.contains(target));
         }
     }
-    if !pressed { return; }
-    let _ = repeat;
+    if !pressed { return true; }
+    if !repeat {start_menu_key(code);}
     let ch: Option<u16> = match text {
         Some(t) if t.chars().count() == 1 && !ctrl_or_cmd && !t.chars().next().unwrap().is_control() => t.encode_utf16().next(),
         _ if code == "Enter" => Some(13),
@@ -200,7 +193,20 @@ pub fn key(winit_name: &str, pressed: bool, repeat: bool, text: Option<&str>, ct
         _ if code == "Space" && !ctrl_or_cmd => Some(32),
         _ => None,
     };
-    if let (Some(ch), Some(head), Some(tail), Some(b)) = (ch, word(HEAD), word(TAIL), base()) {
+    if let Some(ch) = ch { queue_character(ch); }
+    true
+}
+
+fn write_held_key(code: &str, pressed: bool) {
+    if let Some(v) = vk(code) {
+        LAST_KEY_VK.store(v as i32, Ordering::Relaxed); LAST_KEY_PRESSED.store(pressed, Ordering::Relaxed);
+        if let Some(k) = key_byte(v) {
+            k.store(if pressed { 0x80 } else { 0 }, Ordering::SeqCst); LAST_KEY_BASE_VALID.store(1, Ordering::Relaxed);
+        } else { LAST_KEY_BASE_VALID.store(0, Ordering::Relaxed); }
+    }
+}
+fn queue_character(ch: u16) {
+    if let (Some(head), Some(tail), Some(b)) = (word(HEAD), word(TAIL), base()) {
         let h = head.load(Ordering::SeqCst);
         if (h.wrapping_sub(tail.load(Ordering::SeqCst)) as u32) < 64 {
             unsafe { std::ptr::write_volatile(b.add(296 + 2 * (h & 63) as usize) as *mut u16, ch) };
@@ -208,12 +214,43 @@ pub fn key(winit_name: &str, pressed: bool, repeat: bool, text: Option<&str>, ct
         }
     }
 }
+/// Literal guest keyboard: no startup choices, host shortcuts, aliases or MP commands.
+/// The character queue is a separate single-ASCII path; named key identity remains intact.
+pub fn raw_key(code: &str, pressed: bool, source: &str) -> bool {
+    if vk(code).is_none() || source.is_empty() || source.len() > 128 { return false; }
+    let mut held = HELD.lock().unwrap();
+    let was_down = held.raw_event(code, pressed, source, GUEST_SCRIPT_TICK.load(Ordering::Relaxed));
+    let aliased = FLY_ALIAS.iter().any(|(src, target)| *target == code && held.legacy_contains(src));
+    write_held_key(code, held.contains(code) || aliased);
+    if pressed && !was_down { if let Some(ch) = held.ascii(code) { queue_character(ch); } }
+    true
+}
 
-pub fn button(dom_button: usize, pressed: bool) {
-    let Some(bit_index) = [0, 2, 1, 3, 4].get(dom_button).copied() else {return;};
-    let bit = 1 << bit_index;
-    if let Some(b) = word(BTN) {
-        if pressed { b.fetch_or(bit, Ordering::SeqCst); } else { b.fetch_and(!bit, Ordering::SeqCst); }
+/// Called once at the selected script safe point, independently of pad ACTIVE.
+pub fn guest_script_tick() {
+    let tick=GUEST_SCRIPT_TICK.fetch_add(1,Ordering::Relaxed).wrapping_add(1);
+    let mut held=HELD.lock().unwrap();
+    for code in held.guest_tick(tick) {
+        let aliased=FLY_ALIAS.iter().any(|(src,target)| *target==code && held.legacy_contains(src));
+        write_held_key(&code,held.contains(&code)||aliased);
+    }
+    drop(held);
+    let mut buttons=BUTTON_OWNERS.lock().unwrap();buttons.guest_tick(tick);write_buttons(&buttons);
+}
+
+pub fn button(dom_button: usize, pressed: bool) { button_source(dom_button, pressed, "legacy"); }
+pub fn button_source(dom_button: usize, pressed: bool, source: &str) {
+    if dom_button>4 {return;}
+    if source.is_empty() || source.len() > 128 { return; }
+    let mut owners = BUTTON_OWNERS.lock().unwrap();
+    owners.event(dom_button,pressed,source,GUEST_SCRIPT_TICK.load(Ordering::Relaxed));
+    write_buttons(&owners);
+}
+fn write_buttons(owners:&ownership::Buttons) {
+    if let Some(word)=word(BTN) {
+        let mut bits=0;
+        for (button,bit) in [0,2,1,3,4].into_iter().enumerate() {if owners.down(button) {bits|=1<<bit;}}
+        word.store(bits,Ordering::SeqCst);
     }
 }
 

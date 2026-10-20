@@ -45,6 +45,8 @@ mod audio {
 static STOP: AtomicBool = AtomicBool::new(false);
 static STAGE: Mutex<String> = Mutex::new(String::new());
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
+// Input clearing is outside this lifecycle-only harness.
+fn mg_game_release_inputs() {}
 fn set_stage(stage: &str) { *STAGE.lock().unwrap() = stage.into(); }
 fn fresh_lifecycle() {
     STOP.store(false, Ordering::Release);

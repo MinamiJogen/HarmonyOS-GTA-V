@@ -99,6 +99,7 @@ fn publish_app_lifecycle(state: app_lifecycle::State) {
 }
 #[no_mangle]
 pub extern "C" fn mg_game_app_foreground(foreground: bool) {
+    if !foreground {mg_game_release_inputs();}
     let mut state = APP_LIFECYCLE.lock().unwrap();
     if state.foreground(foreground) {
         publish_app_lifecycle(*state);
@@ -108,6 +109,7 @@ pub extern "C" fn mg_game_app_foreground(foreground: bool) {
 }
 #[no_mangle]
 pub extern "C" fn mg_game_surface_lost() {
+    mg_game_release_inputs();
     let mut state = APP_LIFECYCLE.lock().unwrap();
     state.lose_surface(); publish_app_lifecycle(*state);
     // Preserve the guest in memory. A replacement wgpu Surface is not attached
@@ -645,21 +647,50 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     SESSION_RESTART_STATE.lock().unwrap().cancel_active();
     let mut state = APP_LIFECYCLE.lock().unwrap();
     STOP.store(true,Ordering::Release);state.stop();publish_app_lifecycle(*state);drop(state);
-    crate::input::set_focus(false);crate::mp::shutdown();set_stage("stop-requested");
+    mg_game_release_inputs();crate::input::set_focus(false);crate::mp::shutdown();set_stage("stop-requested");
 }
-#[no_mangle] pub unsafe extern "C" fn mg_game_key_name(name:*const c_char,pressed:bool){if let Ok(name)=string(name){crate::input::key(&name,pressed,false,None,false);if pressed{crate::mp::key_pressed(&name);}INPUTS.fetch_add(1,Ordering::Relaxed);}}
+#[no_mangle] pub unsafe extern "C" fn mg_game_key_name(name:*const c_char,pressed:bool){if let Ok(name)=string(name){let accepted=crate::input::key(&name,pressed,false,None,false);if pressed&&accepted{crate::mp::key_pressed(&name);}INPUTS.fetch_add(1,Ordering::Relaxed);}}
+#[no_mangle] pub unsafe extern "C" fn mg_game_raw_key(name:*const c_char,pressed:bool,source:*const c_char)->bool {
+    let (Ok(name),Ok(source))=(string(name),string(source)) else {return false};
+    let accepted=crate::input::raw_key(&name,pressed,&source);
+    if accepted {INPUTS.fetch_add(1,Ordering::Relaxed);} accepted
+}
+#[no_mangle] pub unsafe extern "C" fn mg_game_mouse_button_source(button:u32,pressed:bool,source:*const c_char) {
+    if let Ok(source)=string(source) {crate::input::button_source(button as usize,pressed,&source);INPUTS.fetch_add(1,Ordering::Relaxed);}
+}
+#[no_mangle] pub unsafe extern "C" fn mg_game_named_control(name:*const c_char,value:f32,group:i32)->bool {
+    let Ok(name)=string(name) else {return false};
+    let accepted=crate::touch_controls::send(&name,value,group);
+    if accepted {INPUTS.fetch_add(1,Ordering::Relaxed);} accepted
+}
+#[no_mangle] pub extern "C" fn mg_game_release_semantic_inputs() {
+    crate::touch_controls::release();
+}
+#[no_mangle] pub extern "C" fn mg_game_release_inputs() {
+    TOUCHES.lock().unwrap().clear(); crate::pad::release_all();
+    crate::pad::HORN_TOUCH.store(false,Ordering::Relaxed);
+    crate::pad::INJECT.lock().unwrap().clear();
+    *crate::pad::RADIO_WHEEL.lock().unwrap()=None; crate::pad::REQUESTS.lock().unwrap().clear();
+    crate::touch_controls::release(); crate::input::release_all();
+}
+#[no_mangle] pub extern "C" fn mg_game_touch_state_json()->*const c_char {
+    thread_local! {static TOUCH_STATUS:std::cell::RefCell<CString>=std::cell::RefCell::new(CString::new("{}").unwrap());}
+    let json=crate::touch_state::snapshot().to_string();
+    TOUCH_STATUS.with(|slot|{*slot.borrow_mut()=CString::new(json).unwrap();slot.borrow().as_ptr()})
+}
 #[no_mangle] pub extern "C" fn mg_game_key(code:u32,pressed:bool){mg_game_key_event(code,pressed,0,false);}
 #[no_mangle] pub extern "C" fn mg_game_key_event(code:u32,pressed:bool,unicode:u32,suppress_text:bool)->bool {
     let Some(name)=harmony_keys::key_name(code) else { return false; };
     let repeat=pressed && crate::input::is_held(&name);
     let text=char::from_u32(unicode).filter(|c| c.is_ascii_graphic() || *c==' ').map(|c|c.to_string());
-    crate::input::key(&name,pressed,repeat,text.as_deref(),suppress_text);
-    if pressed && !repeat {crate::mp::key_pressed(&name);}
+    let accepted=crate::input::key(&name,pressed,repeat,text.as_deref(),suppress_text);
+    if accepted && pressed && !repeat {crate::mp::key_pressed(&name);}
     INPUTS.fetch_add(1,Ordering::Relaxed);
     true
 }
 #[no_mangle] pub extern "C" fn mg_game_focus(focused:bool) {
     TOUCHES.lock().unwrap().clear();
+    if !focused {mg_game_release_inputs();}
     crate::input::set_focus(focused);
     crate::input::set_locked(focused);
     INPUTS.fetch_add(1,Ordering::Relaxed);
@@ -707,6 +738,7 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     let gameplay_observed = WORLD_PLAYER_OBSERVED.load(Ordering::Acquire);
     let mut value=serde_json::json!({"stage":STAGE.lock().unwrap().clone(),"error":ERROR.lock().unwrap().clone(),"started":STARTED.load(Ordering::Relaxed),"stopRequested":stop_requested(),"presents":crate::gpu::PRESENTS.load(Ordering::Relaxed),"guestPresents":crate::gpu::GUEST_PRESENTS.load(Ordering::Relaxed),"gpuStarted":crate::gpu::STARTED.load(Ordering::Relaxed),"renderSize":crate::input::size(),"inputEvents":INPUTS.load(Ordering::Relaxed),"inputHealth":input_health,"rssMB":crate::footprint_mb(),"heapVirtualMB":crate::RT.get().map(|rt|rt.mem.data_size()>>20),"heapResidentMB":crate::heap_resident_mb(),"gameHostCalls":crate::RT.get().map(|rt|rt.counts.iter().map(|c|c.load(Ordering::Relaxed)).sum::<u64>()),"target":"aarch64-unknown-linux-ohos","source":"muguet-1a0300d"});
     value["worldPlayerObserved"] = gameplay_observed.into();
+    value["touchControlTransport"] = crate::touch_controls::health_json();
     {
         let lifecycle = *APP_LIFECYCLE.lock().unwrap();
         value["appForeground"] = lifecycle.foreground.into();

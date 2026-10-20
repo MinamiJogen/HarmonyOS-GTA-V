@@ -137,7 +137,9 @@ export default class EntryAbility extends UIAbility {
     const requestLayout: () => Promise<void> = async (): Promise<void> => {
       try {
         const result: window.OrientationResult =
-          await mainWindow.setPreferredOrientationWithResult(window.Orientation.LANDSCAPE);
+          // Keep both landscape orientations available to the sensor, including
+          // a 180-degree turn while the system rotation switch is locked.
+          await mainWindow.setPreferredOrientationWithResult(window.Orientation.AUTO_ROTATION_LANDSCAPE);
         orientationResult = result.executionResult;
         hilog.info(0x4100, 'HarmonyGame', 'STARTUP_ORIENTATION_RESULT %{public}d', orientationResult);
       } catch (error) {
@@ -160,12 +162,6 @@ export default class EntryAbility extends UIAbility {
     requestLayout().catch((error: Error) => {
       hilog.error(0x4100, 'HarmonyGame', 'STARTUP_LAYOUT_SEQUENCE_FAILED %{public}s', String(error));
     });
-  }
-
-  private receiveGamePackage(want: Want): void {
-    if (want.uri && want.action === 'ohos.want.action.viewData' && want.uri.startsWith('file://')) {
-      AppStorage.setOrCreate<string>('gameImportRequestedUri', want.uri);
-    }
   }
 
   private receiveGameSession(want: Want): void {
@@ -204,17 +200,14 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want): void {
     AppStorage.setOrCreate<boolean>('gameAppForeground', false);
-    AppStorage.setOrCreate<string>('gameImportRequestedUri', '');
     AppStorage.setOrCreate<string>('gameSessionRequestedAction', '');
     AppStorage.setOrCreate<string>('gameSessionRequestedSaveId', '');
-    this.receiveGamePackage(want);
     this.receiveGameSession(want);
     registerCrashEvidence(this.context);
     gamePerformanceCreate(this.context);
   }
 
   onNewWant(want: Want): void {
-    this.receiveGamePackage(want);
     this.receiveGameSession(want);
   }
 

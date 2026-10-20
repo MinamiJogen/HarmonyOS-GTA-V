@@ -1,13 +1,17 @@
 # 应用图标来源与导出
 
-当前图标以前景居中的绿色 V 与 FIVE 飘带为主体，背景采用深黑蓝色、白色发光上半圆环和少量淡蓝涟漪。标志、圆环与水面共享蓝白轮廓光，形成统一画面。保留完整方形画布和裁切安全留白。
+当前图标使用用户提供的完整 GTA V 标志：黑色背景上的白色 grand theft auto 字样、绿色 V 与 FIVE 飘带。保留原标志、文字和比例，通过裁去外围空白及方形留白使整幅标志居中；未使用 AI 重绘。
 
-- 原始图：[app-icon-gta5-harmony-source.png](app-icon-gta5-harmony-source.png)，`1254 × 1254`。
-- 预览 PNG：[app-icon-gta5-harmony.png](app-icon-gta5-harmony.png)，`1024 × 1024`。
+- 用户原图：[app-icon-gta5-supplied-source.png](app-icon-gta5-supplied-source.png)，`736 × 414`，保留原文件内容。
+- 居中预览：[app-icon-gta5-centered.png](app-icon-gta5-centered.png)，`512 × 512`。
 - 应用资源：AppScope 与 entry 两处 `app_icon_gta5.png`，均为 `512 × 512`，内容一致。应用、主入口、独立诊断入口和启动窗口均引用 `$media:app_icon_gta5`。
 
-使用 Lanczos3 从原始图重采样导出预览和应用资源，全部为不透明 RGB PNG。图标仅含原标志的 V 和 FIVE，背景仅留少量短蓝色涟漪。
+导出过程采用确定性的本地图像处理。原图标志内容的边界为 `x=205…531、y=42…329`，中心约为 `(368, 185.5)`。先将原图置于 `736 × 736` 的黑色方形画布中央，原图纵向偏移 `161` 像素；再从该方形画布的 `(x=144, y=122)` 处裁出 `448 × 448` 区域。裁后保留完整标志，左、右各留约 `61` 像素，上、下分别留约 `81`、`80` 像素。最后使用 macOS `sips` 重采样为 `512 × 512` PNG，将同一导出结果用于预览和两处应用资源。
+
+方形画布保留黑色背景，不预先烘焙圆角；桌面最终外形由系统图标遮罩决定。完整标志应在系统裁切后保持居中，实际显示效果需在设备桌面检查。
 
 两处应用资源应保持 SHA-256 一致。公开壳包构建脚本会核对 HAP 内图标与两处源码资源逐字节一致；构建和包校验不代表设备安装验证。
+
+旧版图像 `app-icon-gta5-harmony-source.png` 和 `app-icon-gta5-harmony.png` 保留归档，不再作为当前应用图标来源。
 
 GTA V、HarmonyOS 及相关标志的版权、商标权仍归原权利人；此图标不代表 Rockstar Games、Take-Two 或华为的官方授权，软件的 GPL 许可不授予相关商标权。

@@ -60,6 +60,12 @@ export const configureGame: (filesDirectory: string, action?: string, saveId?: s
 export const startGame: () => void;
 export const stopGame: () => void;
 export const gameStatus: () => GameStatus;
+/** Cached script-safe-point snapshot; native monotonic now/age accompany unchanged field timestamps. */
+export const getTouchState: () => string;
+export const sendControl: (controlName: string, value: number, group?: number) => boolean;
+export const sendRawKey: (keyName: string, pressed: boolean, source?: string) => boolean;
+export const releaseAllInputs: () => void;
+export const releaseSemanticInputs: () => void;
 export const checkGameResources: (filesDirectory: string) => Promise<string>;
 export const importGameResources: (sourceFd: number, filesDirectory: string) => Promise<string>;
 export const listGameSaves: (filesDirectory: string) => Promise<string>;
@@ -68,7 +74,7 @@ export const getGameImportStatus: () => string;
 export const cancelGameImport: () => void;
 export const sendKey: (keyName: string, pressed: boolean) => void;
 export const sendKeyCode: (keyCode: number, pressed: boolean) => void;
-export const sendMouseButton: (button: number, pressed: boolean) => void;
+export const sendMouseButton: (button: number, pressed: boolean, source?: string) => void;
 export const sendKeyEvent: (keyCode: number, pressed: boolean, unicode: number, suppressText: boolean) => boolean;
 export const setInputFocus: (focused: boolean) => void;
 export const sendPointer: (x: number, y: number, dx: number, dy: number, look: boolean) => void;

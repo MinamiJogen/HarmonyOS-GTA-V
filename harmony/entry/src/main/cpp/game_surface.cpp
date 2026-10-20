@@ -252,6 +252,52 @@ napi_value Status(napi_env env, napi_callback_info) {
 #endif
     return value;
 }
+napi_value TouchState(napi_env env, napi_callback_info) {
+    napi_value value = nullptr;
+#if MG_HAS_GAME_RUNTIME
+    const char *json = mg_game_touch_state_json();
+    napi_create_string_utf8(env, json ? json : "{}", NAPI_AUTO_LENGTH, &value);
+#else
+    napi_create_string_utf8(env, "{}", NAPI_AUTO_LENGTH, &value);
+#endif
+    return value;
+}
+napi_value NamedControl(napi_env env, napi_callback_info info) {
+    size_t count=3; napi_value args[3]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+    bool accepted=false;
+#if MG_HAS_GAME_RUNTIME
+    double value=0; int32_t group=0;
+    if (count>=2 && napi_get_value_double(env,args[1],&value)==napi_ok) {
+        if (count==3) napi_get_value_int32(env,args[2],&group);
+        const auto name=ReadString(env,args[0]); accepted=mg_game_named_control(name.c_str(),static_cast<float>(value),group);
+    }
+#endif
+    napi_value result=nullptr; napi_get_boolean(env,accepted,&result); return result;
+}
+napi_value RawKey(napi_env env, napi_callback_info info) {
+    size_t count=3; napi_value args[3]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+    bool accepted=false;
+#if MG_HAS_GAME_RUNTIME
+    bool pressed=false;
+    if (count>=2 && napi_get_value_bool(env,args[1],&pressed)==napi_ok) {
+        const auto name=ReadString(env,args[0]); const auto source=count==3?ReadString(env,args[2]):"keyboard";
+        accepted=mg_game_raw_key(name.c_str(),pressed,source.c_str());
+    }
+#endif
+    napi_value result=nullptr; napi_get_boolean(env,accepted,&result); return result;
+}
+napi_value ReleaseInputs(napi_env env, napi_callback_info) {
+#if MG_HAS_GAME_RUNTIME
+    mg_game_release_inputs();
+#endif
+    return Undefined(env);
+}
+napi_value ReleaseSemanticInputs(napi_env env, napi_callback_info) {
+#if MG_HAS_GAME_RUNTIME
+    mg_game_release_semantic_inputs();
+#endif
+    return Undefined(env);
+}
 napi_value Key(napi_env env, napi_callback_info info) {
     size_t count = 2;
     napi_value args[2]{};
@@ -282,16 +328,12 @@ napi_value KeyCode(napi_env env, napi_callback_info info) {
     return Undefined(env);
 }
 napi_value MouseButton(napi_env env, napi_callback_info info) {
-    size_t count = 2;
-    napi_value args[2]{};
-    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
+    size_t count=3; napi_value args[3]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
 #if MG_HAS_GAME_RUNTIME
-    if (count == 2) {
-        uint32_t button = 0;
-        bool pressed = false;
-        napi_get_value_uint32(env, args[0], &button);
-        napi_get_value_bool(env, args[1], &pressed);
-        mg_game_mouse_button(button, pressed);
+    uint32_t button=0; bool pressed=false;
+    if (count>=2 && napi_get_value_uint32(env,args[0],&button)==napi_ok && napi_get_value_bool(env,args[1],&pressed)==napi_ok) {
+        if (count==3) { const auto source=ReadString(env,args[2]); mg_game_mouse_button_source(button,pressed,source.c_str()); }
+        else mg_game_mouse_button(button,pressed);
     }
 #endif
     return Undefined(env);
@@ -373,6 +415,11 @@ void ExportGameMethods(napi_env env, napi_value exports) {
         {"startGame", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stopGame", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"gameStatus", nullptr, Status, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getTouchState", nullptr, TouchState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendControl", nullptr, NamedControl, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendRawKey", nullptr, RawKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"releaseAllInputs", nullptr, ReleaseInputs, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"releaseSemanticInputs", nullptr, ReleaseSemanticInputs, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendKey", nullptr, Key, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendKeyCode", nullptr, KeyCode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendMouseButton", nullptr, MouseButton, nullptr, nullptr, nullptr, napi_default, nullptr},

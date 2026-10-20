@@ -1,0 +1,606 @@
+GTA V 常用与特殊操作清单（2026-10-20）
+
+范围：当前本地 common + PC x64 的静态控制配置；尚未进行逐任务、逐小游戏真机验收。
+玩家条目包含动作族、组合和通用输入能力；输入名称数、条目数和屏幕按钮数不能混为一谈。
+
+扫描控制meta文件：45
+有效INPUT唯一名称：296；含方向轴、设备映射渠道、废弃名及声明项，不等于按钮数量。
+其中common：270（非废弃分组237、废弃27、仅历史等引用6）；PC另外补充26。
+玩家动作/能力检查条目：174；同一输入可能跨场景复用。
+另列10类任务/小游戏专项检查表，以及13项版本/Online/创作功能附加检查项。
+下列“当前输入”包含已定义或候选复用通道，应结合“证据”和“说明”阅读，不能直接用作最终绑定表。
+
+
+[通用镜头与角色]
+A001 常用 | 转动镜头 | 配置定义
+  当前输入：INPUT_LOOK_LR, INPUT_LOOK_UD
+  说明：合并上下左右及方向分量。
+A002 常用 | 切换视角及摄像机距离 | 配置定义
+  当前输入：INPUT_NEXT_CAMERA
+  说明：可用视角受版本和设置限制。
+A003 情境 | 回头观察 | 配置定义
+  当前输入：INPUT_LOOK_BEHIND
+  说明：载具还存在独立回望输入。
+A004 常用 | 打开角色轮并选择角色 | 配置定义
+  当前输入：INPUT_CHARACTER_WHEEL
+  说明：轮盘方向通道、角色选择和保持时序需运行验证。
+A005 情境 | 直接切换指定主角 | 配置定义
+  当前输入：INPUT_SELECT_CHARACTER_MICHAEL, INPUT_SELECT_CHARACTER_FRANKLIN, INPUT_SELECT_CHARACTER_TREVOR
+  说明：合并为动作族；受任务允许条件限制。
+A006 常用 | 激活或关闭角色特殊能力 | 配置定义
+  当前输入：INPUT_SPECIAL_ABILITY_PC, INPUT_SPECIAL_ABILITY, INPUT_SPECIAL_ABILITY_SECONDARY
+  说明：PC单键和手柄组合渠道不重复计动作。
+A007 情境 | 显示HUD或角色信息 | 语义待验
+  当前输入：INPUT_HUD_SPECIAL
+  说明：实际信息展示和展开地图行为需运行确认。
+A008 特殊 | 电影镜头慢动作 | 配置定义
+  当前输入：INPUT_CINEMATIC_SLOWMO
+  说明：只在相关镜头状态有意义。
+A009 特殊 | 操纵脚本飞行镜头 | 配置定义
+  当前输入：INPUT_SCRIPTED_FLY_LR, INPUT_SCRIPTED_FLY_UD, INPUT_SCRIPTED_FLY_ZUP, INPUT_SCRIPTED_FLY_ZDOWN
+  说明：保留水平、前后和升降维度；不代表所有过场都可自由控制。
+
+[步行与探索]
+A010 常用 | 前后左右移动及速度控制 | 配置定义
+  当前输入：INPUT_MOVE_LR, INPUT_MOVE_UD
+  说明：模拟轴和数字方向是同一动作族；实际速度响应需验证。
+A011 常用 | 加速跑或疾跑 | 配置定义
+  当前输入：INPUT_SPRINT
+  说明：按住与连续点击的差异不能由meta确定。
+A012 常用 | 跳跃 | 配置定义
+  当前输入：INPUT_JUMP
+  说明：需要正常按下和释放。
+A013 情境 | 翻越或攀爬障碍 | 显示复用
+  当前输入：INPUT_JUMP
+  说明：CLIMB_DISPLAYONLY是显示标签；成功取决于障碍和状态。
+A014 情境 | 潜行 | 配置定义
+  当前输入：INPUT_DUCK
+  说明：不等于任何场景均可自由蹲下。
+A015 常用 | 进入车辆或抢车 | 配置定义
+  当前输入：INPUT_ENTER
+  说明：点按、按住和座位选择差异需验证。
+A016 情境 | 拾取物品 | 配置定义
+  当前输入：INPUT_PICKUP
+  说明：部分物品自动拾取，不能假定均需按键。
+A017 常用 | 通用任务或场景交互 | 配置定义
+  当前输入：INPUT_CONTEXT
+  说明：任务语义由脚本决定；不能用上车键替代所有交互。
+A018 情境 | 交谈或回应 | 语义待验
+  当前输入：INPUT_TALK
+  说明：交谈内容和适用对象由运行情境决定。
+A019 常用 | 进入或离开掩体 | 配置定义
+  当前输入：INPUT_COVER
+  说明：保持独立动作入口。
+A020 情境 | 沿掩体移动、绕角或跨越 | 组合待验
+  当前输入：INPUT_MOVE_LR, INPUT_MOVE_UD, INPUT_COVER, INPUT_JUMP
+  说明：是上下文组合，非独立CORNER/VAULT输入。
+
+[枪械与武器选择]
+A021 常用 | 瞄准 | 配置定义
+  当前输入：INPUT_AIM
+  说明：触控可设计保持或按住；不等于自动瞄准已生效。
+A022 情境 | 辅助锁定或切换锁定目标 | 组合待验
+  当前输入：INPUT_AIM, INPUT_LOOK_LR, INPUT_LOOK_UD
+  说明：锁定受瞄准模式、武器和目标约束，没有独立可据此推定的LOCKON输入。
+A023 常用 | 开火 | 配置定义
+  当前输入：INPUT_ATTACK
+  说明：不同武器可有按下、保持、松手差异。
+A024 常用 | 换弹 | 配置定义
+  当前输入：INPUT_RELOAD
+  说明：与手机等场景可能共用实体按键。
+A025 常用 | 打开武器轮并选武器类别 | 配置定义
+  当前输入：INPUT_SELECT_WEAPON, INPUT_WEAPON_WHEEL_LR, INPUT_WEAPON_WHEEL_UD
+  说明：需要保持加方向选择。
+A026 情境 | 快速切换上一或下一武器 | 配置定义
+  当前输入：INPUT_SELECT_PREV_WEAPON, INPUT_SELECT_NEXT_WEAPON
+  说明：与轮盘内切换区分。
+A027 情境 | 轮盘内切换同类武器 | 配置定义
+  当前输入：INPUT_WEAPON_WHEEL_PREV, INPUT_WEAPON_WHEEL_NEXT
+  说明：需要轮盘打开状态。
+A028 情境 | 直接选择武器类别 | 配置定义
+  当前输入：INPUT_SELECT_WEAPON_UNARMED, INPUT_SELECT_WEAPON_MELEE, INPUT_SELECT_WEAPON_HANDGUN, INPUT_SELECT_WEAPON_SHOTGUN, INPUT_SELECT_WEAPON_SMG, INPUT_SELECT_WEAPON_AUTO_RIFLE, INPUT_SELECT_WEAPON_SNIPER, INPUT_SELECT_WEAPON_HEAVY, INPUT_SELECT_WEAPON_SPECIAL
+  说明：九类渠道归为一个动作族。
+A029 情境 | 狙击放大或缩小 | 配置定义
+  当前输入：INPUT_SNIPER_ZOOM, INPUT_SNIPER_ZOOM_IN_ONLY, INPUT_SNIPER_ZOOM_OUT_ONLY, INPUT_SNIPER_ZOOM_IN_SECONDARY, INPUT_SNIPER_ZOOM_OUT_SECONDARY
+  说明：合并设备和方向拆分，但界面应能独立放大缩小。
+A030 情境 | 精确瞄准或瞄具附加操作 | 语义待验
+  当前输入：INPUT_ACCURATE_AIM
+  说明：具体效果按武器和视角验证。
+A031 情境 | 瞄准状态下战斗翻滚 | 组合待验
+  当前输入：INPUT_AIM, INPUT_MOVE_LR, INPUT_MOVE_UD, INPUT_JUMP
+  说明：组合触发方向和时序需场景验证。
+A032 情境 | 掩体探身或盲射 | 组合待验
+  当前输入：INPUT_COVER, INPUT_AIM, INPUT_ATTACK, INPUT_LOOK_LR, INPUT_LOOK_UD
+  说明：不可从输入存在断言每种掩体姿态均可用。
+A033 特殊 | 武器附加功能一和二 | 语义待验
+  当前输入：INPUT_WEAPON_SPECIAL, INPUT_WEAPON_SPECIAL_TWO
+  说明：不预先将未知用途硬命名为某种配件开关。
+
+[近战]
+A034 常用 | 轻攻击 | 配置定义
+  当前输入：INPUT_MELEE_ATTACK_LIGHT
+  说明：不使用已废弃MELEE_ATTACK1别名。
+A035 常用 | 重攻击 | 配置定义
+  当前输入：INPUT_MELEE_ATTACK_HEAVY
+  说明：与轻攻击独立保留。
+A036 情境 | 替代近战攻击 | 配置定义
+  当前输入：INPUT_MELEE_ATTACK_ALTERNATE
+  说明：具体拳脚或武器表现由游戏决定。
+A037 常用 | 防御或格挡输入 | 配置定义
+  当前输入：INPUT_MELEE_BLOCK
+  说明：输入名不证明持续按住即有效格挡。
+A038 情境 | 闪避与反击 | 组合待验
+  当前输入：INPUT_MELEE_BLOCK, INPUT_MELEE_ATTACK_LIGHT, INPUT_MELEE_ATTACK_HEAVY, INPUT_MOVE_LR, INPUT_MOVE_UD
+  说明：依时机和目标状态触发。
+A039 情境 | 持枪近战或枪托攻击 | 组合待验
+  当前输入：INPUT_MELEE_ATTACK_LIGHT, INPUT_MELEE_ATTACK_HEAVY, INPUT_ATTACK
+  说明：实际输入随武器/距离待验。
+A040 特殊 | 潜行击倒 | 组合待验
+  当前输入：INPUT_DUCK, INPUT_ATTACK, INPUT_MELEE_ATTACK_LIGHT
+  说明：背后位置、目标和触发键需验证。
+
+[投掷与爆炸物]
+A041 常用 | 装备投掷物后瞄准投出 | 情境复用
+  当前输入：INPUT_AIM, INPUT_ATTACK, INPUT_SELECT_WEAPON
+  说明：需要与枪械开火状态区分。
+A042 情境 | 快速投掷手雷 | 配置定义
+  当前输入：INPUT_THROW_GRENADE
+  说明：与先选投掷物再投出是不同入口。
+A043 情境 | 引爆已放置炸弹 | 配置定义
+  当前输入：INPUT_DETONATE
+  说明：不能只保留投掷而漏掉引爆。
+A044 特殊 | 保持、延迟释放或取消投掷 | 组合待验
+  当前输入：INPUT_ATTACK, INPUT_AIM
+  说明：完整取消/蓄力流程按武器验证。
+
+[游泳与潜水]
+A045 常用 | 水面或水下移动 | 情境复用
+  当前输入：INPUT_MOVE_LR, INPUT_MOVE_UD
+  说明：具体水下姿态响应需验证。
+A046 常用 | 加速游泳 | 情境复用
+  当前输入：INPUT_SPRINT
+  说明：按住/连按差异待验证。
+A047 情境 | 从水面潜入 | 语义待验
+  当前输入：INPUT_DIVE
+  说明：需要游泳状态，不能单凭DIVE名称推断所有水下动作。
+A048 常用 | 上浮或下潜 | 组合待验
+  当前输入：INPUT_JUMP, INPUT_DUCK, INPUT_MOVE_UD, INPUT_LOOK_UD
+  说明：候选通道，尚未建立逐状态确定映射。
+A049 常用 | 水下转向与俯仰 | 组合待验
+  当前输入：INPUT_MOVE_LR, INPUT_MOVE_UD, INPUT_LOOK_LR, INPUT_LOOK_UD
+  说明：移动与镜头的耦合需验证。
+A050 特殊 | 水下攻击 | 组合待验
+  当前输入：INPUT_ATTACK, INPUT_MELEE_ATTACK_LIGHT
+  说明：受可用武器、目标和状态限制。
+
+[汽车与陆地驾驶]
+A051 常用 | 左右转向 | 配置定义
+  当前输入：INPUT_VEH_MOVE_LR
+  说明：左右方向分量不重复计动作。
+A052 常用 | 加速 | 配置定义
+  当前输入：INPUT_VEH_ACCELERATE
+  说明：模拟量控制接通后验证强度响应。
+A053 常用 | 刹车或停车后倒车 | 情境复用
+  当前输入：INPUT_VEH_BRAKE
+  说明：同一输入承担两种速度状态语义。
+A054 常用 | 手刹 | 配置定义
+  当前输入：INPUT_VEH_HANDBRAKE
+  说明：与普通刹车独立保留。
+A055 情境 | 下车、跳车或离开载具 | 配置定义
+  当前输入：INPUT_VEH_EXIT
+  说明：按住和高速离车行为需验证。
+A056 情境 | 喇叭 | 配置定义
+  当前输入：INPUT_VEH_HORN
+  说明：警笛车辆存在上下文复用。
+A057 特殊 | 紧急车辆警笛 | 情境复用
+  当前输入：INPUT_VEH_HORN
+  说明：按下/保持时序由车型行为决定。
+A058 情境 | 车灯切换 | 配置定义
+  当前输入：INPUT_VEH_HEADLIGHT
+  说明：灯光档位由车型决定。
+A059 情境 | 车内低头躲避 | 配置定义
+  当前输入：INPUT_VEH_DUCK
+  说明：人物与座位状态限制。
+A060 情境 | 车内回望 | 配置定义
+  当前输入：INPUT_VEH_LOOK_BEHIND
+  说明：与人物回望渠道区分。
+A061 情境 | 打开电影驾驶镜头并调方位 | 配置定义
+  当前输入：INPUT_VEH_CIN_CAM, INPUT_VEH_CINEMATIC_LR, INPUT_VEH_CINEMATIC_UD
+  说明：不与常规镜头输入合并渠道。
+A062 常用 | 电台轮盘及上一下一电台 | 配置定义
+  当前输入：INPUT_VEH_RADIO_WHEEL, INPUT_VEH_NEXT_RADIO, INPUT_VEH_PREV_RADIO
+  说明：轮盘选择方向和关闭电台操作需验证。
+A063 情境 | 富兰克林驾驶特殊能力 | 配置定义
+  当前输入：INPUT_VEH_SPECIAL_ABILITY_FRANKLIN, INPUT_SPECIAL_ABILITY_PC
+  说明：受角色及任务允许条件限制。
+A064 特殊 | 空中车身姿态校正或翻车自救 | 情境复用
+  当前输入：INPUT_VEH_MOVE_LR, INPUT_VEH_MOVE_UD
+  说明：不是独立的自救按键。
+A065 特殊 | 撬线启动车辆输入 | 配置定义
+  当前输入：INPUT_VEH_HOTWIRE_LEFT, INPUT_VEH_HOTWIRE_RIGHT
+  说明：有定义不代表普通流程一定会触发。
+A066 特殊 | 漂移、烧胎和甩尾 | 组合待验
+  当前输入：INPUT_VEH_ACCELERATE, INPUT_VEH_BRAKE, INPUT_VEH_HANDBRAKE, INPUT_VEH_MOVE_LR
+  说明：玩家动作组合，不新增独立原生输入。
+A067 特殊 | 载具特技纵向控制 | 语义待验
+  当前输入：INPUT_VEH_STUNT_UD
+  说明：任务、车型或模式相关，不与日常转向混淆。
+
+[驾驶与乘客战斗]
+A068 常用 | 驾驶员瞄准 | 配置定义
+  当前输入：INPUT_VEH_AIM
+  说明：需要同时保留驾驶与镜头输入。
+A069 常用 | 驾驶员攻击或第二攻击 | 配置定义
+  当前输入：INPUT_VEH_ATTACK, INPUT_VEH_ATTACK2
+  说明：第二攻击效果由武器和车型决定。
+A070 常用 | 乘客瞄准 | 配置定义
+  当前输入：INPUT_VEH_PASSENGER_AIM
+  说明：不能用驾驶员布局覆盖乘客模式。
+A071 常用 | 乘客攻击 | 配置定义
+  当前输入：INPUT_VEH_PASSENGER_ATTACK
+  说明：座位/武器限制。
+A072 情境 | 切换车内或车载武器 | 配置定义
+  当前输入：INPUT_VEH_SELECT_NEXT_WEAPON, INPUT_VEH_SELECT_PREV_WEAPON
+  说明：支持的武器由载具和座位决定。
+A073 情境 | 炮塔、水炮等瞄准 | 配置定义
+  当前输入：INPUT_VEH_GUN_LR, INPUT_VEH_GUN_UD
+  说明：发射可能复用攻击输入，逐车型核验。
+A074 特殊 | 座位挪动或切换 | 配置定义
+  当前输入：INPUT_VEH_SHUFFLE
+  说明：允许的座位与操作条件需核验。
+
+[摩托与自行车]
+A075 常用 | 摩托前倾后仰及平衡 | 配置定义
+  当前输入：INPUT_VEH_MOVE_UD
+  说明：抬前轮/后轮属于速度与重心组合。
+A076 常用 | 自行车正常踩踏 | 配置定义
+  当前输入：INPUT_VEH_PUSHBIKE_PEDAL
+  说明：与冲刺踩踏区分。
+A077 常用 | 自行车冲刺踩踏 | 配置定义
+  当前输入：INPUT_VEH_PUSHBIKE_SPRINT
+  说明：连按或保持的行为需验证。
+A078 常用 | 自行车前刹 | 配置定义
+  当前输入：INPUT_VEH_PUSHBIKE_FRONT_BRAKE
+  说明：前后刹不可无条件合并。
+A079 常用 | 自行车后刹 | 配置定义
+  当前输入：INPUT_VEH_PUSHBIKE_REAR_BRAKE
+  说明：common载具分组中有定义，实际前后刹响应需车型验证。
+A080 情境 | 自行车跳跃 | 情境复用
+  当前输入：INPUT_VEH_HANDBRAKE
+  说明：当前上游触控采用此复用，按住与释放时序需验。
+
+[飞行器]
+A081 常用 | 增大或减小推力 | 配置定义
+  当前输入：INPUT_VEH_FLY_THROTTLE_UP, INPUT_VEH_FLY_THROTTLE_DOWN
+  说明：直升机表现为上升/下降控制；不等同机头俯仰。
+A082 常用 | 抬头或低头 | 配置定义
+  当前输入：INPUT_VEH_FLY_PITCH_UD
+  说明：俯仰维度。
+A083 常用 | 左右横滚或倾斜 | 配置定义
+  当前输入：INPUT_VEH_FLY_ROLL_LR
+  说明：横滚维度，与偏航独立。
+A084 常用 | 机头左右偏航 | 配置定义
+  当前输入：INPUT_VEH_FLY_YAW_LEFT, INPUT_VEH_FLY_YAW_RIGHT
+  说明：需要左右独立操作入口。
+A085 情境 | 起落架收放 | 配置定义
+  当前输入：INPUT_VEH_FLY_UNDERCARRIAGE
+  说明：只在支持载具显示。
+A086 情境 | 机载武器开火 | 配置定义
+  当前输入：INPUT_VEH_FLY_ATTACK
+  说明：不能仅提供武器选择而无开火入口。
+A087 情境 | 切换机载武器 | 配置定义
+  当前输入：INPUT_VEH_FLY_SELECT_NEXT_WEAPON, INPUT_VEH_FLY_SELECT_PREV_WEAPON
+  说明：由车型可用武器决定。
+A088 情境 | 切换锁定目标 | 配置定义
+  当前输入：INPUT_VEH_FLY_SELECT_TARGET_LEFT, INPUT_VEH_FLY_SELECT_TARGET_RIGHT
+  说明：锁定条件需验证。
+A089 特殊 | 攻击镜头 | 语义待验
+  当前输入：INPUT_VEH_FLY_ATTACK_CAMERA
+  说明：存在输入引用，不能断言所有飞机有效。
+A090 特殊 | 飞行时低头躲避 | 配置定义
+  当前输入：INPUT_VEH_FLY_DUCK
+  说明：配置有映射，载具与座位限制。
+A091 情境 | 离机或跳伞 | 情境复用
+  当前输入：INPUT_VEH_EXIT
+  说明：离机之后需切换自由落体/跳伞状态。
+A092 特殊 | 垂直与水平飞行模式切换 | 配置定义
+  当前输入：INPUT_VEH_FLY_VERTICAL_FLIGHT_MODE
+  说明：VTOL车型/版本特有，当前runtime只特判Hydra。
+
+[船与潜艇]
+A093 常用 | 船前进、制动倒退与转向 | 情境复用
+  当前输入：INPUT_VEH_ACCELERATE, INPUT_VEH_BRAKE, INPUT_VEH_MOVE_LR
+  说明：合并通用驾驶通道；船载战斗另见驾驶战斗。
+A094 情境 | 船头重心或俯仰 | 情境复用
+  当前输入：INPUT_VEH_MOVE_UD
+  说明：只限支持的车型。
+A095 常用 | 潜艇前进或倒退 | 配置定义
+  当前输入：INPUT_VEH_SUB_THROTTLE_UP, INPUT_VEH_SUB_THROTTLE_DOWN
+  说明：与上浮/下潜独立。
+A096 常用 | 潜艇左右转向 | 配置定义
+  当前输入：INPUT_VEH_SUB_TURN_LR
+  说明：左右方向分量合并。
+A097 常用 | 潜艇抬头或低头 | 配置定义
+  当前输入：INPUT_VEH_SUB_PITCH_UD
+  说明：姿态俯仰，不等于垂直升降。
+A098 常用 | 潜艇上浮或下潜 | 配置定义
+  当前输入：INPUT_VEH_SUB_ASCEND, INPUT_VEH_SUB_DESCEND
+  说明：两个升降动作需要独立输入。
+A099 特殊 | 潜艇急左或急右转 | 配置定义
+  当前输入：INPUT_VEH_SUB_TURN_HARD_LEFT, INPUT_VEH_SUB_TURN_HARD_RIGHT
+  说明：不能仅保留普通转向。
+
+[自由落体与降落伞]
+A100 常用 | 自由落体姿态控制 | 语义待验
+  当前输入：INPUT_PARACHUTE_TURN_LR, INPUT_PARACHUTE_PITCH_UD
+  说明：候选通道；开伞前后响应须分别验证。
+A101 情境 | 开伞 | 配置定义
+  当前输入：INPUT_PARACHUTE_DEPLOY
+  说明：需要按场景直接可达。
+A102 情境 | 脱伞 | 配置定义
+  当前输入：INPUT_PARACHUTE_DETACH
+  说明：避免与开伞操作误触混淆。
+A103 常用 | 伞下左右转向 | 配置定义
+  当前输入：INPUT_PARACHUTE_TURN_LR
+  说明：方向拆分合并统计。
+A104 常用 | 伞下俯仰及滑翔姿态 | 配置定义
+  当前输入：INPUT_PARACHUTE_PITCH_UD
+  说明：前后方向合并。
+A105 情境 | 左刹车与右刹车 | 配置定义
+  当前输入：INPUT_PARACHUTE_BRAKE_LEFT, INPUT_PARACHUTE_BRAKE_RIGHT
+  说明：清单合并为动作族，实际需左右独立按下及组合。
+A106 情境 | 精准着陆 | 配置定义
+  当前输入：INPUT_PARACHUTE_PRECISION_LANDING
+  说明：PC配置有通道。
+A107 特殊 | 跳伞烟雾 | 配置定义
+  当前输入：INPUT_PARACHUTE_SMOKE
+  说明：装备及模式限制。
+A108 特殊 | 使用备用伞 | 语义待验
+  当前输入：INPUT_PARACHUTE_DEPLOY
+  说明：未发现独立备用伞输入，须核验装备与复用逻辑。
+
+[特殊载具与任务装置]
+A109 情境 | 敞篷车顶开关 | 配置定义
+  当前输入：INPUT_VEH_ROOF
+  说明：保留按住语义并验证车型条件。
+A110 特殊 | 拖车吊臂、货叉或工程装置升降 | 语义待验
+  当前输入：INPUT_VEH_MOVE_UD
+  说明：车型/任务复用候选，逐车型验证。
+A111 特殊 | 拖车挂接车辆或卡车挂接拖挂 | 情境动作
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：可能由位置、倒车和升降共同触发，不能假定独立按键。
+A112 特殊 | 拖车释放被拖车辆 | 运行时命令
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：runtime Request::DropTow调用DetachVehicleFromAnyTowTruck。
+A113 特殊 | 卡车分离拖挂 | 运行时命令
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：runtime Request::DropTrailer调用DetachVehicleFromTrailer。
+A114 特殊 | Cargobob放出绳钩 | 运行时命令
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：runtime Request::Rope调用CreatePickUpRopeForCargobob；不能据此宣称任意绞盘长度可控。
+A115 特殊 | Cargobob释放吊货或移除绳钩 | 运行时命令
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：runtime移除绳钩路径，效果需真机核验。
+A116 特殊 | 火车、港口吊机等任务装置操纵 | 脚本语义待核
+  当前输入：INPUT_CONTEXT
+  说明：需查任务SCRIPT_*通道及现场提示。
+
+[手机]
+A117 常用 | 打开手机 | 配置定义
+  当前输入：INPUT_PHONE
+  说明：不等同暂停菜单状态。
+A118 常用 | 手机上下左右导航 | 配置定义
+  当前输入：INPUT_CELLPHONE_UP, INPUT_CELLPHONE_DOWN, INPUT_CELLPHONE_LEFT, INPUT_CELLPHONE_RIGHT
+  说明：可用方向盘或触控导航呈现。
+A119 常用 | 手机确认或选择 | 配置定义
+  当前输入：INPUT_CELLPHONE_SELECT
+  说明：按键位置受accept/cancel预设影响。
+A120 常用 | 手机返回或取消 | 配置定义
+  当前输入：INPUT_CELLPHONE_CANCEL
+  说明：需要保留与暂停的语义区别。
+A121 情境 | 手机选项一和额外选项 | 配置定义
+  当前输入：INPUT_CELLPHONE_OPTION, INPUT_CELLPHONE_EXTRA_OPTION
+  说明：两个独立选项通道。
+A122 常用 | 手机列表前后滚动 | 配置定义
+  当前输入：INPUT_CELLPHONE_SCROLL_FORWARD, INPUT_CELLPHONE_SCROLL_BACKWARD
+  说明：不同界面滚动响应需验证。
+A123 情境 | 接听电话 | 显示复用
+  当前输入：INPUT_CELLPHONE_SELECT
+  说明：UI有ANSWER_PHONE_DISPLAYONLY标签。
+A124 情境 | 挂断或跳过电话对话 | 显示复用
+  当前输入：INPUT_CELLPHONE_CANCEL
+  说明：挂断与跳过通话片段的具体复用需验证。
+
+[相机、网页与光标]
+A125 情境 | 手机相机拍摄 | 脚本语义待核
+  当前输入：INPUT_CELLPHONE_SELECT
+  说明：候选通道；快门及后续流程由相机脚本决定。
+A126 情境 | 照片保存 | 脚本语义待核
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：独立保留玩家需求，按相机界面提示确认实际通道。
+A127 情境 | 照片删除或重拍 | 脚本语义待核
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：独立保留玩家需求，不将返回固定解释为删除。
+A128 特殊 | 发送任务照片或确认拍摄目标 | 脚本语义待核
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：须核验任务相机和发送界面的不同阶段。
+A129 情境 | 相机取景缩放 | 脚本语义待核
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：候选动作；具体设备/任务相机是否提供及其通道待查。
+A130 情境 | 相机对焦锁定 | 配置定义
+  当前输入：INPUT_CELLPHONE_CAMERA_FOCUS_LOCK
+  说明：相机状态专用。
+A131 情境 | 相机网格开关 | 配置定义
+  当前输入：INPUT_CELLPHONE_CAMERA_GRID
+  说明：相机状态专用。
+A132 情境 | 相机自拍切换 | 配置定义
+  当前输入：INPUT_CELLPHONE_CAMERA_SELFIE
+  说明：相机状态专用。
+A133 情境 | 相机景深控制 | 配置定义
+  当前输入：INPUT_CELLPHONE_CAMERA_DOF
+  说明：相机状态专用。
+A134 情境 | 自拍表情切换 | 配置定义
+  当前输入：INPUT_CELLPHONE_CAMERA_EXPRESSION
+  说明：相机及角色条件限制。
+A135 常用 | 网页或菜单光标移动 | 配置定义
+  当前输入：INPUT_CURSOR_X, INPUT_CURSOR_Y
+  说明：与相对视角移动分开。
+A136 常用 | 光标点击确认 | 配置定义
+  当前输入：INPUT_CURSOR_ACCEPT
+  说明：点击目标位置由界面决定。
+A137 常用 | 光标取消或右键操作 | 配置定义
+  当前输入：INPUT_CURSOR_CANCEL
+  说明：不能无条件等同关闭整个菜单。
+A138 常用 | 页面滚轮上下滚动 | 配置定义
+  当前输入：INPUT_CURSOR_SCROLL_UP, INPUT_CURSOR_SCROLL_DOWN
+  说明：网页与菜单需验证。
+
+[菜单与地图]
+A139 常用 | 暂停或打开游戏菜单 | 配置定义
+  当前输入：INPUT_FRONTEND_PAUSE
+  说明：PC原始键路由与输入组需验证。
+A140 常用 | 打开地图 | 配置定义
+  当前输入：INPUT_MAP
+  说明：资源登记为PC相关输入；不保证可用独立手柄键直达。
+A141 常用 | 菜单方向选择或连续轴导航 | 配置定义
+  当前输入：INPUT_FRONTEND_UP, INPUT_FRONTEND_DOWN, INPUT_FRONTEND_LEFT, INPUT_FRONTEND_RIGHT, INPUT_FRONTEND_AXIS_X, INPUT_FRONTEND_AXIS_Y
+  说明：数字方向和模拟轴合并为导航动作族。
+A142 常用 | 菜单确认 | 配置定义
+  当前输入：INPUT_FRONTEND_ACCEPT
+  说明：标准与交换确认取消预设不同。
+A143 常用 | 菜单取消或返回 | 配置定义
+  当前输入：INPUT_FRONTEND_CANCEL
+  说明：不可只提供暂停键。
+A144 常用 | 菜单标签前后切换 | 配置定义
+  当前输入：INPUT_FRONTEND_LB, INPUT_FRONTEND_RB
+  说明：实际上下文由当前菜单决定。
+A145 情境 | 菜单翻页或扳机操作 | 配置定义
+  当前输入：INPUT_FRONTEND_LT, INPUT_FRONTEND_RT
+  说明：保留独立通道，不硬编码每个菜单用途。
+A146 情境 | 菜单额外面键与摇杆按压操作 | 配置定义
+  当前输入：INPUT_FRONTEND_X, INPUT_FRONTEND_Y, INPUT_FRONTEND_LS, INPUT_FRONTEND_RS, INPUT_FRONTEND_SELECT
+  说明：按菜单提示显示或通过辅助面板访问。
+A147 常用 | 地图平移或移动地图光标 | 语义待验
+  当前输入：INPUT_FRONTEND_AXIS_X, INPUT_FRONTEND_AXIS_Y, INPUT_CURSOR_X, INPUT_CURSOR_Y
+  说明：静态表不能证明所有地图页面使用同一路径。
+A148 常用 | 地图放大或缩小 | 语义待验
+  当前输入：INPUT_FRONTEND_RIGHT_AXIS_X, INPUT_FRONTEND_RIGHT_AXIS_Y, INPUT_CURSOR_SCROLL_UP, INPUT_CURSOR_SCROLL_DOWN
+  说明：是地图检查项；具体输入需真机确认。
+A149 常用 | 地图设点或取消导航点 | 脚本语义待核
+  当前输入：INPUT_FRONTEND_ACCEPT, INPUT_CURSOR_ACCEPT
+  说明：按地图当前提示核实，不把确认固定等同设点。
+A150 情境 | 切换地图图例、分类或列表 | 脚本语义待核
+  当前输入：INPUT_FRONTEND_X, INPUT_FRONTEND_Y, INPUT_FRONTEND_LB, INPUT_FRONTEND_RB
+  说明：逐页面验证。
+A151 情境 | 跳过允许跳过的过场 | 配置定义
+  当前输入：INPUT_SKIP_CUTSCENE
+  说明：只在游戏允许时有效。
+A152 情境 | 交互菜单及快速导航选项 | 配置定义
+  当前输入：INPUT_INTERACTION_MENU
+  说明：不是所有内容均Online专属，菜单项受模式约束。
+
+[任务脚本与小游戏]
+A153 常用 | 任务提示的确认、取消和情境动作 | 脚本语义待核
+  当前输入：INPUT_CONTEXT, INPUT_SCRIPT_RDOWN, INPUT_SCRIPT_RRIGHT
+  说明：不是每个任务都使用同一通道。
+A154 特殊 | 任务双摇杆或模拟轴操作 | 脚本语义待核
+  当前输入：INPUT_SCRIPT_LEFT_AXIS_X, INPUT_SCRIPT_LEFT_AXIS_Y, INPUT_SCRIPT_RIGHT_AXIS_X, INPUT_SCRIPT_RIGHT_AXIS_Y
+  说明：四个脚本轴需完整保留。
+A155 特殊 | 任务面键、肩键、扳机和摇杆按压 | 脚本语义待核
+  当前输入：INPUT_SCRIPT_RUP, INPUT_SCRIPT_RDOWN, INPUT_SCRIPT_RLEFT, INPUT_SCRIPT_RRIGHT, INPUT_SCRIPT_LB, INPUT_SCRIPT_RB, INPUT_SCRIPT_LT, INPUT_SCRIPT_RT, INPUT_SCRIPT_LS, INPUT_SCRIPT_RS
+  说明：表示操作通道，不代表已知游戏动作。
+A156 特殊 | 任务十字键与选择键 | 脚本语义待核
+  当前输入：INPUT_SCRIPT_PAD_UP, INPUT_SCRIPT_PAD_DOWN, INPUT_SCRIPT_PAD_LEFT, INPUT_SCRIPT_PAD_RIGHT, INPUT_SCRIPT_SELECT
+  说明：防止仅保留四个常用面键而卡任务。
+A157 特殊 | 绳降短跳、长跳和破窗 | 配置定义
+  当前输入：INPUT_RAPPEL_JUMP, INPUT_RAPPEL_LONG_JUMP, INPUT_RAPPEL_SMASH_WINDOW
+  说明：任务/角色状态限制。
+A158 特殊 | 长按、连按、释放触发及组合操作 | 时序待验
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：覆盖全部输入通道的动作时序，不是独立INPUT；由具体任务定义。
+A159 情境 | 输入文字、数字或名称 | 原始输入能力
+  当前输入：无可据此确认的独立INPUT；见说明
+  说明：需原始键码/字符输入或系统输入法接入，不能把19个SCRIPT通道当成文本输入能力。
+
+[录像与编辑器]
+A160 情境 | 开始或停止录制 | 配置定义
+  当前输入：INPUT_REPLAY_START_STOP_RECORDING, INPUT_REPLAY_START_STOP_RECORDING_SECONDARY
+  说明：附加功能，存在PC输入不代表当前运行包已验证可用。
+A161 情境 | 保存录像片段 | 配置定义
+  当前输入：INPUT_SAVE_REPLAY_CLIP
+  说明：需存储与录制功能支持。
+A162 情境 | 录像播放暂停、快进和倒退 | 配置定义
+  当前输入：INPUT_REPLAY_PAUSE, INPUT_REPLAY_FFWD, INPUT_REPLAY_REWIND
+  说明：同族包含三个播放器动作。
+A163 情境 | 录像重播或预览 | 配置定义
+  当前输入：INPUT_REPLAY_RESTART, INPUT_REPLAY_PREVIEW
+  说明：编辑器上下文。
+A164 情境 | 编辑工具和快捷键提示 | 配置定义
+  当前输入：INPUT_REPLAY_TOOLS, INPUT_REPLAY_SHOWHOTKEY, INPUT_REPLAY_TOGGLETIPS
+  说明：附加功能。
+A165 情境 | 编辑时间或HUD显示 | 配置定义
+  当前输入：INPUT_REPLAY_TOGGLETIME, INPUT_REPLAY_HIDEHUD
+  说明：附加功能。
+A166 情境 | 创建、删除或切换标记点 | 配置定义
+  当前输入：INPUT_REPLAY_NEWMARKER, INPUT_REPLAY_MARKER_DELETE, INPUT_REPLAY_CYCLEMARKERLEFT, INPUT_REPLAY_CYCLEMARKERRIGHT
+  说明：编辑器上下文。
+A167 情境 | 设置片段起点或终点 | 配置定义
+  当前输入：INPUT_REPLAY_STARTPOINT, INPUT_REPLAY_ENDPOINT
+  说明：编辑器上下文。
+A168 情境 | 编辑镜头升降或视场角 | 配置定义
+  当前输入：INPUT_REPLAY_CAMERAUP, INPUT_REPLAY_CAMERADOWN, INPUT_REPLAY_FOVINCREASE, INPUT_REPLAY_FOVDECREASE
+  说明：编辑器上下文。
+A169 情境 | 编辑保存、录制或截图 | 配置定义
+  当前输入：INPUT_REPLAY_SAVE, INPUT_REPLAY_RECORD, INPUT_REPLAY_SCREENSHOT
+  说明：附加功能。
+
+[Online及模式附加]
+A170 情境 | 丢弃武器或弹药 | 配置定义
+  当前输入：INPUT_DROP_WEAPON, INPUT_DROP_AMMO
+  说明：通常受模式/菜单/装备许可限制，不宣称故事模式始终可用。
+A171 情境 | 多人信息展示 | 配置定义
+  当前输入：INPUT_MULTIPLAYER_INFO
+  说明：有定义不代表当前项目支持联网。
+A172 情境 | 多人文字聊天频道 | 配置定义
+  当前输入：INPUT_MP_TEXT_CHAT_ALL, INPUT_MP_TEXT_CHAT_TEAM, INPUT_MP_TEXT_CHAT_FRIENDS, INPUT_MP_TEXT_CHAT_CREW
+  说明：多频道操作族；需文字输入。
+A173 情境 | 切换多人角色 | 配置定义
+  当前输入：INPUT_SELECT_CHARACTER_MULTIPLAYER
+  说明：受模式与功能可用性限制。
+A174 特殊 | 输入作弊码入口 | 配置定义
+  当前输入：INPUT_ENTER_CHEAT_CODE
+  说明：是否开放和具体输入流程需按构建验证；不预设为常驻触控按钮。
+
+[任务及小游戏专项检查表：尚未确定每阶段输入映射]
+瑜伽：姿态调整、呼吸、保持和释放；待采集实际提示；不虚构INPUT_YOGA。
+网球：移动、发球、击球类型、方向和力度、镜头和菜单；待逐阶段确认脚本通道。
+高尔夫：选杆、瞄准、挥杆力度和时机、击球、视角；待逐阶段确认脚本通道。
+飞镖：瞄准、投镖、确认返回；待确认实际游戏提示。
+靶场：选择挑战、瞄准开火、换弹、确认返回；普通枪械通道与活动脚本需共同检查。
+三项全能、赛跑及比赛：跑步、游泳、自行车、冲刺或耐力时序、阶段切换；复用基础动作但须检查时序和模式切换。
+任务电脑、黑客或密码界面：光标或方向导航、选择、确认返回、时机输入；每个脚本可赋予不同动作含义。
+钻孔、切割、焊接或类似任务设备：移动或方向、力度/深度候选连续量、启停、确认取消；动作候选检查表，不代表每种设备已在当前故事包确认。
+港口吊机、火车和特殊任务镜头：移动、升降、装卸或交互、切换视角；按实际任务提示建立子表。
+拍摄并发送任务照片：拍摄、保存、重拍或删除、发送或确认目标；手机SELECT不等于已确认整个拍照发送流程。
+
+[Online、版本与创作功能附加清单：不视为当前构建已支持]
+电台歌曲上一首/下一首；电台和版本条件
+载具丢下投射物；车型/任务/版本条件
+液压模式及各方向车身弹跳；Online/版本扩展；本地TOGGLE只有历史引用
+摩托左右近战；Online/版本扩展
+特殊汽车跳跃；Online/车型/版本扩展
+火箭推进或飞行加力；Online/车型/版本扩展
+车载降落伞或飞行摩托翼面；Online/车型/版本扩展
+炸弹舱或反制措施；Online/车型/版本扩展
+载具形态变换；Online/版本扩展；本地仅历史引用
+头盔面罩切换；装备/版本条件；本地仅历史引用
+语音按住说话、指向或快捷人物动作；Online附加；本地INPUT_TALK不可用来推断网络语音
+Creator内容创作：浏览、调整、放置、删除、旋转、缩放、镜头和取消；Creator；本地controls.xml主要为DISPLAYONLY标签，不等于独立注入接口
+Director Mode与完整录像编辑工作流；编辑器附加；已收录PC输入名，功能仍需单独验收
+
+[来源]
+resources/game/data/common/data/control/*.meta
+resources/game/data/x64/data/control/*.meta
+resources/game/data/common/data/ui/controls.xml
+https://docs.fivem.net/docs/game-references/controls/
+JSON同名文件保留全部输入名称、来源行号、文件SHA-256、映射及异常原文。

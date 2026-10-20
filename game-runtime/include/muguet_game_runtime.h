@@ -29,6 +29,14 @@ void mg_game_touch(uint32_t action,float x,float y,uint32_t pointer_id);
 void mg_game_control(int32_t control,float value);
 void mg_game_stop(void);
 const char* mg_game_status_json(void);
+/* Latest cached read-only game observations. No guest calls from the UI thread;
+ * copy the thread-local JSON immediately. Observation timestamps stay unchanged. */
+const char* mg_game_touch_state_json(void);
+bool mg_game_named_control(const char* name,float value,int32_t group);
+bool mg_game_raw_key(const char* name,bool pressed,const char* source);
+void mg_game_mouse_button_source(uint32_t button,bool pressed,const char* source);
+void mg_game_release_inputs(void);
+void mg_game_release_semantic_inputs(void);
 /* Synchronous diagnostic worker call. Copy the returned thread-local JSON before
  * another call on the same thread. Does not start the game or create a surface. */
 const char* mg_wgpu_atlas_probe_json(const char* files_dir,uint32_t iterations);

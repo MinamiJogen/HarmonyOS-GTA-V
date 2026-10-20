@@ -11,6 +11,9 @@
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
+    "metadata": [
+      { "name": "ohos.arkui.UIMaterial.state", "value": "enable" }
+    ],
     "abilities": [
       {
         "name": "EntryAbility",
@@ -28,13 +31,6 @@
             ],
             "actions": [
               "ohos.want.action.home"
-            ]
-          },
-          {
-            "actions": ["ohos.want.action.viewData"],
-            "uris": [
-              { "scheme": "file", "type": "general.zip-archive", "linkFeature": "FileOpen" },
-              { "scheme": "file", "type": "application/zip", "linkFeature": "FileOpen" }
             ]
           }
         ]

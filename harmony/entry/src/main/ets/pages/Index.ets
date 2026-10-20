@@ -5,14 +5,19 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import inputDevice from '@ohos.multimodalInput.inputDevice';
 import pointer from '@ohos.multimodalInput.pointer';
 import { systemDateTime } from '@kit.BasicServicesKit';
+import { uiMaterial, window, ThemeControl, LengthMetrics } from '@kit.ArkUI';
+import { GameTouchControls } from '../controls/GameTouchControls';
+import { TouchSnapshot } from '../controls/TouchState';
+import { GameKeyboard } from '../components/GameKeyboard';
 import { gamePerformanceGameStarted } from '../entryability/GamePerformance';
 import { CpuSample, GpuSample, readCpuSample, readGpuSample } from '../telemetry/GameTelemetry';
 import { applyGameDefaults } from '../config/GameDefaults';
 import { GameQualitySelection, loadGameQuality, saveGameQuality, applyGameQuality } from '../config/GameQuality';
-import {
-  DownloadGamePackage, GamePackageDirectory, getGamePackageDirectory, listGamePackages,
-  openGamePackageDirectory, selectGamePackage, selectSavePackage
-} from '../resources/PublicGamePackages';
+import { selectGamePackage, selectSavePackage } from '../resources/PublicGamePackages';
+import { GameSaveEntry, SavePickerDialog } from '../components/SavePickerDialog';
+import { LauncherSectionCard } from '../components/LauncherSectionCard';
+import { LauncherGraphicsSettings } from '../components/LauncherGraphicsSettings';
+import { LauncherColors, launcherTheme } from '../theme/LauncherTheme';
 
 interface ResourceCheck {
   ready: boolean;
@@ -31,16 +36,6 @@ interface ResourceImportStatus {
   ready?: boolean;
   cancelled?: boolean;
   warning?: string;
-}
-
-interface GameSaveEntry {
-  id: string;
-  title: string;
-  file: string;
-  size: number;
-  mtime: number;
-  mode: number;
-  backup: boolean;
 }
 
 interface GameSaveList {
@@ -99,6 +94,13 @@ interface PerformanceSnapshot {
 
 interface UiGameStatus extends GameStatus {
   uiPerformance?: PerformanceSnapshot;
+  uiTouchState?: TouchSnapshot;
+  uiToolbarExpanded?: boolean;
+  uiKeyboardVisible?: boolean;
+  uiTouchControlsVisible?: boolean;
+  uiTouchInputTrace?: string;
+  uiDetectedState?: string;
+  uiSprintHeld?: boolean;
 }
 
 interface BufferProbeDisplayResult {
@@ -118,11 +120,8 @@ struct Index {
   @State private resourceReady: boolean = false;
   @State private runtimeLinked: boolean = false;
   @State private resourceMessage: string = '正在检查已安装的游戏资源…';
-  @State private directoryLabel: string = '正在准备公共下载目录…';
-  @State private directoryAvailable: boolean = false;
-  @State private packageList: DownloadGamePackage[] = [];
-  @State private packageListLoading: boolean = false;
   @State private importing: boolean = false;
+  @State private selectingPackage: boolean = false;
   @State private importProgress: number = 0;
   @State private importMessage: string = '';
   @State private importFileName: string = '';
@@ -134,14 +133,40 @@ struct Index {
   @State private superResolution: boolean = true;
   @State private frameGeneration: boolean = true;
   @State private qualityMessage: string = '';
-  private packageDirectory: GamePackageDirectory | undefined = undefined;
+  private saveDialogId: number = -1;
+  private readonly controlMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
+    style: uiMaterial.ImmersiveStyle.THIN, interactive: true, lightEffect: {}
+  });
+  private readonly gameMenuMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
+    style: uiMaterial.ImmersiveStyle.THIN, materialColor: '#8024322D',
+    interactive: true, lightEffect: { color: '#D6F5E6' }
+  });
+  private readonly dialogMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
+    style: uiMaterial.ImmersiveStyle.ULTRA_THICK, materialColor: '#30DDEFE4'
+  });
   private inputRegistered: boolean = false;
   private importPollTimer: number = -1;
   private importCancelRequested: boolean = false;
   @State private statusText: string = '等待原生游戏窗口';
   @State private detailText: string = '';
   @State private controlsVisible: boolean = true;
-  @State private menuControls: boolean = false;
+  @State private toolbarExpanded: boolean = false;
+  @State private keyboardVisible: boolean = false;
+  @State private childPanelOpen: boolean = false;
+  @State private inputResetEpoch: number = 0;
+  @State private closePanelsEpoch: number = 0;
+  @State private touchStateJson: string = '{}';
+  @State private touchStatusText: string = '状态未确认';
+  @State private gameWidth: number = 800;
+  @State private gameHeight: number = 360;
+  @State private gameAspect: number = 0;
+  @State private safeLeft: number = 0;
+  @State private safeRight: number = 0;
+  @State private safeTop: number = 0;
+  @State private safeBottom: number = 0;
+  @State private exitConfirmVisible: boolean = false;
+  private touchStateTimer: number = -1;
+  private touchGeneration: number = -1;
   @State private diagnosticsVisible: boolean = false;
   @State private gameRunning: boolean = false;
   @State private fpsText: string = '采样中';
@@ -155,8 +180,8 @@ struct Index {
   @State private resolutionText: string = '—';
   @State private outputResolutionText: string = '—';
   @State private mouseLook: boolean = true;
+  @State private uiCursorOwned: boolean = false;
   @StorageLink('gameAppForeground') @Watch('onAppForegroundChanged') private appForeground: boolean = false;
-  @StorageLink('gameImportRequestedUri') @Watch('onImportUriChanged') private requestedImportUri: string = '';
   @StorageLink('gameSessionRequestedSaveId') private requestedSessionSaveId: string = '';
   @StorageLink('gameSessionRequestedAction') @Watch('onRequestedSession') private requestedSessionAction: string = '';
   private handledSessionRestartId: number = 0;
@@ -182,6 +207,12 @@ struct Index {
   private cpuPending: boolean = false;
   private gpuPending: boolean = false;
   private pageActive: boolean = false;
+  private safeAreaWindow: window.Window | undefined = undefined;
+  private safeAreaListener: () => void = () => {
+    if (this.pageActive && this.gamePageVisible) {
+      this.readSafeArea(true);
+    }
+  };
   private lastMouseX: number = 0;
   private lastMouseY: number = 0;
   private mousePositionKnown: boolean = false;
@@ -203,6 +234,7 @@ struct Index {
   };
 
   aboutToAppear(): void {
+    ThemeControl.setDefaultTheme(launcherTheme);
     this.pageActive = true;
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     this.filesDirectory = context.filesDir;
@@ -251,11 +283,16 @@ struct Index {
     // resource validation so a failed first launch cannot lock the process.
     this.runtimeLinked = game.gameStatus().runtimeLinked;
     this.checkResources();
-    this.refreshPackages();
   }
 
   aboutToDisappear(): void {
     this.pageActive = false;
+    if (this.safeAreaWindow) {
+      try { this.safeAreaWindow.off('avoidAreaChange', this.safeAreaListener); } catch (_) {}
+      this.safeAreaWindow = undefined;
+    }
+    if (this.touchStateTimer >= 0) { clearInterval(this.touchStateTimer); this.touchStateTimer = -1; }
+    this.closeSavePicker();
     this.telemetryEpoch += 1;
     if (this.pollTimer >= 0) {
       clearInterval(this.pollTimer);
@@ -278,21 +315,21 @@ struct Index {
       const result: ResourceCheck = JSON.parse(await game.checkGameResources(this.filesDirectory)) as ResourceCheck;
       if (!this.pageActive) { return; }
       this.resourceReady = result.ready;
-      this.resourceMessage = result.ready ? '游戏资源已就绪，可开始新游戏、加载存档或进入 Demo。' :
-        '尚未找到完整资源。将游戏 ZIP 放入下载目录，或从文件管理中选择。';
+      this.resourceMessage = result.ready ? '' :
+        '尚未找到完整资源。请在下方“文件导入”中导入游戏 ZIP。';
       if (!result.ready && result.error) {
         hilog.info(0x4100, 'GameImport', 'RESOURCE_CHECK %{public}s', result.error);
       }
     } catch (error) {
       if (this.pageActive) { this.resourceReady = false; this.resourceMessage = String(error); }
     } finally {
-      if (this.pageActive) { this.resourceChecking = false; this.onRequestedSession(); this.onImportUriChanged(); }
+      if (this.pageActive) { this.resourceChecking = false; this.onRequestedSession(); }
     }
   }
 
   private onRequestedSession(): void {
     if (!this.pageActive || this.resourceChecking || !this.resourceReady || !this.runtimeLinked ||
-      !this.requestedSessionAction || this.bufferProbeMode || this.importing || this.saveBusy) { return; }
+      !this.requestedSessionAction || this.bufferProbeMode || this.importing || this.selectingPackage || this.saveBusy) { return; }
     const action: string = this.requestedSessionAction;
     const saveId: string = this.requestedSessionSaveId;
     this.requestedSessionAction = '';
@@ -310,7 +347,7 @@ struct Index {
     const saveId: string = runtime.sessionRestartSaveId || '';
     if (action !== 'load' || !/^userdata\/Documents\/Rockstar Games\/GTA V\/Default\/SGTA5[0-9]{4}$/.test(saveId) ||
       Number(saveId.slice(-4)) > 15) {
-      this.sessionRestartFailure = '原游戏未提供有效的读档槽位，请返回首页后选择存档。';
+      this.sessionRestartFailure = '原游戏未提供有效的读档槽位，请退出游戏后选择存档。';
       return;
     }
     try {
@@ -324,71 +361,24 @@ struct Index {
         parameters: { muguetSessionAction: action, muguetSessionSaveId: saveId }
       });
     } catch (error) {
-      this.sessionRestartFailure = `游戏内读档重启失败：${String(error)}。请返回首页后重试。`;
+      this.sessionRestartFailure = `游戏内读档重启失败：${String(error)}。请退出游戏后重试。`;
       this.getUIContext().getPromptAction().showToast({ message: this.sessionRestartFailure, duration: 5000 });
     }
   }
 
-  private onImportUriChanged(): void {
-    if (!this.pageActive || this.resourceChecking || !this.requestedImportUri || this.bufferProbeMode) { return; }
-    const uri: string = this.requestedImportUri;
-    this.requestedImportUri = '';
-    if (this.gamePageVisible || this.importing) {
-      this.getUIContext().getPromptAction().showToast({
-        message: this.gamePageVisible ? '请重新打开应用，回到首页后再导入游戏包。' : '正在导入，请完成后再选择其他文件。'
-      });
-      return;
-    }
-    if (!uri.startsWith('file://')) {
-      this.importMessage = '未取得文件访问权限，请点击“选择游戏 ZIP”重新选择。';
-      return;
-    }
-    this.importPackage(uri, '文件管理打开的游戏 ZIP');
-  }
-
-  private async refreshPackages(): Promise<void> {
-    if (this.packageListLoading || this.importing || this.gamePageVisible) { return; }
-    this.packageListLoading = true;
-    try {
-      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const directory: GamePackageDirectory = await getGamePackageDirectory(context);
-      const packages: DownloadGamePackage[] = await listGamePackages(directory);
-      if (!this.pageActive) { return; }
-      this.packageDirectory = directory;
-      this.directoryLabel = directory.displayName;
-      this.directoryAvailable = true;
-      this.packageList = packages;
-    } catch (error) {
-      if (this.pageActive) {
-        this.directoryAvailable = false;
-        this.directoryLabel = '公共目录暂不可用，请点击“选择游戏 ZIP”。';
-        hilog.warn(0x4100, 'GameImport', 'DOWNLOAD_DIRECTORY_FAILED %{public}s', String(error));
-      }
-    } finally {
-      if (this.pageActive) { this.packageListLoading = false; }
-    }
-  }
-
-  private async openDownloadDirectory(): Promise<void> {
-    try {
-      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const directory: GamePackageDirectory = this.packageDirectory || await getGamePackageDirectory(context);
-      await openGamePackageDirectory(context, directory);
-    } catch (error) {
-      this.importMessage = `无法打开文件管理，请手动打开 ${this.directoryLabel}，或点击“选择游戏 ZIP”。`;
-      hilog.warn(0x4100, 'GameImport', 'OPEN_DOWNLOAD_FAILED %{public}s', String(error));
-    }
-  }
-
   private async choosePackage(): Promise<void> {
-    if (this.importing || this.resourceChecking || this.gamePageVisible || this.saveBusy) { return; }
+    if (this.importing || this.selectingPackage || this.resourceChecking || this.gamePageVisible || this.saveBusy) { return; }
+    this.selectingPackage = true;
+    let uri: string = '';
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const uri: string = await selectGamePackage(context, this.packageDirectory?.uri || '');
-      if (uri && this.pageActive) { await this.importPackage(uri, '所选游戏 ZIP'); }
+      uri = await selectGamePackage(context);
     } catch (error) {
       if (this.pageActive) { this.importMessage = `未选择文件或文件无法打开：${String(error)}`; }
+    } finally {
+      this.selectingPackage = false;
     }
+    if (uri && this.pageActive) { await this.importPackage(uri, '所选游戏 ZIP'); }
   }
 
   private updateImportProgress(): void {
@@ -450,7 +440,7 @@ struct Index {
   }
 
   private async showSaves(): Promise<void> {
-    if (this.saveBusy || this.importing || this.gamePageVisible) { return; }
+    if (this.saveBusy || this.importing || this.selectingPackage || this.gamePageVisible || this.saveListVisible) { return; }
     this.saveBusy = true;
     try {
       const result: GameSaveList = JSON.parse(await game.listGameSaves(this.filesDirectory)) as GameSaveList;
@@ -461,26 +451,54 @@ struct Index {
       if (this.saves.length === 0) {
         await this.getUIContext().getPromptAction().showDialog({
           title: '没有存档', message: '尚未找到可加载的剧情存档。可以先开始新游戏，或导入存档 ZIP。',
-          buttons: [{ text: '知道了', color: '#23815F' }]
+          buttons: [{ text: '知道了', color: $r('sys.color.font_emphasize') }],
+          systemMaterial: this.dialogMaterial
         });
       } else {
         this.saveListVisible = true;
+        const id: number = await this.getUIContext().getPromptAction().openCustomDialog({
+          builder: () => { this.savePicker(); },
+          alignment: DialogAlignment.Center,
+          autoCancel: true,
+          systemMaterial: this.dialogMaterial,
+          onWillDismiss: (action: DismissDialogAction) => {
+            this.saveListVisible = false;
+            this.saveDialogId = -1;
+            action.dismiss();
+          }
+        });
+        this.saveDialogId = id;
+        if (!this.pageActive || !this.saveListVisible || this.gamePageVisible) { this.closeSavePicker(); }
       }
     } catch (error) {
+      this.saveListVisible = false;
       if (this.pageActive) { this.saveMessage = `读取存档失败：${String(error)}`; }
     } finally {
       if (this.pageActive) { this.saveBusy = false; }
     }
   }
 
+  private closeSavePicker(): void {
+    this.saveListVisible = false;
+    const id: number = this.saveDialogId;
+    this.saveDialogId = -1;
+    if (id >= 0) {
+      try {
+        this.getUIContext().getPromptAction().closeCustomDialog(id);
+      } catch (error) {
+        hilog.warn(0x4100, 'GameSave', 'CLOSE_DIALOG_FAILED %{public}s', String(error));
+      }
+    }
+  }
+
   private async chooseSavePackage(): Promise<void> {
-    if (this.saveBusy || this.importing || this.resourceChecking || this.gamePageVisible) { return; }
+    if (this.saveBusy || this.importing || this.selectingPackage || this.resourceChecking || this.gamePageVisible) { return; }
     let file: fileIo.File | undefined = undefined;
     this.saveBusy = true;
     this.saveMessage = '';
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const uri: string = await selectSavePackage(context, this.packageDirectory?.uri || '');
+      const uri: string = await selectSavePackage(context);
       if (!uri || !this.pageActive) { return; }
       file = await fileIo.open(uri, fileIo.OpenMode.READ_ONLY);
       this.saveMessage = '正在检查并导入存档…';
@@ -502,47 +520,56 @@ struct Index {
   }
 
   private async returnToLauncher(): Promise<void> {
+    if (this.exitConfirmVisible) { return; }
+    this.exitConfirmVisible = true;
+    this.resetInput();
     try {
       const result = await this.getUIContext().getPromptAction().showDialog({
-        title: '返回首页', message: '将退出当前游戏。请先确认游戏内保存已经完成，未保存的进度不会保留。',
-        buttons: [{ text: '继续游戏', color: '#59726C' }, { text: '返回首页', color: '#23815F' }]
+        title: '退出游戏', message: '退出当前游戏并返回启动页。请先确认游戏内保存已经完成，未保存的进度不会保留。',
+        buttons: [{ text: '继续游戏', color: $r('sys.color.font_secondary') },
+          { text: '退出游戏', color: $r('sys.color.font_emphasize') }],
+        systemMaterial: this.dialogMaterial
       });
       if (result.index !== 1) { return; }
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       this.resetInput();
-      context.getApplicationContext().restartApp({
+      await context.getApplicationContext().restartApp({
         bundleName: context.abilityInfo.bundleName, moduleName: 'entry', abilityName: 'EntryAbility'
       });
     } catch (error) {
-      this.getUIContext().getPromptAction().showToast({ message: `返回首页失败：${String(error)}` });
+      this.getUIContext().getPromptAction().showToast({ message: `退出游戏失败：${String(error)}` });
+    } finally {
+      this.exitConfirmVisible = false;
+      this.mousePositionKnown = false;
+      if (this.appForeground) { this.focusGame(); }
     }
   }
 
   onBackPress(): boolean {
-    if (this.saveListVisible) { this.saveListVisible = false; return true; }
+    if (this.exitConfirmVisible) { return true; }
+    if (this.saveListVisible) { this.closeSavePicker(); return true; }
+    if (this.keyboardVisible) { this.toggleKeyboard(); return true; }
+    if (this.childPanelOpen) { this.resetInput(); this.closePanelsEpoch += 1; return true; }
+    if (this.diagnosticsVisible) { this.toggleStatus(); return true; }
+    if (this.toolbarExpanded) { this.collapseAll(); return true; }
     if (this.gamePageVisible) { this.returnToLauncher(); return true; }
     return false;
   }
 
-  private saveDescription(item: GameSaveEntry): string {
-    const mode: string = item.mode === 2 ? 'Demo' : '剧情';
-    const date: string = item.mtime > 0 ? new Date(item.mtime * 1000).toLocaleString() : '时间未知';
-    const fileName: string = item.file.slice(item.file.lastIndexOf('/') + 1);
-    return `${fileName} · ${mode} · ${date} · ${this.packageSize(item.size)}`;
-  }
-
   private beginGame(action: string = 'demo', saveId: string = ''): void {
-    if (this.importing || this.resourceChecking || !this.resourceReady || !this.runtimeLinked || this.gamePageVisible || this.saveBusy) { return; }
+    if (this.importing || this.selectingPackage || this.resourceChecking || !this.resourceReady || !this.runtimeLinked || this.gamePageVisible || this.saveBusy) { return; }
     try {
       applyGameDefaults(this.filesDirectory);
       applyGameQuality(this.filesDirectory, {
         preset: this.qualityPreset, superResolution: this.superResolution, frameGeneration: this.frameGeneration
       });
       game.configureGame(this.filesDirectory, action, saveId);
-      this.saveListVisible = false;
+      this.closeSavePicker();
       inputDevice.on('change', this.inputListener);
       this.inputRegistered = true;
       this.gamePageVisible = true;
+      this.readSafeArea();
+      this.touchStateTimer = setInterval(() => { this.refreshTouchState(); }, 50);
       this.refreshStatus();
       this.pollTimer = setInterval(() => { this.refreshStatus(); }, 1000);
     } catch (error) {
@@ -553,33 +580,29 @@ struct Index {
     }
   }
 
-  private selectQuality(preset: string, superResolution: boolean, frameGeneration: boolean): void {
-    if (this.gamePageVisible || this.importing || this.saveBusy) { return; }
+  private selectQuality(preset: string, superResolution: boolean, frameGeneration: boolean): boolean {
+    if (this.gamePageVisible || this.importing || this.selectingPackage || this.saveBusy) { return false; }
     try {
       saveGameQuality(this.filesDirectory, { preset, superResolution, frameGeneration });
       this.qualityPreset = preset;
       this.superResolution = superResolution;
       this.frameGeneration = frameGeneration;
       this.qualityMessage = '';
+      return true;
     } catch (error) {
       this.qualityMessage = `画质选择未保存：${String(error)}`;
+      return false;
     }
   }
 
-  private packageSize(bytes: number): string {
-    return bytes >= 1000000000 ? `${(bytes / 1000000000).toFixed(2)} GB` : `${(bytes / 1000000).toFixed(1)} MB`;
-  }
-
   private focusGame(): void {
-    if (!this.appForeground) { return; }
+    if (!this.appForeground || this.exitConfirmVisible) { return; }
+    game.setInputFocus(true);
     this.getUIContext().getFocusController().requestFocus('game-input');
   }
 
   private onAppForegroundChanged(): void {
-    if (!this.gamePageVisible) {
-      if (this.appForeground && this.pageActive && !this.bufferProbeMode) { this.refreshPackages(); }
-      return;
-    }
+    if (!this.gamePageVisible) { return; }
     this.telemetryEpoch += 1;
     this.previousPresents = -1;
     this.previousSampleMs = 0;
@@ -590,14 +613,19 @@ struct Index {
     hilog.info(0x4100, 'GameInput', 'UI_FOREGROUND %{public}s', String(this.appForeground));
     this.resetInput();
     if (this.appForeground) {
+      this.readSafeArea();
       game.setInputFocus(true);
       this.focusGame();
     } else {
+      this.touchStateJson = '{}';
       this.gameFocused = false;
     }
   }
 
   private toggleStatus(): void {
+    this.resetInput();
+    this.keyboardVisible = false;
+    this.closePanelsEpoch += 1;
     this.diagnosticsVisible = !this.diagnosticsVisible;
     this.telemetryEpoch += 1;
     if (this.diagnosticsVisible) {
@@ -663,6 +691,7 @@ struct Index {
   }
 
   private resetInput(): void {
+    this.inputResetEpoch += 1;
     game.setInputFocus(false);
     this.mousePositionKnown = false;
     this.externalButtons = [false, false, false, false, false];
@@ -678,15 +707,90 @@ struct Index {
   }
 
   private toggleMouseLook(): void {
+    this.resetInput();
     this.mouseLook = !this.mouseLook;
     this.mousePositionKnown = false;
-    this.showPointer(!this.mouseLook);
+    this.showPointer(!this.effectiveMouseLook());
     this.focusGame();
+  }
+
+  private toggleKeyboard(): void {
+    this.resetInput();
+    this.closePanelsEpoch += 1;
+    this.keyboardVisible = !this.keyboardVisible;
+    this.diagnosticsVisible = false;
+    this.mousePositionKnown = false;
+    this.focusGame();
+  }
+
+  private collapseAll(): void {
+    this.resetInput();
+    this.toolbarExpanded = false;
+    this.keyboardVisible = false;
+    this.diagnosticsVisible = false;
+    this.childPanelOpen = false;
+    this.closePanelsEpoch += 1;
+    this.telemetryEpoch += 1;
+    this.focusGame();
+  }
+
+  private refreshTouchState(): void {
+    if (!this.pageActive || !this.appForeground || !this.gamePageVisible) { return; }
+    let cursor: boolean = false;
+    let changedGeneration: boolean = false;
+    try {
+      this.touchStateJson = game.getTouchState();
+      const state: TouchSnapshot = JSON.parse(this.touchStateJson) as TouchSnapshot;
+      if (Number.isFinite(state.generation)) {
+        changedGeneration = this.touchGeneration >= 0 && this.touchGeneration !== state.generation;
+        this.touchGeneration = state.generation;
+      }
+      const ui = state.ui;
+      const owner = state.uiOwnsInput;
+      cursor = ui?.known === true && owner?.known === true && owner.value === true &&
+        ui.generation === state.generation && owner.generation === state.generation &&
+        ui.sampledAtMonoMs !== undefined && owner.sampledAtMonoMs !== undefined &&
+        state.nowMonoMs - ui.sampledAtMonoMs <= 500 && state.nowMonoMs - owner.sampledAtMonoMs <= 500 &&
+        ['pause', 'map', 'phone', 'phoneCamera', 'web', 'startup'].includes(ui.value || '');
+    } catch (_) { this.touchStateJson = '{}'; }
+    if (cursor !== this.uiCursorOwned || changedGeneration) {
+      this.resetInput(); this.uiCursorOwned = cursor; this.showPointer(!this.effectiveMouseLook());
+      this.focusGame();
+    }
+  }
+
+  private effectiveMouseLook(): boolean { return this.mouseLook && !this.uiCursorOwned && !this.keyboardVisible; }
+
+  private async readSafeArea(restoreInput: boolean = false): Promise<void> {
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const mainWindow = await window.getLastWindow(context);
+      if (!this.pageActive || !this.gamePageVisible) { return; }
+      if (!this.safeAreaWindow) {
+        mainWindow.on('avoidAreaChange', this.safeAreaListener);
+        this.safeAreaWindow = mainWindow;
+      }
+      const cutout: window.AvoidArea = mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
+      const system: window.AvoidArea = mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      const navigation: window.AvoidArea = mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
+      const left: number = this.getUIContext().px2vp(Math.max(cutout.leftRect.width, system.leftRect.width));
+      const right: number = this.getUIContext().px2vp(Math.max(cutout.rightRect.width, system.rightRect.width));
+      const top: number = this.getUIContext().px2vp(Math.max(cutout.topRect.height, system.topRect.height));
+      const bottom: number = this.getUIContext().px2vp(Math.max(cutout.bottomRect.height, system.bottomRect.height, navigation.bottomRect.height));
+      if (left !== this.safeLeft || right !== this.safeRight || top !== this.safeTop || bottom !== this.safeBottom) {
+        if (restoreInput) { this.resetInput(); }
+        this.safeLeft = left; this.safeRight = right; this.safeTop = top; this.safeBottom = bottom;
+        if (restoreInput && !this.diagnosticsVisible && !this.keyboardVisible && !this.childPanelOpen) { this.focusGame(); }
+      }
+    } catch (_) {}
   }
 
   private externalKey(event: KeyEvent): boolean {
     this.lastKeyCode = event.keyCode;
-    if (!this.appForeground) { return false; }
+    if (!this.appForeground || this.exitConfirmVisible) {
+      if (event.type === KeyType.Up) { game.sendKeyEvent(event.keyCode, false, 0, true); }
+      return false;
+    }
     if (event.type !== KeyType.Down && event.type !== KeyType.Up) { return false; }
     // F8 toggles camera look and the visible menu cursor without changing Escape's game action.
     if (event.keyCode === 2097) {
@@ -715,7 +819,7 @@ struct Index {
     if (event.action === MouseAction.Press) { this.focusGame(); }
     if (event.action === MouseAction.Press || event.action === MouseAction.Release) {
       // A device can click at a new position without delivering a preceding Move.
-      game.sendPointer(this.getUIContext().vp2px(event.x), this.getUIContext().vp2px(event.y), 0, 0, this.mouseLook);
+      game.sendPointer(this.getUIContext().vp2px(event.x), this.getUIContext().vp2px(event.y), 0, 0, this.effectiveMouseLook());
     }
     if (event.action === MouseAction.Move) {
       const rawX: number = event.rawDeltaX || 0;
@@ -723,8 +827,8 @@ struct Index {
       const useRaw: boolean = rawX !== 0 || rawY !== 0;
       const dx: number = useRaw ? rawX : (this.mousePositionKnown ? event.x - this.lastMouseX : 0);
       const dy: number = useRaw ? rawY : (this.mousePositionKnown ? event.y - this.lastMouseY : 0);
-      game.sendPointer(this.getUIContext().vp2px(event.x), this.getUIContext().vp2px(event.y), dx, dy, this.mouseLook);
-      this.showPointer(!this.mouseLook);
+      game.sendPointer(this.getUIContext().vp2px(event.x), this.getUIContext().vp2px(event.y), dx, dy, this.effectiveMouseLook());
+      this.showPointer(!this.effectiveMouseLook());
       if (!this.loggedMouse) {
         this.loggedMouse = true;
         hilog.info(0x4100, 'GameInput', 'EXTERNAL_POINTER rawAvailable=%{public}s sourceTool=%{public}d',
@@ -807,6 +911,13 @@ struct Index {
   private refreshStatus(): void {
     try {
       const status: UiGameStatus = game.gameStatus() as UiGameStatus;
+      status.uiTouchState = JSON.parse(this.touchStateJson) as TouchSnapshot;
+      status.uiToolbarExpanded = this.toolbarExpanded;
+      status.uiKeyboardVisible = this.keyboardVisible;
+      status.uiTouchControlsVisible = this.controlsVisible;
+      status.uiTouchInputTrace = AppStorage.get<string>('gameTouchInputTrace') || '';
+      status.uiDetectedState = this.touchStatusText;
+      status.uiSprintHeld = AppStorage.get<boolean>('gameSprintHeld') || false;
       status.uiAppForeground = this.appForeground;
       status.uiGameFocused = this.gameFocused;
       status.uiMouseLook = this.mouseLook;
@@ -825,6 +936,7 @@ struct Index {
       this.memoryText = runtime.rssMB && runtime.rssMB > 0 ? `${runtime.rssMB.toFixed(0)} MB` : '—';
       const renderSize: number[] = runtime.spatialUpscale?.activeGameRenderSize || runtime.renderSize || [];
       const outputSize: number[] = runtime.spatialUpscale?.activeOutputSize || renderSize;
+      if (renderSize.length === 2 && renderSize[1] > 0) { this.gameAspect = renderSize[0] / renderSize[1]; }
       this.resolutionText = renderSize.length === 2 ? `${renderSize[0]} × ${renderSize[1]}` : '—';
       this.outputResolutionText = outputSize.length === 2 ? `${outputSize[0]} × ${outputSize[1]}` : '—';
       status.uiPerformance = {
@@ -844,9 +956,9 @@ struct Index {
           `游戏启动请求失败 (${status.startResult})`;
       } else {
         if (this.sessionRestartFailure || runtime.sessionRestartError) {
-          this.statusText = '游戏内读档未完成，请返回首页重试';
+          this.statusText = '游戏内读档未完成，请退出游戏后重试';
         } else if (runtime.saveLoadError) {
-          this.statusText = '存档加载失败，请返回首页重试';
+          this.statusText = '存档加载失败，请退出游戏后重试';
         } else if (runtime.saveLoadPending) {
           this.statusText = '正在加载所选存档';
         } else if ((runtime.presents || 0) > 0 && !runtime.error) {
@@ -860,7 +972,7 @@ struct Index {
         } else if (runtime.stage === 'running-game-main') {
           this.statusText = '游戏正在启动';
         } else if (runtime.stage === 'error') {
-          this.statusText = '游戏启动遇到错误，请查看状态';
+          this.statusText = '游戏启动遇到错误，请打开性能检测';
         } else {
           this.statusText = runtime.stage || runtime.status || '游戏运行时初始化中';
         }
@@ -886,269 +998,246 @@ struct Index {
     }
   }
 
-  private handleKey(key: string, event: TouchEvent): void {
-    if (event.type === TouchType.Down) {
-      this.focusGame();
-      game.setInputFocus(true);
-      game.sendKey(key, true);
-    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      game.sendKey(key, false);
-    }
+  @Builder
+  private toolbarItem(label: string, active: boolean, action: () => void) {
+    Button(label, { type: ButtonType.Capsule, buttonStyle: ButtonStyleMode.NORMAL })
+      .width(label.length * 12 + 24).height(44).fontSize(12).focusable(false)
+      .padding({ left: 12, right: 12 })
+      .fontColor(active ? '#B8F2D7' : '#F4F8F6')
+      .systemMaterial(this.gameMenuMaterial)
+      .accessibilitySelected(active)
+      .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+      .onTouch((event: TouchEvent) => { event.stopPropagation(); })
+      .onClick(action)
   }
 
-  private handleMouse(button: number, event: TouchEvent): void {
-    if (event.type === TouchType.Down) {
-      this.focusGame();
-      game.setInputFocus(true);
-      game.sendMouseButton(button, true);
-    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      game.sendMouseButton(button, false);
-    }
+  @Builder
+  private menuToggle() {
+    Button(this.toolbarExpanded ? '›' : '≡', { type: ButtonType.Circle, buttonStyle: ButtonStyleMode.NORMAL })
+      .width(32).height(32).fontSize(23).focusable(false).margin(6)
+      .responseRegion({ x: -6, y: -6, width: 44, height: 44 })
+      .fontColor('#F4F8F6').systemMaterial(this.gameMenuMaterial)
+      .accessibilityText(this.toolbarExpanded ? '收起游戏菜单' : '展开游戏菜单')
+      .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+      .onTouch((event: TouchEvent) => { event.stopPropagation(); })
+      .onClick(() => {
+        if (this.toolbarExpanded) { this.collapseAll(); }
+        else { this.resetInput(); this.toolbarExpanded = true; this.closePanelsEpoch += 1; }
+      })
+  }
+
+  @Builder
+  private gameToolbar() {
+    Row({ space: 6 }) {
+      if (this.toolbarExpanded) {
+        Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End,
+          space: { main: LengthMetrics.vp(6), cross: LengthMetrics.vp(6) } }) {
+          this.toolbarItem('退出游戏', false, () => { this.returnToLauncher(); })
+          this.toolbarItem(this.mouseLook ? '鼠标：视角' : '鼠标：光标', false, () => { this.toggleMouseLook(); })
+          this.toolbarItem('全键盘按键', this.keyboardVisible, () => { this.toggleKeyboard(); })
+          this.toolbarItem(this.controlsVisible ? '收起按键' : '显示按键', !this.controlsVisible, () => {
+            this.resetInput(); this.closePanelsEpoch += 1; this.controlsVisible = !this.controlsVisible;
+          })
+          this.toolbarItem('性能检测', this.diagnosticsVisible, () => { this.toggleStatus(); })
+        }.width(Math.min(408, Math.max(180, this.gameWidth - this.safeLeft - this.safeRight - 92)))
+      }
+      this.menuToggle()
+    }.alignItems(VerticalAlign.Top)
+      .padding(this.toolbarExpanded ? { left: 8, right: 2, top: 6, bottom: 6 } : 0)
+      .borderRadius(28)
+      .backgroundColor(this.toolbarExpanded ? '#CE182522' : '#00000000')
+      .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+      .onTouch((event: TouchEvent) => { event.stopPropagation(); })
+  }
+
+  @Builder
+  private metric(label: string, value: string) {
+    Column({ space: 5 }) {
+      Text(label).fontSize(10).fontColor('#A6BBB2')
+      Text(value).fontSize(18).fontWeight(FontWeight.Medium).fontColor('#F4FAF6')
+        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+    }.alignItems(HorizontalAlign.Start).layoutWeight(1).padding(10)
+      .backgroundColor('#402E4240').borderRadius(12)
   }
 
   @Builder
   private performancePanel() {
-    Column({ space: 12 }) {
+    Column({ space: 10 }) {
       Row({ space: 8 }) {
-        Text('性能状态').fontSize(15).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        Text(this.statusText).fontSize(11).fontColor('#B6C9D8')
-        Blank()
-        Text('v0.8.0').fontSize(11).fontColor('#B6C9D8')
+        Column({ space: 3 }) {
+          Text('性能检测').fontSize(17).fontWeight(FontWeight.Bold).fontColor('#F4FAF6')
+          Text(this.statusText).fontSize(10).fontColor('#A6BBB2').maxLines(1)
+          Text(this.touchStatusText).fontSize(11).fontColor('#B5EAD3').maxLines(1)
+        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+        Text('实时').fontSize(10).fontColor('#B5EAD3').padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .backgroundColor('#254F7964').borderRadius(12)
+        Button('×', { type: ButtonType.Circle }).width(44).height(44).fontSize(23).focusable(false)
+          .fontColor('#DDEBE3').backgroundColor('#30455650').accessibilityText('关闭性能检测')
+          .onClick(() => { this.toggleStatus(); })
       }.width('100%')
-      Row({ space: 16 }) {
-        Column({ space: 4 }) {
-          Text('游戏帧率 · FPS').fontSize(11).fontColor('#B6C9D8')
-          Text(this.fpsText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Column({ space: 4 }) {
-          Text('CPU 占用 · 本应用').fontSize(11).fontColor('#B6C9D8')
-          Text(this.appCpuText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Column({ space: 4 }) {
-          Text('CPU 占用 · 系统').fontSize(11).fontColor('#B6C9D8')
-          Text(this.systemCpuText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Column({ space: 4 }) {
-          Text('GPU 负载 · 系统等级').fontSize(11).fontColor('#B6C9D8')
-          Text(this.gpuLoadText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-      }.width('100%')
-      Row({ space: 16 }) {
-        Column({ space: 4 }) {
-          Text('平均帧间隔').fontSize(11).fontColor('#B6C9D8')
-          Text(this.frameTimeText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Column({ space: 4 }) {
-          Text('内存 · 本应用').fontSize(11).fontColor('#B6C9D8')
-          Text(this.memoryText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Column({ space: 4 }) {
-          Text('显存 · 本应用').fontSize(11).fontColor('#B6C9D8')
-          Text(this.gpuMemoryText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Column({ space: 4 }) {
-          Text('GPU 频率').fontSize(11).fontColor('#B6C9D8')
-          Text(this.gpuFrequencyText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-      }.width('100%')
-      Row({ space: 12 }) {
-        Text(`渲染 ${this.resolutionText}  →  输出 ${this.outputResolutionText}`)
-          .fontSize(11).fontColor('#B6C9D8')
-        Blank()
-        Text('GPU 为 1–10 级负载；占用信息每 2 秒更新')
-          .fontSize(10).fontColor('#90A7B9')
-      }.width('100%')
-    }.padding(14).width('100%').backgroundColor('#D9101820').borderRadius(14)
+      Scroll() {
+        Column({ space: 8 }) {
+          Row({ space: 12 }) {
+            Column({ space: 1 }) {
+              Row({ space: 6 }) {
+                Text(this.fpsText).fontSize(40).fontWeight(FontWeight.Bold).fontColor('#B5EAD3')
+                Text('FPS').fontSize(12).fontColor('#A6BBB2').margin({ top: 18 })
+              }
+              Text('游戏呈现帧率').fontSize(10).fontColor('#A6BBB2')
+            }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+            Column({ space: 5 }) {
+              Text('平均帧间隔').fontSize(10).fontColor('#A6BBB2')
+              Text(this.frameTimeText).fontSize(20).fontWeight(FontWeight.Medium).fontColor('#F4FAF6')
+            }.alignItems(HorizontalAlign.End)
+          }.width('100%').padding(12).backgroundColor('#304B745F').borderRadius(14)
+          Row({ space: 8 }) { this.metric('CPU · 本应用', this.appCpuText); this.metric('CPU · 系统', this.systemCpuText) }.width('100%')
+          Row({ space: 8 }) { this.metric('GPU · 系统负载等级', this.gpuLoadText); this.metric('GPU · 频率', this.gpuFrequencyText) }.width('100%')
+          Row({ space: 8 }) { this.metric('内存 · 本应用', this.memoryText); this.metric('显存 · 本应用', this.gpuMemoryText) }.width('100%')
+          Column({ space: 4 }) {
+            Text(`渲染  ${this.resolutionText}`).fontSize(11).fontColor('#CCDAD3')
+            Text(`输出  ${this.outputResolutionText}`).fontSize(11).fontColor('#CCDAD3')
+            Text('GPU 为系统 1–10 级负载，非百分比；占用每 2 秒采样。').fontSize(10).fontColor('#8BA69A')
+            Text('FPS 按游戏呈现计数计算，非屏幕最终合成帧率。').fontSize(10).fontColor('#8BA69A')
+          }.width('100%').alignItems(HorizontalAlign.Start).padding({ top: 4, bottom: 4 })
+        }.width('100%')
+      }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
+    }.padding(14).width(Math.min(420, this.gameWidth - this.safeLeft - this.safeRight - 24))
+      .height(Math.min(410, this.gameHeight - this.safeTop - this.safeBottom - (this.gameWidth < 700 ? 128 : 80)))
+      .backgroundColor('#F2182528').borderRadius(22).border({ width: 1, color: '#35C5E0D1' })
+      .shadow({ radius: 24, color: '#70000000', offsetY: 8 })
       .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+      .onTouch((event: TouchEvent) => { event.stopPropagation(); })
   }
 
   @Builder
-  private mouseControl(label: string, button: number) {
-    Text(label)
-      .fontSize(15).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-      .width(54).height(48).textAlign(TextAlign.Center)
-      .backgroundColor('#70344658').borderRadius(12)
-      .border({ width: 1, color: '#80B4C8D8' })
-      .onTouch((event: TouchEvent) => { this.handleMouse(button, event); })
-      .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+  private resourceAndStartupContent() {
+    Text(this.resourceChecking ? '检查资源中' : (this.resourceReady ? '资源已就绪' : '等待导入游戏资源'))
+      .fontSize(16).fontWeight(FontWeight.Medium).fontColor(LauncherColors.accent)
+    if (this.resourceMessage.length > 0) {
+      Text(this.resourceMessage).fontSize(14).fontColor(LauncherColors.secondaryText).width('100%')
+    }
+    if (!this.runtimeLinked) {
+      Text('当前为公开应用壳。导入资源后，仍需安装自行编译并签名的完整游戏包才能运行游戏。')
+        .fontSize(13).fontColor(LauncherColors.secondaryText).width('100%')
+    }
+    LauncherGraphicsSettings({
+      preset: this.qualityPreset,
+      superResolution: this.superResolution,
+      frameGeneration: this.frameGeneration,
+      settingsEnabled: !this.importing && !this.selectingPackage && !this.saveBusy && !this.resourceChecking,
+      onPresetChange: (preset: string) => {
+        return this.selectQuality(preset, this.superResolution, this.frameGeneration);
+      },
+      onSuperResolutionChange: (enabled: boolean) => {
+        return this.selectQuality(this.qualityPreset, enabled, this.frameGeneration);
+      },
+      onFrameGenerationChange: (enabled: boolean) => {
+        return this.selectQuality(this.qualityPreset, this.superResolution, enabled);
+      }
+    })
+    if (this.qualityMessage.length > 0) {
+      Text(this.qualityMessage).fontSize(12).fontColor(LauncherColors.accent).width('100%')
+    }
+    Row({ space: 12 }) {
+      Button('开始新游戏').layoutWeight(1).constraintSize({ minHeight: 48 })
+        .buttonStyle(ButtonStyleMode.EMPHASIZED)
+        .enabled(this.resourceReady && this.runtimeLinked && !this.resourceChecking && !this.importing && !this.selectingPackage && !this.saveBusy)
+        .onClick(() => { this.beginGame('new'); })
+      Button('加载存档').layoutWeight(1).constraintSize({ minHeight: 48 })
+        .buttonStyle(ButtonStyleMode.NORMAL)
+        .backgroundColor(LauncherColors.secondaryButton).fontColor(LauncherColors.accent)
+        .border({ width: 1, color: LauncherColors.secondaryButtonBorder })
+        .enabled(this.resourceReady && this.runtimeLinked && !this.resourceChecking && !this.importing && !this.selectingPackage && !this.saveBusy)
+        .onClick(() => { this.showSaves(); })
+      Button('开始 Demo').layoutWeight(1).constraintSize({ minHeight: 48 })
+        .buttonStyle(ButtonStyleMode.NORMAL)
+        .backgroundColor(LauncherColors.secondaryButton).fontColor(LauncherColors.accent)
+        .border({ width: 1, color: LauncherColors.secondaryButtonBorder })
+        .enabled(this.resourceReady && this.runtimeLinked && !this.resourceChecking && !this.importing && !this.selectingPackage && !this.saveBusy)
+        .onClick(() => { this.beginGame('demo'); })
+    }.width('100%')
   }
 
   @Builder
-  private control(label: string, key: string) {
-    Text(label)
-      .fontSize(15).fontWeight(FontWeight.Medium).fontColor('#FFFFFF')
-      .width(54).height(48).textAlign(TextAlign.Center)
-      .backgroundColor('#70344658').borderRadius(12)
-      .border({ width: 1, color: '#80B4C8D8' })
-      .onTouch((event: TouchEvent) => { this.handleKey(key, event); })
-      .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+  private importFilesContent() {
+    Text('选择 ZIP 文件直接导入，无需提前解压。')
+      .fontSize(14).fontColor(LauncherColors.secondaryText).width('100%')
+    Row({ space: 12 }) {
+      Button('导入游戏 ZIP').layoutWeight(1).constraintSize({ minHeight: 48 })
+        .buttonStyle(ButtonStyleMode.NORMAL)
+        .backgroundColor(LauncherColors.secondaryButton).fontColor(LauncherColors.accent)
+        .border({ width: 1, color: LauncherColors.secondaryButtonBorder })
+        .enabled(!this.importing && !this.selectingPackage && !this.resourceChecking && !this.saveBusy)
+        .onClick(() => { this.choosePackage(); })
+      Button('导入存档 ZIP').layoutWeight(1).constraintSize({ minHeight: 48 })
+        .buttonStyle(ButtonStyleMode.NORMAL)
+        .backgroundColor(LauncherColors.secondaryButton).fontColor(LauncherColors.accent)
+        .border({ width: 1, color: LauncherColors.secondaryButtonBorder })
+        .enabled(!this.saveBusy && !this.importing && !this.selectingPackage && !this.resourceChecking)
+        .onClick(() => { this.chooseSavePackage(); })
+    }.width('100%')
+    if (this.saveBusy) {
+      Row({ space: 8 }) {
+        LoadingProgress().width(24).height(24).color(LauncherColors.accent)
+        Text('正在处理存档…').fontSize(14).fontColor(LauncherColors.secondaryText)
+      }.width('100%')
+    }
+    if (this.saveMessage.length > 0) {
+      Text(this.saveMessage).fontSize(13).fontColor(LauncherColors.secondaryText).width('100%')
+    }
+    if (this.importing || this.importMessage.length > 0) {
+      Divider().color(LauncherColors.border)
+      if (this.importFileName.length > 0) {
+        Text(this.importFileName).fontSize(14).fontColor(LauncherColors.text).maxLines(2)
+      }
+      Text(this.importMessage).fontSize(14).fontColor(LauncherColors.secondaryText).width('100%')
+      if (this.importing) {
+        Progress({ value: this.importProgress, total: 100, type: ProgressType.Linear })
+          .width('100%').color(LauncherColors.accent)
+        Text('请保持应用打开，等待解压和校验完成。').fontSize(12).fontColor(LauncherColors.secondaryText)
+        Button('取消导入').constraintSize({ minHeight: 48 }).buttonStyle(ButtonStyleMode.TEXTUAL).onClick(() => {
+          this.importCancelRequested = true;
+          game.cancelGameImport();
+          this.importMessage = '正在取消，请等待临时资源清理完成…';
+        })
+      }
+    }
   }
 
   @Builder
   private gameResourcePage() {
-    Scroll() {
-      Column({ space: 20 }) {
-        Row() {
-          Column({ space: 6 }) {
-            Text($r('app.string.app_name')).fontSize(28).fontWeight(FontWeight.Bold).fontColor('#172C29')
-            Text('导入自己的游戏资源，准备好后开始游戏。').fontSize(14).fontColor('#59726C')
-          }.alignItems(HorizontalAlign.Start)
-          Blank()
-          Text('v0.8.0').fontSize(13).fontColor('#59726C')
-        }.width('100%')
-
-        Column({ space: 10 }) {
-          Text(this.resourceChecking ? '检查资源中' : (this.resourceReady ? '资源已就绪' : '导入游戏资源'))
-            .fontSize(20).fontWeight(FontWeight.Medium).fontColor('#183F34')
-          Text(this.resourceMessage).fontSize(14).fontColor('#48665C').width('100%')
-          if (!this.runtimeLinked) {
-            Text('当前为公开应用壳。导入资源后，仍需安装自行编译并签名的完整游戏包才能运行游戏。')
-              .fontSize(13).fontColor('#8B642A').width('100%')
-          }
-          Row({ space: 10 }) {
-            Text('画质预设').fontSize(14).fontColor('#183F34')
-            Button('高').width(48).height(36).fontSize(14)
-              .backgroundColor(this.qualityPreset === 'high' ? '#23815F' : '#F5FAF7')
-              .fontColor(this.qualityPreset === 'high' ? '#FFFFFF' : '#23634B')
-              .onClick(() => { this.selectQuality('high', this.superResolution, this.frameGeneration); })
-            Button('中').width(48).height(36).fontSize(14)
-              .backgroundColor(this.qualityPreset === 'medium' ? '#23815F' : '#F5FAF7')
-              .fontColor(this.qualityPreset === 'medium' ? '#FFFFFF' : '#23634B')
-              .onClick(() => { this.selectQuality('medium', this.superResolution, this.frameGeneration); })
-            Button('低').width(48).height(36).fontSize(14)
-              .backgroundColor(this.qualityPreset === 'low' ? '#23815F' : '#F5FAF7')
-              .fontColor(this.qualityPreset === 'low' ? '#FFFFFF' : '#23634B')
-              .onClick(() => { this.selectQuality('low', this.superResolution, this.frameGeneration); })
-            Blank()
-            Text('超分').fontSize(14).fontColor('#183F34')
-            Toggle({ type: ToggleType.Switch, isOn: this.superResolution }).selectedColor('#23815F')
-              .accessibilityText('超分开关')
-              .onChange((enabled: boolean) => {
-                if (enabled !== this.superResolution) { this.selectQuality(this.qualityPreset, enabled, this.frameGeneration); }
-              })
-            Text('补帧').fontSize(14).fontColor('#183F34')
-            Toggle({ type: ToggleType.Switch, isOn: this.frameGeneration }).selectedColor('#23815F')
-              .accessibilityText('补帧开关')
-              .onChange((enabled: boolean) => {
-                if (enabled !== this.frameGeneration) { this.selectQuality(this.qualityPreset, this.superResolution, enabled); }
-              })
-          }.width('100%').enabled(!this.importing && !this.saveBusy && !this.resourceChecking)
-          Text(this.qualityPreset === 'high' ? (this.frameGeneration && this.superResolution ?
-            '更高画质 · 优先细节，补帧后目标平均约 25 FPS' : '更高画质 · 优先细节') :
-            (this.qualityPreset === 'low' ? '最低兼容画质 · 着色器为最低可运行档，其余选项最低' : '均衡画质 · 当前画质基准，优先流畅'))
-            .fontSize(12).fontColor('#59726C').width('100%')
-          if (this.qualityMessage.length > 0) {
-            Text(this.qualityMessage).fontSize(12).fontColor('#9A462F').width('100%')
-          }
-          Row({ space: 12 }) {
-            Button('开始新游戏').layoutWeight(1).height(44).backgroundColor('#23815F').fontColor('#FFFFFF')
-              .enabled(this.resourceReady && this.runtimeLinked && !this.resourceChecking && !this.importing && !this.saveBusy)
-              .onClick(() => { this.beginGame('new'); })
-            Button('加载存档').layoutWeight(1).height(44).backgroundColor('#EAF3EF').fontColor('#23634B')
-              .enabled(this.resourceReady && this.runtimeLinked && !this.resourceChecking && !this.importing && !this.saveBusy)
-              .onClick(() => { this.showSaves(); })
-            Button('开始 Demo').layoutWeight(1).height(44).backgroundColor('#EAF3EF').fontColor('#23634B')
-              .enabled(this.resourceReady && this.runtimeLinked && !this.resourceChecking && !this.importing && !this.saveBusy)
-              .onClick(() => { this.beginGame('demo'); })
-          }.width('100%')
-        }.padding(20).width('100%').alignItems(HorizontalAlign.Start)
-          .backgroundColor('#E4F1E9').borderRadius(18)
-
-        Column({ space: 12 }) {
+    WithTheme({ theme: launcherTheme, colorMode: ThemeColorMode.LIGHT }) {
+      Scroll() {
+        Column({ space: 20 }) {
           Row() {
-            Text('公共下载目录').fontSize(18).fontWeight(FontWeight.Medium).fontColor('#172C29')
-            Blank()
-            Button(this.packageListLoading ? '刷新中…' : '刷新').fontSize(13).height(32)
-              .enabled(!this.packageListLoading && !this.importing)
-              .onClick(() => { this.refreshPackages(); })
+            Column({ space: 6 }) {
+              Text('GTA V HarmonyOS加载器').fontSize(28).fontWeight(FontWeight.Bold)
+                .fontColor(LauncherColors.text)
+              Text('导入预编译游戏压缩文件后，等待处理完毕即可开始游戏。').fontSize(14)
+                .fontColor(LauncherColors.secondaryText)
+            }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+            Text('v0.8.0').fontSize(13).fontColor(LauncherColors.secondaryText)
           }.width('100%')
-          Text(this.directoryLabel).fontSize(14).fontColor('#23634B')
-            .copyOption(CopyOptions.LocalDevice).width('100%')
-          Text('用文件管理将游戏 ZIP 复制到这个目录，无需解压。回到这里刷新并点击文件导入。')
-            .fontSize(13).fontColor('#59726C').width('100%')
-          Row({ space: 12 }) {
-            Button('打开下载目录').layoutWeight(1).height(40).fontSize(14)
-              .enabled(this.directoryAvailable && !this.importing)
-              .onClick(() => { this.openDownloadDirectory(); })
-            Button('选择游戏 ZIP').layoutWeight(1).height(40).fontSize(14)
-              .enabled(!this.importing && !this.resourceChecking && !this.saveBusy)
-              .onClick(() => { this.choosePackage(); })
-          }.width('100%')
-          Button(this.saveBusy ? '正在处理存档…' : '导入存档（ZIP）').width('100%').height(40).fontSize(14)
-            .enabled(!this.saveBusy && !this.importing && !this.resourceChecking)
-            .onClick(() => { this.chooseSavePackage(); })
-          Text('导入剧情进度 ZIP，同名旧档会先备份；Demo 使用独立的演示目录。')
-            .fontSize(12).fontColor('#59726C').width('100%')
-          if (this.saveMessage.length > 0) {
-            Text(this.saveMessage).fontSize(13).fontColor('#48665C').width('100%')
-          }
-          if (this.packageList.length === 0) {
-            Text('暂未找到 ZIP。复制后点击刷新，也可直接选择其他位置的文件。')
-              .fontSize(13).fontColor('#798C84').padding({ top: 6, bottom: 6 }).width('100%')
-          } else {
-            ForEach(this.packageList, (item: DownloadGamePackage) => {
-              Row({ space: 12 }) {
-                Column({ space: 4 }) {
-                  Text(item.name).fontSize(14).fontColor('#172C29').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
-                  Text(this.packageSize(item.bytes)).fontSize(12).fontColor('#798C84')
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                Button('导入').height(36).fontSize(13)
-                  .enabled(!this.importing && !this.resourceChecking && !this.saveBusy)
-                  .onClick(() => { this.importPackage(item.path, item.name); })
-              }.padding(12).width('100%').backgroundColor('#F1F6F3').borderRadius(10)
-            }, (item: DownloadGamePackage) => item.path)
-          }
-        }.padding(20).width('100%').alignItems(HorizontalAlign.Start)
-          .backgroundColor('#FFFFFF').borderRadius(18)
-
-        if (this.importing || this.importMessage.length > 0) {
-          Column({ space: 10 }) {
-            if (this.importFileName.length > 0) {
-              Text(this.importFileName).fontSize(14).fontColor('#172C29').maxLines(2)
-            }
-            Text(this.importMessage).fontSize(14).fontColor('#48665C').width('100%')
-            if (this.importing) {
-              Progress({ value: this.importProgress, total: 100, type: ProgressType.Linear })
-                .width('100%').color('#23815F')
-              Text('请保持应用打开，等待解压和校验完成。').fontSize(12).fontColor('#798C84')
-              Button('取消导入').height(36).fontSize(13).onClick(() => {
-                this.importCancelRequested = true;
-                game.cancelGameImport();
-                this.importMessage = '正在取消，请等待临时资源清理完成…';
-              })
-            }
-          }.padding(20).width('100%').alignItems(HorizontalAlign.Start)
-            .backgroundColor('#FFFFFF').borderRadius(18)
-        }
-        Text('资源导入保留存档；存档导入遇到同名档时，先备份再替换。原 ZIP 会保留。')
-          .fontSize(12).fontColor('#798C84').width('100%')
-      }.width('100%').constraintSize({ maxWidth: 920 }).padding(24).alignItems(HorizontalAlign.Start)
-    }.width('100%').height('100%').backgroundColor('#F4F7F5')
+          LauncherSectionCard({
+            title: '资源与启动',
+            content: () => { this.resourceAndStartupContent(); }
+          })
+          LauncherSectionCard({
+            title: '文件导入',
+            content: () => { this.importFilesContent(); }
+          })
+        }.width('100%').constraintSize({ maxWidth: 920 }).padding(24).alignItems(HorizontalAlign.Start)
+      }.width('100%').height('100%').backgroundColor(LauncherColors.background)
+    }
   }
 
   @Builder
   private savePicker() {
-    Stack({ alignContent: Alignment.Center }) {
-      Column().width('100%').height('100%').backgroundColor('#66000000')
-        .onClick(() => { this.saveListVisible = false; })
-      Column({ space: 12 }) {
-        Text('加载剧情存档').fontSize(22).fontWeight(FontWeight.Medium).fontColor('#172C29').width('100%')
-        List({ space: 8 }) {
-          ForEach(this.saves, (item: GameSaveEntry) => {
-            ListItem() {
-              Column({ space: 5 }) {
-                Text(item.title || item.file).fontSize(16).fontColor('#172C29').width('100%').maxLines(2)
-                Text(this.saveDescription(item)).fontSize(12).fontColor('#59726C').width('100%')
-              }.padding(14).width('100%').backgroundColor('#F1F6F3').borderRadius(10)
-                .onClick(() => { this.beginGame('load', item.id); })
-            }
-          }, (item: GameSaveEntry) => item.id)
-        }.height(300).width('100%')
-        Button('取消').width('100%').height(40).backgroundColor('#EAF3EF').fontColor('#23634B')
-          .onClick(() => { this.saveListVisible = false; })
-      }.padding(24).width('82%').constraintSize({ maxWidth: 640 })
-        .backgroundColor('#FFFFFF').borderRadius(20)
-    }.width('100%').height('100%')
+    SavePickerDialog({
+      saves: this.saves,
+      onSelect: (id: string) => { this.beginGame('load', id); },
+      onClose: () => { this.closeSavePicker(); }
+    })
   }
 
   build() {
@@ -1164,122 +1253,62 @@ struct Index {
         }.layoutWeight(1).width('100%')
       }.padding(32).width('100%').height('100%').backgroundColor('#101820')
     } else if (!this.gamePageVisible) {
-      Stack({ alignContent: Alignment.Center }) {
-        this.gameResourcePage()
-        if (this.saveListVisible) { this.savePicker() }
-      }.width('100%').height('100%')
+      this.gameResourcePage()
     } else {
       Stack({ alignContent: Alignment.TopStart }) {
       XComponent({ id: 'muguet-game-surface', type: XComponentType.SURFACE, libraryname: 'harmony_probe' })
         .width('100%').height('100%')
         .focusable(false)
-        .onAreaChange(() => { this.mousePositionKnown = false; })
+        .onAreaChange((_old: Area, area: Area) => {
+          this.resetInput(); this.gameWidth = Number(area.width); this.gameHeight = Number(area.height); this.readSafeArea();
+        })
 
-      Column() {
-        Row({ space: 8 }) {
-          if (!this.gameRunning && !this.diagnosticsVisible) {
-            Text(this.statusText).fontSize(12).fontColor('#FFFFFF')
-              .padding(8).backgroundColor('#9A101820').borderRadius(8)
-          }
-          Blank()
-          Button('首页').fontSize(12).height(32).focusable(false)
-            .onMouse((event: MouseEvent) => { event.stopPropagation(); })
-            .onClick(() => { this.returnToLauncher(); })
-          Button(this.mouseLook ? '鼠标：视角' : '鼠标：光标')
-            .fontSize(12).height(32).focusable(false)
-            .onMouse((event: MouseEvent) => { event.stopPropagation(); })
-            .onClick(() => { this.toggleMouseLook(); })
-          Button(this.menuControls ? '操作按键' : '菜单按键').fontSize(12).height(32).focusable(false)
-            .onMouse((event: MouseEvent) => { event.stopPropagation(); })
-            .onClick(() => { this.resetInput(); this.menuControls = !this.menuControls; this.controlsVisible = true; })
-          Button(this.controlsVisible ? '收起按键' : '显示按键')
-            .fontSize(12).height(32).focusable(false)
-            .onMouse((event: MouseEvent) => { event.stopPropagation(); })
-            .onClick(() => { this.controlsVisible = !this.controlsVisible; })
-          Button(this.diagnosticsVisible ? '收起状态' : '状态').fontSize(12).height(32).focusable(false)
-            .onMouse((event: MouseEvent) => { event.stopPropagation(); })
-            .onClick(() => { this.toggleStatus(); })
-        }.width('100%')
+      GameTouchControls({
+        visible: this.controlsVisible && !this.keyboardVisible && !this.diagnosticsVisible && !this.exitConfirmVisible,
+        inputEnabled: this.appForeground && !this.exitConfirmVisible,
+        stateJson: this.touchStateJson, resetEpoch: this.inputResetEpoch,
+        closePanelsEpoch: this.closePanelsEpoch, mouseLook: this.effectiveMouseLook(), gameAspect: this.gameAspect,
+        onOpenKeyboard: () => { this.toolbarExpanded = true; this.toggleKeyboard(); },
+        onStatusChanged: (status: string) => {
+          if (this.touchStatusText !== status) { this.touchStatusText = status; }
+        },
+        onPanelChanged: (open: boolean) => {
+          if (open || this.childPanelOpen) { this.resetInput(); }
+          if (open) { this.toolbarExpanded = false; }
+          this.childPanelOpen = open;
+        }
+      }).width('100%').height('100%')
+        .padding({ left: this.safeLeft, right: this.safeRight, top: this.safeTop, bottom: this.safeBottom })
+
+      if (this.keyboardVisible || this.diagnosticsVisible || this.exitConfirmVisible) {
+        Column().width('100%').height('100%').hitTestBehavior(HitTestMode.Block)
+          .onTouch((event: TouchEvent) => { event.stopPropagation(); })
+          .onMouse((event: MouseEvent) => { event.stopPropagation(); })
+      }
+
+      Column({ space: 8 }) {
+        Row() { Blank().hitTestBehavior(HitTestMode.None); this.gameToolbar() }.width('100%')
         if (this.diagnosticsVisible) {
-          this.performancePanel()
+          Row() { Blank().hitTestBehavior(HitTestMode.None); this.performancePanel() }.width('100%')
         }
-        Blank()
-        if (this.controlsVisible) {
-          Row() {
-            if (this.menuControls) {
-              Column({ space: 4 }) {
-                this.control('↑', 'ArrowUp')
-                Row({ space: 4 }) {
-                  this.control('←', 'ArrowLeft')
-                  this.control('↓', 'ArrowDown')
-                  this.control('→', 'ArrowRight')
-                }
-                Row({ space: 4 }) {
-                  this.control('返回', 'Backspace')
-                  this.control('Esc', 'Escape')
-                }
-              }
-            } else {
-              Column({ space: 4 }) {
-                this.control('W ↑', 'KeyW')
-                Row({ space: 4 }) {
-                  this.control('A ←', 'KeyA')
-                  this.control('S ↓', 'KeyS')
-                  this.control('D →', 'KeyD')
-                }
-                Row({ space: 4 }) {
-                  this.control('Shift', 'ShiftLeft')
-                  this.control('Esc', 'Escape')
-                }
-              }
-            }
-            Blank()
-            if (this.menuControls) {
-              Column({ space: 4 }) {
-                Row({ space: 4 }) {
-                  this.control('确认', 'Enter')
-                  this.control('返回', 'Backspace')
-                  this.control('Esc', 'Escape')
-                }
-                Row({ space: 4 }) {
-                  this.control('前标签', 'KeyQ')
-                  this.control('后标签', 'KeyE')
-                  this.control('Tab', 'Tab')
-                }
-                Row({ space: 4 }) {
-                  this.control('上一页', 'PageUp')
-                  this.control('下一页', 'PageDown')
-                  this.control('空格', 'Space')
-                }
-                Text('Esc 打开菜单 · 方向键选择 · 确认/返回').fontSize(11).fontColor('#D0E4EE')
-              }
-            } else {
-              Column({ space: 4 }) {
-                Row({ space: 4 }) {
-                  this.control('确认', 'Enter')
-                  this.control('上车 F', 'KeyF')
-                  this.control('跳跃', 'Space')
-                }
-                Row({ space: 4 }) {
-                  this.control('Q', 'KeyQ')
-                  this.control('E', 'KeyE')
-                  this.control('R', 'KeyR')
-                }
-                Row({ space: 4 }) {
-                  this.mouseControl('瞄准', 2)
-                  this.mouseControl('射击', 0)
-                  this.control('5', 'Digit5')
-                }
-                Text('滑动转动视角 · F8 切换鼠标光标').fontSize(11).fontColor('#D0E4EE')
-              }
-            }
-          }.width('100%').alignItems(VerticalAlign.Bottom)
+        Blank().hitTestBehavior(HitTestMode.None)
+        if (this.keyboardVisible) {
+          GameKeyboard({
+            resetEpoch: this.inputResetEpoch, inputEnabled: this.appForeground && !this.exitConfirmVisible,
+            viewWidth: this.gameWidth,
+            viewHeight: this.gameHeight - this.safeTop - this.safeBottom - (this.gameWidth < 700 ? 48 : 0),
+            onClose: () => { this.toggleKeyboard(); }
+          })
         }
-      }.width('100%').height('100%').padding({ left: 20, right: 20, top: 12, bottom: 16 })
+      }.width('100%').height('100%')
+        .padding({ left: this.safeLeft + 12, right: this.safeRight + 12, top: this.safeTop + 12, bottom: this.safeBottom + 12 })
         .hitTestBehavior(HitTestMode.Transparent)
       }.width('100%').height('100%').backgroundColor('#000000')
         .id('game-input').focusable(true).defaultFocus(true)
-        .onFocus(() => { this.gameFocused = this.appForeground; game.setInputFocus(this.appForeground); })
+        .onFocus(() => {
+          this.gameFocused = this.appForeground && !this.exitConfirmVisible;
+          game.setInputFocus(this.gameFocused);
+        })
         .onBlur(() => { this.gameFocused = false; this.resetInput(); })
         .onTouch((event: TouchEvent) => {
           if (event.type === TouchType.Down) { this.focusGame(); }
@@ -1289,7 +1318,7 @@ struct Index {
         .onAxisEvent((event: AxisEvent) => { this.externalAxis(event); })
         .onHover((hovered: boolean) => {
           this.mousePositionKnown = false;
-          this.showPointer(!hovered || !this.mouseLook);
+          this.showPointer(!hovered || !this.effectiveMouseLook());
           if (!hovered) { this.releaseMouseButtons(); }
         })
     }

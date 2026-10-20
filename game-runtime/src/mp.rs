@@ -14,7 +14,18 @@ use wasmtime::{Caller, Val};
 pub const COMMANDS: &[(&str, &str)] = &[
     ("PlayerPedId", "player_commands::CommandPlayerPedId()"),
     ("IsPauseMenuActive", "hud_commands::CommandIsPauseMenuActive()"),
+    ("IsPlayerControlOn", "player_commands::CommandIsPlayerControlOn(int)"),
+    ("IsPedInCover", "ped_commands::CommandIsPedInCover(int, bool)"),
+    ("IsPedReloading", "ped_commands::CommandIsPedReloading(int)"),
+    ("IsPedInMeleeCombat", "ped_commands::CommandIsPedInMeleeCombat(int)"),
+    ("IsPedRunningMobilePhoneTask", "ped_commands::CommandIsPedRunningMobilePhoneTask(int)"),
+    ("IsPedInParachuteFreefall", "ped_commands::CommandIsPedInParachuteFreefall(int)"),
+    ("GetPedParachuteState", "ped_commands::CommandGetPedParachuteState(int)"),
+    ("IsCutsceneActive", "cutscene_commands::CommandIsCutsceneActive()"),
+    ("IsLoadingScreenActive", "dlc_commands::CommandCheckIsLoadingScreenActive()"),
     ("SetControlValueNextFrame", "pad_commands::CommandSetControlValueNextFrame(int, int, float)"),
+    ("IsControlJustPressed", "pad_commands::CommandIsControlJustPressed(int, int)"),
+    ("IsPedJumping", "ped_commands::CommandIsPedJumping(int)"),
     ("GetVehicleClass", "vehicle_commands::CommandGetVehicleClass(int)"),
     ("DetachVehicleFromAnyTowTruck", "vehicle_commands::CommandDetachVehicleFromAnyTowTruck(int)"),
     ("GetEntityAttachedToTowTruck", "vehicle_commands::CommandGetEntityAttachedToTowTruck(int)"),
@@ -921,6 +932,13 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
     let scratch = call(caller, "_emscripten_stack_alloc", &[Val::I64(SCRATCH)]).map(|v| v.unwrap_i64() as u64).unwrap_or(0);
     if scratch != 0 {
         let mut c = Cmd { caller, scratch };
+        // Read-only UI observations stay independent of controller activation.
+        crate::input::guest_script_tick();
+        crate::touch_state::sample(&mut c, thread);
+        observe_input_channels(&mut c);
+        for (group, control, value) in crate::touch_controls::snapshot() {
+            c.touch_control(group, control, value);
+        }
         if WANT_BULLETS.swap(false, Ordering::Relaxed) {
             more_bullets(&mut c);
         }
@@ -974,12 +992,141 @@ fn call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Option<
     Some(out.into_iter().next().unwrap_or(Val::I32(0)))
 }
 
+// BEGIN jump diagnostic accumulator (pure host-testable state).
+struct JumpEvidence {
+    generation:Option<u64>,last_sample:Option<Instant>,last_pressed:Option<bool>,
+    just_pressed_true:u64,last_just_pressed_at:Option<u64>,jumping_true:u64,last_jumping_at:Option<u64>,
+    ped:Option<i32>,latest_z:Option<f32>,maximum_z:Option<f32>,jump_baseline_z:Option<f32>,jump_maximum_z:Option<f32>,
+}
+impl JumpEvidence {
+    const fn new()->Self {Self {generation:None,last_sample:None,last_pressed:None,
+        just_pressed_true:0,last_just_pressed_at:None,jumping_true:0,last_jumping_at:None,
+        ped:None,latest_z:None,maximum_z:None,jump_baseline_z:None,jump_maximum_z:None}}
+    fn generation(&mut self,generation:u64) {if self.generation!=Some(generation) {*self=Self::new();self.generation=Some(generation);}}
+    fn pressed(&mut self,result:Result<i32,&str>,at:u64) {
+        let pressed=result.ok().map(|value|value!=0);
+        if pressed==Some(true) {
+            self.just_pressed_true+=1;self.last_just_pressed_at=Some(at);
+            if self.last_pressed!=Some(true) {self.jump_baseline_z=self.latest_z;self.jump_maximum_z=self.latest_z;}
+        }
+        self.last_pressed=pressed;
+    }
+    fn jumping(&mut self,result:Result<i32,&str>,at:u64) {
+        if result.is_ok_and(|value|value!=0) {self.jumping_true+=1;self.last_jumping_at=Some(at);}
+    }
+    fn position(&mut self,ped:i32,z:f32) {
+        if !z.is_finite() {return;}
+        if self.ped!=Some(ped) {self.ped=Some(ped);self.latest_z=None;self.maximum_z=None;self.jump_baseline_z=None;self.jump_maximum_z=None;}
+        self.latest_z=Some(z);self.maximum_z=Some(self.maximum_z.map_or(z,|old|old.max(z)));
+        if self.last_just_pressed_at.is_some() {
+            if self.jump_baseline_z.is_none() {self.jump_baseline_z=Some(z);}
+            self.jump_maximum_z=Some(self.jump_maximum_z.map_or(z,|old|old.max(z)));
+        }
+    }
+}
+#[cfg(test)] mod jump_evidence_tests {
+    use super::*;
+    #[test] fn positive_edge_and_jumping_samples_latch_after_false_and_missing_samples() {
+        let mut e=JumpEvidence::new();e.generation(1);e.position(7,22.0);
+        e.pressed(Ok(1),100);e.pressed(Ok(0),120);e.pressed(Err("missingExport"),150);
+        e.jumping(Ok(1),180);e.jumping(Ok(0),200);e.position(7,22.6);e.position(7,22.0);
+        assert_eq!(e.just_pressed_true,1);assert_eq!(e.last_just_pressed_at,Some(100));
+        assert_eq!(e.jumping_true,1);assert_eq!(e.last_jumping_at,Some(180));
+        assert_eq!(e.jump_baseline_z,Some(22.0));assert_eq!(e.jump_maximum_z,Some(22.6));
+        e.generation(2);assert_eq!(e.just_pressed_true,0);assert_eq!(e.last_jumping_at,None);assert_eq!(e.maximum_z,None);
+    }
+    #[test] fn new_ped_does_not_inherit_previous_height_and_unknown_is_not_positive() {
+        let mut e=JumpEvidence::new();e.generation(0);e.position(7,100.0);e.pressed(Err("queryFailed"),10);
+        e.jumping(Err("queryFailed"),10);e.position(8,22.0);
+        assert_eq!(e.just_pressed_true,0);assert_eq!(e.jumping_true,0);assert_eq!(e.maximum_z,Some(22.0));
+        assert_eq!(e.jump_baseline_z,None);
+    }
+}
+// END jump diagnostic accumulator.
+
+/// Real input channels and entity position. Jump edges are read at every
+/// selected script safe point and latched before the 5 Hz publication throttle.
+fn observe_input_channels(c:&mut Cmd) {
+    use crate::touch_state::Query;
+    if !crate::ffi::app_presentation_allowed() {return;}
+    static EVIDENCE:Mutex<JumpEvidence>=Mutex::new(JumpEvidence::new());
+    static SEQ:AtomicU64=AtomicU64::new(0);
+    let now=Instant::now();let generation=crate::ffi::app_presentation_generation();let at=crate::touch_state::now_ms();
+    let mut evidence=EVIDENCE.lock().unwrap();evidence.generation(generation);
+    let just_pressed=c.integer("IsControlJustPressed",&[0,22]);evidence.pressed(just_pressed,at);
+    if evidence.last_sample.is_some_and(|sample|now.saturating_duration_since(sample)<Duration::from_millis(200)) {return;}
+    evidence.last_sample=Some(now);
+    let observed=|source:&str,result:Result<serde_json::Value,&str>| match result {
+        Ok(value)=>serde_json::json!({"known":true,"value":value,"source":source,"generation":generation,"sampledAtMonoMs":at}),
+        Err(reason)=>serde_json::json!({"known":false,"reason":reason,"source":source,"generation":generation,"sampledAtMonoMs":at}),
+    };
+    let ped=c.integer("PlayerPedId",&[]);
+    let valid=match ped {Ok(0)=>Ok(false),Ok(ped)=>c.integer("DoesEntityExist",&[ped]).map(|value|value!=0),Err(reason)=>Err(reason)};
+    let mut snapshot=serde_json::json!({"seq":SEQ.fetch_add(1,Ordering::Relaxed)+1,"generation":generation,
+        "sampledAtMonoMs":at,"maxHz":5,"controlGroup":0,"controls":{},
+        "playerValid":observed("PlayerPedId+DoesEntityExist",valid.map(serde_json::Value::from)),
+        "scope":"read-only engine channels, jump task state and entity coordinates; active input alone does not prove action execution"});
+    for (name,index) in [("INPUT_JUMP",22),("INPUT_MOVE_UP_ONLY",32),("INPUT_MOVE_DOWN_ONLY",33),
+        ("INPUT_MOVE_LEFT_ONLY",34),("INPUT_MOVE_RIGHT_ONLY",35),("INPUT_ATTACK",24),("INPUT_AIM",25)] {
+        let value=if valid==Ok(true) {c.integer("IsControlPressed",&[0,index]).map(|value|serde_json::Value::from(value!=0))}
+            else {Err("noValidPlayer")};
+        snapshot["controls"][name]=observed(&format!("IsControlPressed(0,{index})"),value);
+    }
+    snapshot["jumpJustPressed"]=observed("IsControlJustPressed(0,22)",just_pressed.map(|value|serde_json::Value::from(value!=0)));
+    let jumping=if valid==Ok(true) {c.integer("IsPedJumping",&[ped.unwrap()])} else {Err("noValidPlayer")};
+    evidence.jumping(jumping,at);
+    snapshot["pedJumping"]=observed("IsPedJumping(player)",jumping.map(|value|serde_json::Value::from(value!=0)));
+    let position=if valid==Ok(true) {c.v_checked("GetEntityCoords",&[i(ped.unwrap()),b(false)])
+        .map(|v|{evidence.position(ped.unwrap(),v[2]);serde_json::json!({"x":v[0],"y":v[1],"z":v[2]})})} else {Err("noValidPlayer")};
+    snapshot["position"]=observed("GetEntityCoords(player,false)",position);
+    snapshot["jumpEvidence"]=serde_json::json!({
+        "justPressedTrueObservations":evidence.just_pressed_true,"lastJustPressedTrueAtMonoMs":evidence.last_just_pressed_at,
+        "jumpingTrueObservations":evidence.jumping_true,"lastJumpingTrueAtMonoMs":evidence.last_jumping_at,
+        "maxObservedZ":evidence.maximum_z,"lastJumpBaselineZ":evidence.jump_baseline_z,"maxObservedZSinceLastJumpPress":evidence.jump_maximum_z,
+        "maxObservedRiseSinceLastJumpPress":evidence.jump_baseline_z.zip(evidence.jump_maximum_z).map(|(baseline,max)|max-baseline),
+        "justPressedPolling":"every selected script safe point; true observations are not distinct action counts",
+        "positionSampling":"5 Hz; baseline uses latest prior sample or first sample after edge; peak may be undersampled"});
+    if crate::ffi::app_presentation_allowed() && crate::ffi::app_presentation_generation()==generation {
+        crate::touch_controls::publish_input_observation(snapshot);
+    }
+}
+
 struct Cmd<'a, 'b> {
     caller: &'a mut Caller<'b, HostState>,
     scratch: u64,
 }
 
+impl crate::touch_state::Query for Cmd<'_, '_> {
+    fn integer(&mut self, name: &str, args: &[i32]) -> Result<i32, &'static str> {
+        let export = format!("mp:{name}");
+        if self.caller.get_export(&export).and_then(|e| e.into_func()).is_none() { return Err("missingExport"); }
+        let args: Vec<Val> = args.iter().map(|value| Val::I32(*value)).collect();
+        match call(self.caller, &export, &args) {
+            Some(Val::I32(value)) => Ok(value), Some(Val::I64(value)) => Ok(value as i32), _ => Err("queryFailed"),
+        }
+    }
+}
+
 impl Cmd<'_, '_> {
+    fn v_checked(&mut self,cmd:&str,args:&[Val])->Result<[f32;3],&'static str> {
+        let name=format!("mp:{cmd}");
+        if self.caller.get_export(&name).and_then(|export| export.into_func()).is_none() {return Err("missingExport");}
+        for off in [0,8,16] {crate::write_u32(self.mem(),self.scratch+off,f32::NAN.to_bits());}
+        let mut full=vec![Val::I64(self.scratch as i64)];full.extend_from_slice(args);
+        call(self.caller,&name,&full).ok_or("queryFailed")?;
+        let result=[self.read_f32(0),self.read_f32(8),self.read_f32(16)];
+        if result.iter().all(|value|value.is_finite()) {Ok(result)} else {Err("invalidVectorResult")}
+    }
+    fn touch_control(&mut self,group:i32,control:i32,value:f32) {
+        use crate::touch_controls::Dispatch;
+        let name="mp:SetControlValueNextFrame";
+        let result=if self.caller.get_export(name).and_then(|export| export.into_func()).is_none() {Dispatch::MissingExport}
+            else {match call(self.caller,name,&[i(group),i(control),f(value)]) {
+                Some(Val::I32(result))=>Dispatch::Returned(result),Some(Val::I64(result))=>Dispatch::Returned(result as i32),
+                None=>Dispatch::QueryFailed,_=>Dispatch::UnexpectedReturn,
+            }};
+        crate::touch_controls::record_dispatch(group,control,value,result);
+    }
     fn i(&mut self, cmd: &str, args: &[Val]) -> i32 {
         match call(self.caller, &format!("mp:{cmd}"), args) {
             Some(Val::I32(v)) => v,

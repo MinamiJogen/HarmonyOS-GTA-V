@@ -1,0 +1,21 @@
+// Literal SCRIPT channels only; game/mission meanings are unverified.
+export interface TaskWidget { id: string; kind: string; label: string; x: number; y: number; width: number; height: number; channels: string[]; }
+export const TASK_WIDGETS: TaskWidget[] = [
+  {"id": "left_stick", "kind": "stick", "label": "L", "x": 32.0, "y": 200.0, "width": 128, "height": 128, "channels": ["INPUT_SCRIPT_LEFT_AXIS_X", "INPUT_SCRIPT_LEFT_AXIS_Y"]},
+  {"id": "right_stick", "kind": "stick", "label": "R", "x": 352.0, "y": 200.0, "width": 128, "height": 128, "channels": ["INPUT_SCRIPT_RIGHT_AXIS_X", "INPUT_SCRIPT_RIGHT_AXIS_Y"]},
+  {"id": "face_up", "kind": "button", "label": "Y", "x": 538.0, "y": 102.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RUP"]},
+  {"id": "face_down", "kind": "button", "label": "A", "x": 538.0, "y": 198.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RDOWN"]},
+  {"id": "face_left", "kind": "button", "label": "X", "x": 490.0, "y": 150.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RLEFT"]},
+  {"id": "face_right", "kind": "button", "label": "B", "x": 586.0, "y": 150.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RRIGHT"]},
+  {"id": "left_bumper", "kind": "button", "label": "LB", "x": 200.0, "y": 10.0, "width": 64, "height": 44, "channels": ["INPUT_SCRIPT_LB"]},
+  {"id": "right_bumper", "kind": "button", "label": "RB", "x": 376.0, "y": 10.0, "width": 64, "height": 44, "channels": ["INPUT_SCRIPT_RB"]},
+  {"id": "left_trigger", "kind": "continuous_trigger", "label": "LT", "x": 122.0, "y": 12.0, "width": 44, "height": 80, "channels": ["INPUT_SCRIPT_LT"]},
+  {"id": "right_trigger", "kind": "continuous_trigger", "label": "RT", "x": 474.0, "y": 12.0, "width": 44, "height": 80, "channels": ["INPUT_SCRIPT_RT"]},
+  {"id": "left_stick_click", "kind": "button", "label": "LS", "x": 202.0, "y": 242.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_LS"]},
+  {"id": "right_stick_click", "kind": "button", "label": "RS", "x": 298.0, "y": 242.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RS"]},
+  {"id": "dpad_up", "kind": "button", "label": "↑", "x": 58.0, "y": 54.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_UP"]},
+  {"id": "dpad_down", "kind": "button", "label": "↓", "x": 58.0, "y": 150.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_DOWN"]},
+  {"id": "dpad_left", "kind": "button", "label": "←", "x": 10.0, "y": 102.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_LEFT"]},
+  {"id": "dpad_right", "kind": "button", "label": "→", "x": 106.0, "y": 102.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_RIGHT"]},
+  {"id": "select", "kind": "button", "label": "Select", "x": 250.0, "y": 306.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_SELECT"]},
+];
