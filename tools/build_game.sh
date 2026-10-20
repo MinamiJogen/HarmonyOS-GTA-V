@@ -13,7 +13,7 @@ task_phase='参数检查'
 
 usage() {
   cat <<'HELP'
-鸿蒙 GTA5 v0.8.0 本地构建工具（macOS）
+鸿蒙 GTA5 v1.0.1 本地构建工具（macOS）
 
 用法：
   bash tools/build_game.sh --check [--aot-only]

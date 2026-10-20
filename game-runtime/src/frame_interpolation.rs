@@ -5,6 +5,57 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::{CommandBuffer, CommandEncoder, Device, Queue, Texture};
 
+// Process-local UI observations; never infer a live backend from a status file
+// left by another process. State 2 requires a successfully presented NEW AI frame.
+static LIVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LIVE_AI_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIVE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[derive(Clone,Copy)]
+struct LiveSnapshot { state:u8,last:u64,generation:u64 }
+// The existing writes all run on the GPU thread. A reader makes one attempt,
+// without spinning, and rejects a snapshot that overlaps any of those writes.
+fn publish_live(state:u8,last:u64,generation:u64) {
+    use std::sync::atomic::Ordering;
+    LIVE_REVISION.fetch_add(1,Ordering::SeqCst);
+    LIVE_AI_NS.store(last,Ordering::SeqCst);
+    LIVE_GENERATION.store(generation,Ordering::SeqCst);
+    LIVE_STATE.store(state,Ordering::SeqCst);
+    LIVE_REVISION.fetch_add(1,Ordering::SeqCst);
+}
+fn live_snapshot()->Option<LiveSnapshot> {
+    use std::sync::atomic::Ordering;
+    let before=LIVE_REVISION.load(Ordering::SeqCst);
+    if before&1!=0 {return None;}
+    let snapshot=LiveSnapshot {state:LIVE_STATE.load(Ordering::SeqCst),
+        last:LIVE_AI_NS.load(Ordering::SeqCst),generation:LIVE_GENERATION.load(Ordering::SeqCst)};
+    let after=LIVE_REVISION.load(Ordering::SeqCst);
+    (before==after).then_some(snapshot)
+}
+fn live_snapshot_current(snapshot:Option<LiveSnapshot>,before:u64,after:u64)->bool {
+    before==after&&snapshot.is_some_and(|value|value.generation==after)
+}
+fn note_live(state:u8) {
+    publish_live(state,0,crate::ffi::app_presentation_generation());
+}
+pub(crate) fn live_status()->serde_json::Value {
+    let generation_before=crate::ffi::app_presentation_generation();
+    let snapshot=live_snapshot();
+    let current=live_snapshot_current(snapshot,generation_before,crate::ffi::app_presentation_generation());
+    let LiveSnapshot {state,last,..}=snapshot.unwrap_or(LiveSnapshot {state:0,last:0,generation:0});
+    let now=monotonic_ns();
+    let fresh=current&&now.is_some_and(|now|last!=0&&now>=last&&now-last<=5_000_000_000);
+    let status=if !crate::config::frame_interpolation_enabled(){"off"}
+        else if !cfg!(feature="frame-interpolation"){"unavailable_not_compiled"}
+        else if state==3{"unavailable_runtime_error"}
+        else if crate::ffi::stop_requested(){"stopped"}
+        else if !crate::ffi::app_presentation_allowed(){"paused"}
+        else if state==2&&fresh{"running"}else{"requested"};
+    serde_json::json!({"state":status,"processId":std::process::id(),"observedMonotonicNs":now,
+        "lastNewAiPresentMonotonicNs":if last==0{None}else{Some(last)},
+        "fresh":fresh,"scope":"current process atomics; running requires a new AI native present within 5s in the current presentation generation; repeats never establish running"})
+}
+
 #[cfg(feature = "frame-interpolation")]
 const WIDTH: u32 = 320;
 #[cfg(feature = "frame-interpolation")]
@@ -501,6 +552,7 @@ mod implementation {
     pub(crate) struct Interpolator;
     impl Interpolator {
         pub(crate) fn from_env() -> Option<Self> {
+            note_live(0);
             if !crate::config::frame_interpolation_enabled() { return None; }
             if std::env::var("MG_FRAME_INTERPOLATION").is_ok_and(|v| v == "rife" || v == "npu") {
                 eprintln!("[frame-interpolation] unavailable: runtime was built without frame-interpolation feature");
@@ -911,14 +963,16 @@ mod implementation {
         info:Option<Value>,counts:Counts,inference_ms:VecDeque<f64>,trace:VecDeque<Value>,last_present:Option<Instant>,
         rejections:VecDeque<Value>,
     }
-    impl Drop for Interpolator { fn drop(&mut self) {self.stop.store(true,Ordering::Release);self.epoch.fetch_add(1,Ordering::AcqRel);} }
+    impl Drop for Interpolator { fn drop(&mut self) {note_live(0);self.stop.store(true,Ordering::Release);self.epoch.fetch_add(1,Ordering::AcqRel);} }
     impl Interpolator {
         pub(crate) fn from_env()->Option<Self> {
+            note_live(0);
             if !crate::config::frame_interpolation_enabled() {
                 eprintln!("[frame-interpolation] disabled by frame_interpolation_enabled; backend marker retained");
                 return None;
             }
             let mode=match std::env::var("MG_FRAME_INTERPOLATION").as_deref(){Ok("rife")=>"rife",Ok("npu")=>"npu",_=>return None};
+            note_live(1);
             let setup=||->Result<Self,String> {
                 let root=std::fs::canonicalize(std::env::var_os("MUGUET_SUPPORT").ok_or("missing MUGUET_SUPPORT")?).map_err(|e|e.to_string())?;
                 let (output_fps,classifier_policy)=configured_options(&root,mode)?;
@@ -944,7 +998,7 @@ mod implementation {
                     failed:None,info:None,counts:Counts::default(),inference_ms:VecDeque::new(),trace:VecDeque::new(),last_present:None,rejections:VecDeque::new()})
             };
             match setup() {Ok(mut v)=>{eprintln!("[frame-interpolation] enabled: backend {}; original GPU resolution; 200ms delay, {}Hz source / {}Hz output deadlines; classifier_policy={}",v.mode,v.output_fps/2,v.output_fps,v.classifier_policy);v.report();Some(v)},
-                Err(e)=>{eprintln!("[frame-interpolation] rejected; original presentation retained: {e}");None}}
+                Err(e)=>{note_live(3);eprintln!("[frame-interpolation] rejected; original presentation retained: {e}");None}}
         }
         pub(crate) fn active(&self)->bool { self.failed.is_none() }
         pub(crate) fn cache_epoch(&self)->u64 {self.epoch.load(Ordering::Acquire)}
@@ -988,6 +1042,7 @@ mod implementation {
             }
         }
         fn reset(&mut self,reason:&str) {
+            note_live(if self.failed.is_some(){3}else{1});
             self.epoch.fetch_add(1,Ordering::AcqRel);self.origin=None;self.next_source_slot=0;self.next_slot=0;
             self.events.clear();self.history.clear();self.source_times.clear();self.last=None;self.last_present=None;self.counts.resets+=1;
             // Pending maps retain their buffers until callbacks complete. Their
@@ -1291,6 +1346,9 @@ mod implementation {
         }
         pub(crate) fn presented(&mut self,display:&Display,success:bool,present_begin_ns:Option<u64>,present_complete_ns:Option<u64>) {
             let now=Instant::now();
+            if success&&display.kind=="ai" {
+                publish_live(2,present_complete_ns.or_else(super::monotonic_ns).unwrap_or(0),self.presentation_generation);
+            }
             if success {match display.kind {"source"=>self.counts.source_presents+=1,"ai"=>self.counts.ai_presents+=1,_=>self.counts.repeats+=1}}
             else {self.counts.acquire_failures+=1;}
             if super::pairing::is_late_ai_present(success,display.kind=="ai",display.nominal_content_slot,display.slot) {

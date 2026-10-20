@@ -12,7 +12,7 @@ import { GameKeyboard } from '../components/GameKeyboard';
 import { gamePerformanceGameStarted } from '../entryability/GamePerformance';
 import { CpuSample, GpuSample, readCpuSample, readGpuSample } from '../telemetry/GameTelemetry';
 import { applyGameDefaults } from '../config/GameDefaults';
-import { GameQualitySelection, loadGameQuality, saveGameQuality, applyGameQuality } from '../config/GameQuality';
+import { GameQualitySelection, loadGameQuality, saveGameQuality, applyGameQuality, requireGameQualityCapabilities } from '../config/GameQuality';
 import { selectGamePackage, selectSavePackage } from '../resources/PublicGamePackages';
 import { GameSaveEntry, SavePickerDialog } from '../components/SavePickerDialog';
 import { LauncherSectionCard } from '../components/LauncherSectionCard';
@@ -57,6 +57,14 @@ interface SpatialStatus {
   activeGameRenderSize?: number[];
   activeOutputSize?: number[];
   mode?: string;
+  nativeRecordedFrames?: number;
+  nativeCommandsEncoded?: boolean;
+  fallbackReason?: string;
+}
+interface FrameGenerationLive {
+  state?: string;
+  processId?: number;
+  fresh?: boolean;
 }
 
 interface RuntimeStatus {
@@ -65,6 +73,9 @@ interface RuntimeStatus {
   message?: string;
   error?: string;
   presents?: number;
+  frameGenerationAvailable?: boolean;
+  frameGenerationLive?: FrameGenerationLive;
+  presentationPaused?: boolean;
   inputEvents?: number;
   rssMB?: number;
   heapVirtualMB?: number;
@@ -133,6 +144,14 @@ struct Index {
   @State private superResolution: boolean = true;
   @State private frameGeneration: boolean = true;
   @State private qualityMessage: string = '';
+  @State private capabilitiesKnown: boolean = false;
+  @State private superResolutionAvailable: boolean = false;
+  @State private frameGenerationAvailable: boolean = false;
+  @State private capabilityMessage: string = '';
+  @State private superResolutionStateText: string = '请求开启（待启动验证）';
+  @State private frameGenerationStateText: string = '请求开启（待启动验证）';
+  private lastSpatialFrames: number = -1;
+  private lastSpatialProgressMs: number = -1;
   private saveDialogId: number = -1;
   private readonly controlMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
     style: uiMaterial.ImmersiveStyle.THIN, interactive: true, lightEffect: {}
@@ -238,6 +257,7 @@ struct Index {
     this.pageActive = true;
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     this.filesDirectory = context.filesDir;
+    this.refreshProcessingCapabilities();
     try {
       const selection: GameQualitySelection = loadGameQuality(this.filesDirectory);
       this.qualityPreset = selection.preset;
@@ -556,14 +576,49 @@ struct Index {
     return false;
   }
 
+  private refreshProcessingCapabilities(): void {
+    try {
+      const capabilities = game.gameCapabilities();
+      if (typeof capabilities.runtimeLinked !== 'boolean' ||
+        typeof capabilities.superResolutionAvailable !== 'boolean' ||
+        typeof capabilities.frameGenerationAvailable !== 'boolean') {
+        throw new Error('原生能力查询返回无效数据');
+      }
+      this.runtimeLinked = capabilities.runtimeLinked;
+      this.superResolutionAvailable = capabilities.superResolutionAvailable;
+      this.frameGenerationAvailable = capabilities.frameGenerationAvailable;
+      this.capabilitiesKnown = true;
+      this.capabilityMessage = !capabilities.runtimeLinked ? '当前安装包未包含游戏运行时。' :
+        (!capabilities.frameGenerationAvailable ? '本安装包未编译 AI 补帧。已保存请求保持不变；请明确关闭补帧后启动。' :
+          '开关保存使用请求；超分接口、补帧模型和设备能力在启动后验证。');
+    } catch (_) {
+      this.capabilitiesKnown = false;
+      this.superResolutionAvailable = false;
+      this.frameGenerationAvailable = false;
+      this.capabilityMessage = '无法确认当前安装包能力，请安装匹配的完整包。已保存选择保持不变。';
+    }
+  }
+
   private beginGame(action: string = 'demo', saveId: string = ''): void {
     if (this.importing || this.selectingPackage || this.resourceChecking || !this.resourceReady || !this.runtimeLinked || this.gamePageVisible || this.saveBusy) { return; }
+    // Validate before either migration or quality application writes config.json.
+    this.refreshProcessingCapabilities();
+    if (!this.capabilitiesKnown) { this.qualityMessage = this.capabilityMessage; return; }
+    try {
+      requireGameQualityCapabilities({ preset: this.qualityPreset, superResolution: this.superResolution,
+        frameGeneration: this.frameGeneration }, { runtimeLinked: this.runtimeLinked,
+        superResolutionAvailable: this.superResolutionAvailable, frameGenerationAvailable: this.frameGenerationAvailable });
+    } catch (error) {
+      this.qualityMessage = String(error);
+      this.getUIContext().getPromptAction().showToast({ message: this.qualityMessage, duration: 5000 });
+      return;
+    }
     try {
       applyGameDefaults(this.filesDirectory);
       applyGameQuality(this.filesDirectory, {
         preset: this.qualityPreset, superResolution: this.superResolution, frameGeneration: this.frameGeneration
       });
-      game.configureGame(this.filesDirectory, action, saveId);
+      game.configureGame(this.filesDirectory, action, saveId, this.frameGeneration);
       this.closeSavePicker();
       inputDevice.on('change', this.inputListener);
       this.inputRegistered = true;
@@ -583,6 +638,11 @@ struct Index {
   private selectQuality(preset: string, superResolution: boolean, frameGeneration: boolean): boolean {
     if (this.gamePageVisible || this.importing || this.selectingPackage || this.saveBusy) { return false; }
     try {
+      if ((frameGeneration && !this.frameGeneration && (!this.capabilitiesKnown || !this.frameGenerationAvailable)) ||
+        (superResolution && !this.superResolution && (!this.capabilitiesKnown || !this.superResolutionAvailable))) {
+        this.qualityMessage = this.capabilityMessage;
+        return false;
+      }
       saveGameQuality(this.filesDirectory, { preset, superResolution, frameGeneration });
       this.qualityPreset = preset;
       this.superResolution = superResolution;
@@ -926,6 +986,25 @@ struct Index {
       status.uiLastAxisStep = this.lastAxisStep;
       status.uiLastAxisNotches = this.lastAxisNotches;
       const runtime: RuntimeStatus = JSON.parse(status.runtimeJson) as RuntimeStatus;
+      // Only read this process's native status. Never open a prior FG status file.
+      const processingNow: number = systemDateTime.getUptime(systemDateTime.TimeType.STARTUP, false);
+      const srFrames: number = runtime.spatialUpscale?.nativeRecordedFrames ?? 0;
+      if (srFrames > this.lastSpatialFrames && srFrames > 0) { this.lastSpatialProgressMs = processingNow; }
+      this.lastSpatialFrames = srFrames;
+      this.superResolutionStateText = !this.superResolution ? '已关闭' :
+        (!this.superResolutionAvailable ? '不可用（当前安装包）' :
+          (runtime.spatialUpscale?.fallbackReason ? `不可用：${runtime.spatialUpscale.fallbackReason}` :
+            (runtime.presentationPaused ? '已暂停' :
+              (runtime.spatialUpscale?.nativeCommandsEncoded === true && runtime.spatialUpscale?.mode !== 'off' &&
+                this.lastSpatialProgressMs >= 0 && processingNow - this.lastSpatialProgressMs <= 5000 ?
+                '运行中' : '请求开启（等待超分输出）'))));
+      const fgState: string = runtime.frameGenerationLive?.state || '';
+      this.frameGenerationStateText = !this.frameGeneration ? '已关闭' :
+        (runtime.frameGenerationAvailable === false ? '不可用（安装包未编译）' :
+          (fgState === 'running' && runtime.frameGenerationLive?.fresh === true ? '运行中（已呈现新 AI 帧）' :
+            (fgState === 'unavailable_runtime_error' ? '不可用（初始化或执行失败，已回退原帧）' :
+              (fgState === 'paused' ? '已暂停' : (fgState === 'stopped' ? '已停止' :
+                (fgState === 'unavailable_not_compiled' ? '不可用（安装包未编译）' : '请求开启（等待新 AI 输出）'))))));
       if (runtime.saveLoadError && runtime.saveLoadError !== this.lastSaveLoadError) {
         this.lastSaveLoadError = runtime.saveLoadError;
         this.getUIContext().getPromptAction().showToast({ message: runtime.saveLoadError, duration: 5000 });
@@ -1096,6 +1175,8 @@ struct Index {
           Column({ space: 4 }) {
             Text(`渲染  ${this.resolutionText}`).fontSize(11).fontColor('#CCDAD3')
             Text(`输出  ${this.outputResolutionText}`).fontSize(11).fontColor('#CCDAD3')
+            Text(`超分  ${this.superResolutionStateText}`).fontSize(11).fontColor('#CCDAD3')
+            Text(`补帧  ${this.frameGenerationStateText}`).fontSize(11).fontColor('#CCDAD3')
             Text('GPU 为系统 1–10 级负载，非百分比；占用每 2 秒采样。').fontSize(10).fontColor('#8BA69A')
             Text('FPS 按游戏呈现计数计算，非屏幕最终合成帧率。').fontSize(10).fontColor('#8BA69A')
           }.width('100%').alignItems(HorizontalAlign.Start).padding({ top: 4, bottom: 4 })
@@ -1124,6 +1205,9 @@ struct Index {
       preset: this.qualityPreset,
       superResolution: this.superResolution,
       frameGeneration: this.frameGeneration,
+      capabilitiesKnown: this.capabilitiesKnown,
+      superResolutionAvailable: this.superResolutionAvailable,
+      frameGenerationAvailable: this.frameGenerationAvailable,
       settingsEnabled: !this.importing && !this.selectingPackage && !this.saveBusy && !this.resourceChecking,
       onPresetChange: (preset: string) => {
         return this.selectQuality(preset, this.superResolution, this.frameGeneration);
@@ -1135,6 +1219,7 @@ struct Index {
         return this.selectQuality(this.qualityPreset, this.superResolution, enabled);
       }
     })
+    Text(this.capabilityMessage).fontSize(12).fontColor(LauncherColors.secondaryText).width('100%')
     if (this.qualityMessage.length > 0) {
       Text(this.qualityMessage).fontSize(12).fontColor(LauncherColors.accent).width('100%')
     }
@@ -1216,7 +1301,7 @@ struct Index {
               Text('导入预编译游戏压缩文件后，等待处理完毕即可开始游戏。').fontSize(14)
                 .fontColor(LauncherColors.secondaryText)
             }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-            Text('v0.8.0').fontSize(13).fontColor(LauncherColors.secondaryText)
+            Text('v1.0.1').fontSize(13).fontColor(LauncherColors.secondaryText)
           }.width('100%')
           LauncherSectionCard({
             title: '资源与启动',

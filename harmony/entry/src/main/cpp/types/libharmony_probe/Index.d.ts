@@ -37,6 +37,7 @@ export interface ProbeResult {
 export const runProbe: (aotPath: string, reportPath: string) => ProbeResult;
 
 export interface GameStatus {
+  frameGenerationAvailable?: boolean;
   uiAppForeground?: boolean;
   uiGameFocused?: boolean;
   uiMouseLook?: boolean;
@@ -56,10 +57,18 @@ export interface GameStatus {
   runtimeJson: string;
 }
 
-export const configureGame: (filesDirectory: string, action?: string, saveId?: string) => void;
+export const configureGame: (filesDirectory: string, action?: string, saveId?: string, frameGenerationRequested?: boolean) => void;
 export const startGame: () => void;
 export const stopGame: () => void;
 export const gameStatus: () => GameStatus;
+export interface GameCapabilities {
+  runtimeLinked: boolean;
+  superResolutionAvailable: boolean;
+  frameGenerationAvailable: boolean;
+  scope: string;
+}
+/** Compile/link capabilities only; does not initialize NNRT, models or Vulkan. */
+export const gameCapabilities: () => GameCapabilities;
 /** Cached script-safe-point snapshot; native monotonic now/age accompany unchanged field timestamps. */
 export const getTouchState: () => string;
 export const sendControl: (controlName: string, value: number, group?: number) => boolean;

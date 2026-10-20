@@ -129,6 +129,6 @@ def package(game, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="生成完整 HAP 可直接导入的精简资源 ZIP；不含 Wasm、AOT 或 HAP。")
     parser.add_argument("--game-dir", type=Path, default=ROOT / "resources/game")
-    parser.add_argument("--output", type=Path, default=ROOT / "dist/private-import-v0.8.0/HarmonyOS-GTA-V-v0.8.0-runtime-resources.zip")
+    parser.add_argument("--output", type=Path, default=ROOT / "dist/private-import-v1.0.1/HarmonyOS-GTA-V-v1.0.1-runtime-resources.zip")
     args = parser.parse_args()
     package(args.game_dir, args.output)

@@ -169,8 +169,8 @@ void OnTouch(OH_NativeXComponent *component, void *window) {
 OH_NativeXComponent_Callback callbacks{OnCreated, OnChanged, OnDestroyed, OnTouch};
 
 napi_value Configure(napi_env env, napi_callback_info info) {
-    size_t count = 3;
-    napi_value args[3]{};
+    size_t count = 4;
+    napi_value args[4]{};
     napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
     std::lock_guard<std::mutex> lock(stateMutex);
     if (resourceImportBlocked) {
@@ -199,6 +199,15 @@ napi_value Configure(napi_env env, napi_callback_info info) {
         }
     }
 #if MG_HAS_GAME_RUNTIME
+    bool frameGenerationRequested = false;
+    if (count > 3 && napi_get_value_bool(env, args[3], &frameGenerationRequested) != napi_ok) {
+        napi_throw_error(env, nullptr, "补帧请求参数必须为布尔值。");
+        return nullptr;
+    }
+    if (frameGenerationRequested && mg_game_frame_generation_available() == 0) {
+        napi_throw_error(env, nullptr, "本安装包未编译 AI 补帧；请明确关闭补帧后启动。配置保持不变。");
+        return nullptr;
+    }
     if (mg_game_set_launch(action.c_str(), saveId.c_str()) != 0) {
         napi_throw_error(env, nullptr, "无法使用所选游戏模式或存档，请重新打开应用后重试。");
         return nullptr;
@@ -228,11 +237,29 @@ napi_value Stop(napi_env env, napi_callback_info) {
     startRequested = false;
     return Undefined(env);
 }
+napi_value Capabilities(napi_env env, napi_callback_info) {
+    napi_value value = nullptr;
+    napi_create_object(env, &value);
+    SetBool(env, value, "runtimeLinked", MG_HAS_GAME_RUNTIME == 1);
+    SetBool(env, value, "superResolutionAvailable", MG_HAS_GAME_RUNTIME == 1);
+#if MG_HAS_GAME_RUNTIME
+    SetBool(env, value, "frameGenerationAvailable", mg_game_frame_generation_available() == 1);
+#else
+    SetBool(env, value, "frameGenerationAvailable", false);
+#endif
+    SetString(env, value, "scope", "Linked compile capabilities only; device/model support and running state are checked after startup.");
+    return value;
+}
 napi_value Status(napi_env env, napi_callback_info) {
     std::lock_guard<std::mutex> lock(stateMutex);
     napi_value value = nullptr;
     napi_create_object(env, &value);
     SetBool(env, value, "runtimeLinked", MG_HAS_GAME_RUNTIME == 1);
+#if MG_HAS_GAME_RUNTIME
+    SetBool(env, value, "frameGenerationAvailable", mg_game_frame_generation_available() == 1);
+#else
+    SetBool(env, value, "frameGenerationAvailable", false);
+#endif
     SetBool(env, value, "surfaceReady", nativeWindow != nullptr && surfaceWidth > 0 && surfaceHeight > 0);
     SetInt(env, value, "width", static_cast<int32_t>(surfaceWidth));
     SetInt(env, value, "height", static_cast<int32_t>(surfaceHeight));
@@ -415,6 +442,7 @@ void ExportGameMethods(napi_env env, napi_value exports) {
         {"startGame", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stopGame", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"gameStatus", nullptr, Status, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"gameCapabilities", nullptr, Capabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getTouchState", nullptr, TouchState, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendControl", nullptr, NamedControl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendRawKey", nullptr, RawKey, nullptr, nullptr, nullptr, napi_default, nullptr},

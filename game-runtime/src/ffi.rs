@@ -511,6 +511,11 @@ fn render_size(width:u32,height:u32)->(u32,u32) {
 }
 pub(crate) fn set_stage(s: &str) { eprintln!("[game] {s}"); *STAGE.lock().unwrap()=s.into(); }
 unsafe fn string(p:*const c_char)->anyhow::Result<String> { anyhow::ensure!(!p.is_null(),"null string"); Ok(CStr::from_ptr(p).to_str()?.into()) }
+/// Compile capability only: model/device initialization is checked at runtime.
+#[no_mangle]
+pub extern "C" fn mg_game_frame_generation_available()->i32 {
+    if cfg!(feature="frame-interpolation") {1}else{0}
+}
 #[no_mangle]
 pub unsafe extern "C" fn mg_game_set_launch(action:*const c_char,save_id:*const c_char)->i32 {
     if STARTED.load(Ordering::Acquire) { return 2; }
@@ -531,6 +536,14 @@ pub unsafe extern "C" fn mg_game_set_launch(action:*const c_char,save_id:*const 
 pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,files_dir:*const c_char)->i32 {
     if window.is_null() || width==0 || height==0 { set_error("missing native window or size"); return 1; }
     let path=match string(files_dir) {Ok(s)=>s,Err(e)=>{set_error(e);return 1}};
+    if mg_game_frame_generation_available()==0 {
+        let cfg=std::fs::read(PathBuf::from(&path).join("config.json")).ok()
+            .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok()).unwrap_or(serde_json::Value::Null);
+        let root=PathBuf::from(&path);
+        if crate::config::select_interpolation_backend(&cfg,root.join("frame-interpolation-npu.request").is_file(),root.join("frame-interpolation-rife.request").is_file()).is_some() {
+            eprintln!("[frame-interpolation] startup rejected: runtime was built without frame-interpolation feature; requested config preserved");return 4;
+        }
+    }
     if STARTED.swap(true,Ordering::SeqCst) { return 2; }
     STOP.store(false,Ordering::Release);
     PHYSICAL_SIZE.store(pack_size(width,height),Ordering::Relaxed);
@@ -738,6 +751,9 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     let gameplay_observed = WORLD_PLAYER_OBSERVED.load(Ordering::Acquire);
     let mut value=serde_json::json!({"stage":STAGE.lock().unwrap().clone(),"error":ERROR.lock().unwrap().clone(),"started":STARTED.load(Ordering::Relaxed),"stopRequested":stop_requested(),"presents":crate::gpu::PRESENTS.load(Ordering::Relaxed),"guestPresents":crate::gpu::GUEST_PRESENTS.load(Ordering::Relaxed),"gpuStarted":crate::gpu::STARTED.load(Ordering::Relaxed),"renderSize":crate::input::size(),"inputEvents":INPUTS.load(Ordering::Relaxed),"inputHealth":input_health,"rssMB":crate::footprint_mb(),"heapVirtualMB":crate::RT.get().map(|rt|rt.mem.data_size()>>20),"heapResidentMB":crate::heap_resident_mb(),"gameHostCalls":crate::RT.get().map(|rt|rt.counts.iter().map(|c|c.load(Ordering::Relaxed)).sum::<u64>()),"target":"aarch64-unknown-linux-ohos","source":"muguet-1a0300d"});
     value["worldPlayerObserved"] = gameplay_observed.into();
+    value["processId"] = std::process::id().into();
+    value["frameGenerationAvailable"] = (mg_game_frame_generation_available()==1).into();
+    value["frameGenerationLive"] = crate::frame_interpolation::live_status();
     value["touchControlTransport"] = crate::touch_controls::health_json();
     {
         let lifecycle = *APP_LIFECYCLE.lock().unwrap();

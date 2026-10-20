@@ -8,6 +8,8 @@ int32_t mg_game_start(void* native_window,uint32_t width,uint32_t height,const c
 /* Choose new/load/demo before constructing the guest. save_id is empty except
  * for load, where it is an app-private canonical relative save identifier. */
 int32_t mg_game_set_launch(const char* action,const char* save_id);
+/* Exact 0/1 compile capability. Does not initialize NNRT or validate a model/device. */
+int32_t mg_game_frame_generation_available(void);
 void mg_game_resize(uint32_t width,uint32_t height);
 void mg_game_key(uint32_t key_code,bool pressed);
 bool mg_game_key_event(uint32_t key_code,bool pressed,uint32_t unicode,bool suppress_text);

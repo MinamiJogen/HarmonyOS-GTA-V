@@ -6,6 +6,24 @@ export interface GameQualitySelection {
   superResolution: boolean;
   frameGeneration: boolean;
 }
+export interface GameQualityCapabilities {
+  runtimeLinked: boolean;
+  superResolutionAvailable: boolean;
+  frameGenerationAvailable: boolean;
+}
+
+// Must run BEFORE defaults/quality write any config. Keep an unsupported request
+// intact so the player can explicitly turn it off or install a capable package.
+export function requireGameQualityCapabilities(selection: GameQualitySelection,
+  capabilities: GameQualityCapabilities): void {
+  if (!capabilities.runtimeLinked) { throw new Error('本安装包未包含游戏运行时。'); }
+  if (selection.frameGeneration && !capabilities.frameGenerationAvailable) {
+    throw new Error('本安装包未编译 AI 补帧。请明确关闭补帧后启动，或安装支持补帧的完整包；已保存选择保持不变。');
+  }
+  if (selection.superResolution && !capabilities.superResolutionAvailable) {
+    throw new Error('本安装包未包含超分能力；已保存选择保持不变。');
+  }
+}
 
 function readConfig(filesDir: string): Record<string, Object> {
   const path: string = `${filesDir}/config.json`;

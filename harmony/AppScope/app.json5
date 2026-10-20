@@ -3,8 +3,8 @@
     "bundleName": "com.shuyuan.harmonyosgtav",
     "entityType": "game",
     "vendor": "HarmonyOS-GTA-V",
-    "versionCode": 1000006,
-    "versionName": "0.8.0",
+    "versionCode": 1000101,
+    "versionName": "1.0.1",
     "icon": "$media:app_icon_gta5",
     "label": "$string:app_name"
   }

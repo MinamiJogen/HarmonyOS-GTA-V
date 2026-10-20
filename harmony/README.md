@@ -1,5 +1,12 @@
 # HarmonyOS API 26 game shell and runtime probe
 
+The current application version is **1.0.1** (`versionCode` **1000101**). Full
+local builds include checked frame-interpolation capabilities, live processing
+status, and readback-cache recovery after nonfatal graphics errors. Resource
+build **8b0b5899ed** is unchanged: existing matching `data/` and shader files, or
+the previously verified resource-only ZIP, remain compatible. The matching game
+AOT is embedded in the local full HAP; no separate resource update is required.
+
 The home page creates a native XComponent surface and starts the actual OHOS
 game runtime when its static library and signed game AOT object are linked. It
 uses the application's real `filesDir/game` resource directory, preserves saves
@@ -174,7 +181,7 @@ The opt-in full-game interpolation prototype is built separately from the public
 shell and the system FG surface experiment:
 
 ```sh
-MUGUET_RUNTIME_FEATURES=frame-interpolation bash game-runtime/scripts/build-ohos.sh
+bash game-runtime/scripts/build-ohos.sh
 HARMONY_BUILD_STAGE=/private/tmp/harmony-fg30-20261019 \
 HARMONY_GAME_EXPERIMENT_BUNDLE=com.minami.harmonyruntimeprobe \
 HARMONY_RIFE_SDK=/private/tmp/harmony-rife-20261019/sdk \
@@ -185,14 +192,22 @@ zsh harmony/build_signed_local.sh
 The private mirror retains its existing signing profile. The experiment bundle
 must differ from the working game; it keeps `EntryAbility` and omits system FG
 loader metadata. It reuses the local embedded AOT and requires separately
-installed game resources. The runtime feature is off by default; a feature-on
-archive must be linked with the optional SDK and generic interpolation bridge.
+installed game resources. Normal local OHOS runtime builds include
+`frame-interpolation` by default. `MUGUET_RUNTIME_FEATURES=` explicitly builds a
+feature-off native diagnostic; full-game HAP packaging rejects it. A full game
+requires `HARMONY_RIFE_SDK` and the generic interpolation bridge. The build records
+the exact runtime archive hash and checks the constant-return capability ABI plus
+real implementation markers before linking and again inside the HAP. A stale
+archive manifest or a feature-off packaged library fails the build. Public shells
+and the independent FG surface probe remain runtime-free.
 
 Inside this experiment's files directory, `frame-interpolation-npu.request`
 selects the public stock-model NNRT/CANN path with GPU reconstruction;
 `frame-interpolation-rife.request` selects RIFE v4.6 (NPU marker takes precedence).
-Restart the process after changing these explicit local markers. With neither
-marker, the ordinary renderer runs. The RIFE path verifies the pinned model
+Restart the process after changing these explicit local markers or configuration.
+`frame_interpolation_enabled=false` disables FG. Existing NPU/RIFE markers retain
+their selection; with neither marker, explicit configuration `true` selects NPU.
+A missing field retains the legacy marker-only opt-in. The RIFE path verifies the pinned model
 hashes in `rife-v4.6`; the NPU path reads stock model bytes only in memory.
 
 The NPU path preserves owned copies of the actual guest final texture. Only

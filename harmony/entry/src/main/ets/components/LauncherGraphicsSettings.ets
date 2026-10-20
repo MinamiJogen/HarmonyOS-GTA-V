@@ -9,6 +9,9 @@ export struct LauncherGraphicsSettings {
   @Prop superResolution: boolean = true;
   @Prop frameGeneration: boolean = true;
   @Prop settingsEnabled: boolean = true;
+  @Prop capabilitiesKnown: boolean = false;
+  @Prop superResolutionAvailable: boolean = false;
+  @Prop frameGenerationAvailable: boolean = false;
 
   onPresetChange: (preset: string) => boolean = (_preset: string): boolean => false;
   onSuperResolutionChange: (enabled: boolean) => boolean = (_enabled: boolean): boolean => false;
@@ -99,13 +102,17 @@ export struct LauncherGraphicsSettings {
             Toggle({ type: ToggleType.Switch, isOn: this.superResolution })
               .selectedColor(LauncherColors.accent)
               .systemMaterial(this.controlMaterial)
-              .enabled(this.settingsEnabled)
+              .enabled(this.settingsEnabled && (this.superResolution || (this.capabilitiesKnown && this.superResolutionAvailable)))
               .accessibilityText('XEngine 超分辨率')
               .onChange((next: boolean) => { this.requestSuperResolution(next); })
           }, (epoch: number) => String(epoch))
         }
         .width('100%')
         .constraintSize({ minHeight: 44 })
+        Text(!this.superResolution ? '已关闭' :
+          (!this.capabilitiesKnown ? '请求开启 · 能力待确认' :
+            (this.superResolutionAvailable ? '请求开启 · 启动后验证设备接口' : '请求开启 · 当前安装包不可用')))
+          .fontSize(11).fontColor(LauncherColors.secondaryText)
 
         Divider().color(LauncherColors.border)
 
@@ -118,13 +125,17 @@ export struct LauncherGraphicsSettings {
             Toggle({ type: ToggleType.Switch, isOn: this.frameGeneration })
               .selectedColor(LauncherColors.accent)
               .systemMaterial(this.controlMaterial)
-              .enabled(this.settingsEnabled)
+              .enabled(this.settingsEnabled && (this.frameGeneration || (this.capabilitiesKnown && this.frameGenerationAvailable)))
               .accessibilityText('NNRT/CANN AI 帧插值')
               .onChange((next: boolean) => { this.requestFrameGeneration(next); })
           }, (epoch: number) => String(epoch))
         }
         .width('100%')
         .constraintSize({ minHeight: 44 })
+        Text(!this.frameGeneration ? '已关闭' :
+          (!this.capabilitiesKnown ? '请求开启 · 能力待确认' :
+            (this.frameGenerationAvailable ? '请求开启 · 启动后验证模型和设备' : '请求开启 · 当前安装包未提供补帧')))
+          .fontSize(11).fontColor(LauncherColors.secondaryText)
       }
       // Bound the percentage-width rows before Flex measures this child's basis.
       .width(288)

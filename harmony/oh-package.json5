@@ -1,7 +1,7 @@
 {
   "modelVersion": "6.0.0",
   "name": "harmony-runtime-probe",
-  "version": "0.8.0",
+  "version": "1.0.1",
   "description": "面向 HarmonyOS API 26 的 GTA5 运行环境与原生诊断工具。",
   "dependencies": {},
   "devDependencies": {}

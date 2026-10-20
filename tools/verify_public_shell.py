@@ -50,7 +50,7 @@ def main():
         assert bundle_name == "com.shuyuan.harmonyosgtav", "Unexpected application bundle name"
         pack_info = json.loads(package.read("pack.info"))
         assert pack_info["summary"]["app"]["bundleName"] == bundle_name, "Package metadata bundle name differs from module.json"
-        assert app["versionName"] == "0.8.0" and app["versionCode"] == 1000006, "Unexpected application version"
+        assert app["versionName"] == "1.0.1" and app["versionCode"] == 1000101, "Unexpected application version"
         icon = package.read(icon_path)
         assert icon == (repo / "harmony/AppScope/resources/base/media/app_icon_gta5.png").read_bytes(), "Packaged app icon differs from the selected source icon"
         assert icon == (repo / "harmony/entry/src/main/resources/base/media/app_icon_gta5.png").read_bytes(), "Entry and AppScope app icons differ"
@@ -81,7 +81,7 @@ def main():
     report = {
         "status": "PASS_public_shell_static_verification",
         "bundleName": bundle_name, "packInfoBundleNameMatches": True,
-        "versionName": "0.8.0", "versionCode": 1000006,
+        "versionName": "1.0.1", "versionCode": 1000101,
         "api": 26, "abi": "arm64-v8a", "buildMode": "release",
         "unsigned": True, "hapBytes": hap.stat().st_size,
         "officialSignatureVerifier": "signature not found; No Hap Signing Block",

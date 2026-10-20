@@ -888,7 +888,7 @@ struct PendingMap {
     kind: MapKind,
 }
 enum MapKind {
-    Readback { flag: u64, rows: Vec<(u64, u64, u64)>, recycle: bool },
+    Readback { flag: u64, rows: Vec<(u64, u64, u64)>, recycle: bool, error_generation: u64 },
     Occlusion { list: Vec<(u64, u32, u64, bool, usize)> },
 }
 
@@ -899,6 +899,7 @@ static OUTPUT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_CACHE_COPIES: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_CACHE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_CACHE_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static UNSUPPORTED_RENDER_ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn output_cache_status() -> serde_json::Value {
     serde_json::json!({"repeatHitSubmissions":OUTPUT_CACHE_HITS.load(Ordering::Relaxed),
@@ -955,6 +956,7 @@ pub struct Gpu {
     stale_query_writes: u64,
     bc_live: HashMap<u32, (TextureFormat, u64, u64)>,
     adapter: Adapter,
+    render_attachment_usages: RefCell<HashMap<TextureFormat, TextureUsages>>,
     gpu_profile: Option<gpu_profile::Profiler>,
     profile_finish_pending: bool,
     surface: Option<(Surface<'static>, Arc<crate::native_platform::NativeWindow>)>,
@@ -1125,7 +1127,7 @@ impl Gpu {
             let mem2 = mem.clone();
             let kinds: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
             device.on_uncaptured_error(Arc::new(move |e: Error| {
-                errors.fetch_add(1, Ordering::Relaxed);
+                errors.fetch_add(1, Ordering::AcqRel);
                 atomic(&mem2, ring + 16).fetch_add(1, Ordering::Relaxed);
                 let msg = error_chain(&e);
                 let key: String = msg.chars().filter(|c| !c.is_ascii_digit()).take(200).collect();
@@ -1184,7 +1186,7 @@ impl Gpu {
         Ok(Gpu {
             live_queries: Default::default(), query_done: Default::default(), stale_query_writes: 0, bc_live: HashMap::new(),
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
-            base, mem, ring, device, queue, adapter, gpu_profile, profile_finish_pending: false, surface, surface_format, surface_size: (0, 0),
+            base, mem, ring, device, queue, adapter, render_attachment_usages: RefCell::new(HashMap::new()), gpu_profile, profile_finish_pending: false, surface, surface_format, surface_size: (0, 0),
             spatial, spatial_slot_ready: [true; FRAME_SLOTS], submit_prefix: Vec::new(),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             map_programs: HashMap::new(), s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
@@ -2159,10 +2161,37 @@ impl Gpu {
         self.empty_bgl.as_ref().unwrap().0.clone()
     }
 
-    fn target_view(&mut self, id: u32, dxgi: u32, mip: u32, slice: u32) -> Option<(TextureView, TextureFormat)> {
+    fn render_target_format(&self, id: u32, dxgi: u32) -> Option<TextureFormat> {
         let t = self.tex(id)?;
         let fmt = if dxgi != 0 { map_format(dxgi, 0).format } else { t.format };
         let fmt = if is_depth(t.format) || t.half != 0 { t.format } else { fmt };
+        // Adapter format properties are immutable for this device. On Vulkan
+        // the public query reaches the driver, so do it once per view format,
+        // rather than once for every render pass or cached attachment view.
+        let cached = self.render_attachment_usages.borrow().get(&fmt).copied();
+        let allowed = match cached {
+            Some(allowed) => allowed,
+            None => {
+                let allowed = self.adapter.get_texture_format_features(fmt).allowed_usages;
+                self.render_attachment_usages.borrow_mut().insert(fmt, allowed);
+                allowed
+            }
+        };
+        if !t.tex.usage().contains(TextureUsages::RENDER_ATTACHMENT)
+            || !allowed.contains(TextureUsages::RENDER_ATTACHMENT) {
+            UNSUPPORTED_RENDER_ATTACHMENTS.fetch_add(1, Ordering::Relaxed);
+            log_once(&format!("unsupported-render-attachment-{id}-{fmt:?}"),
+                &format!("unsupported render attachment: tex={id} textureFormat={:?} viewFormat={fmt:?} usage={:?} formatAllowed={allowed:?}; rejecting this pass without format substitution", t.format, t.tex.usage()));
+            return None;
+        }
+        Some(fmt)
+    }
+
+    fn target_view(&mut self, id: u32, dxgi: u32, mip: u32, slice: u32) -> Option<(TextureView, TextureFormat)> {
+        // A cached view does not make an unsupported attachment renderable.
+        // In particular, RGBA8_SNORM may support sampling/copy/storage only.
+        let fmt = self.render_target_format(id, dxgi)?;
+        let t = self.tex(id)?;
         if let Some(v) = t.views.get(&(fmt, mip, slice)) { return Some((v.clone(), fmt)); }
         let three = t.desc.dim == TextureDimension::D3;
         let tex = t.tex.clone();
@@ -2213,7 +2242,9 @@ impl Gpu {
                     any = true;
                     self.use_tex(r.tex);
                 }
-                None => colors.push(None),
+                // Dropping just this attachment could still draw into the
+                // remaining MRT/depth targets with a different shader contract.
+                None => return false,
             }
         }
         while matches!(colors.last(), Some(None)) { colors.pop(); }
@@ -2231,7 +2262,7 @@ impl Gpu {
                 ds_att = Some((v, f));
                 any = true;
                 self.use_tex(ds.tex);
-            }
+            } else { return false; }
         }
         if !any { return false; }
 
@@ -3333,6 +3364,7 @@ impl Gpu {
     }
 
     fn clear_view(&mut self, id: u32, mip: u32, slice: u32) -> Option<TextureView> {
+        self.render_target_format(id, 0)?;
         let t = self.tex(id)?;
         if t.desc.dim == TextureDimension::D3 {
             return Some(t.tex.create_view(&TextureViewDescriptor { base_mip_level: mip, mip_level_count: Some(1), base_array_layer: slice, array_layer_count: Some(1), dimension: Some(TextureViewDimension::D2), ..Default::default() }));
@@ -3569,6 +3601,7 @@ impl Gpu {
     fn resolve(&mut self, dst: u32, dst_sub: u32, src: u32, src_sub: u32) {
         self.materialize_clears(src);
         self.materialize_clears(dst);
+        if self.render_target_format(src, 0).is_none() || self.render_target_format(dst, 0).is_none() { return; }
         let (Some(s), Some(d)) = (self.tex(src), self.tex(dst)) else { return };
         let (ss, ds) = (Self::sub_of(&s.desc, src_sub), Self::sub_of(&d.desc, dst_sub));
         let sv = s.tex.create_view(&TextureViewDescriptor { base_mip_level: ss.0, mip_level_count: Some(1), base_array_layer: ss.1, array_layer_count: Some(1), dimension: Some(TextureViewDimension::D2), ..Default::default() });
@@ -3591,6 +3624,7 @@ impl Gpu {
         let Some((fmt, desc, tex)) = self.tex(res).map(|t| (t.format, t.desc, t.tex.clone())) else { return };
         if desc.mips < 2 { return; }
         if is_depth(fmt) || is_bc(fmt) || desc.dim == TextureDimension::D3 { log_once(&format!("mips{fmt:?}"), &format!("GenerateMips: unsupported format/dimension {fmt:?}")); return; }
+        if self.render_target_format(res, 0).is_none() { return; }
         self.end_pass();
         if !self.mip_pipelines.contains_key(&fmt) {
             let module = self.device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(
@@ -3638,9 +3672,10 @@ impl Gpu {
         self.mark_color_dirty(res);
     }
 
-    fn readback_buffer(&mut self, size: u64, fully_written: bool) -> Buffer {
+    fn readback_buffer(&mut self, size: u64, fully_written: bool, error_generation: u64) -> Buffer {
         let usage = BufferUsages::COPY_DST | BufferUsages::MAP_READ;
         if let Some(pool) = self.readback_pool.as_mut() {
+            pool.observe_error_generation(error_generation);
             if fully_written {
                 if let Some(buffer) = pool.take(readback_pool::Key { size, usage: usage.bits() }) { return buffer; }
             }
@@ -3671,11 +3706,12 @@ impl Gpu {
             let padded = (checked_value(memory_checks::add(n, 3), "buffer readback padding") & !3).max(4);
             let from = if has_box { l as u64 } else { 0 };
             let copy = padded.min(g.size().saturating_sub(from)) & !3;
-            let recycle = self.readback_pool.is_some() && self.errors.load(Ordering::Relaxed) == 0
+            let error_generation = self.errors.load(Ordering::Acquire);
+            let recycle = self.readback_pool.is_some()
                 && g.usage().contains(BufferUsages::COPY_SRC)
                 && !g.usage().intersects(BufferUsages::MAP_READ | BufferUsages::MAP_WRITE)
                 && readback_pool::full_buffer_copy(padded, copy, from, g.size());
-            let rb = self.readback_buffer(padded, recycle);
+            let rb = self.readback_buffer(padded, recycle, error_generation);
             self.end_pass();
             if copy > 0 {
                 let timestamp = self.profile_pair("readback", || format!("buffer {src} bytes={copy}"));
@@ -3684,7 +3720,7 @@ impl Gpu {
                 if let Some(t) = &timestamp { t.end(enc); }
             }
             self.flush();
-            self.map_pending(rb, MapKind::Readback { flag, rows: vec![(0, addr, n)], recycle });
+            self.map_pending(rb, MapKind::Readback { flag, rows: vec![(0, addr, n)], recycle, error_generation });
             return;
         }
         let Some((tex, fmt, desc, bc)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc, x.bc)) else { done(self); return };
@@ -3717,7 +3753,8 @@ impl Gpu {
         }
         let rb_slice_size = checked_value(memory_checks::mul(bpr, by as u64), "texture readback slice size");
         let rb_size = checked_value(memory_checks::mul(rb_slice_size, d as u64), "texture readback buffer size");
-        let recycle = self.readback_pool.is_some() && self.errors.load(Ordering::Relaxed) == 0
+        let error_generation = self.errors.load(Ordering::Acquire);
+        let recycle = self.readback_pool.is_some()
             && bw == 1 && bh == 1 && fmt.block_copy_size(None).is_some()
             && tex.usage().contains(TextureUsages::COPY_SRC) && mip < tex.mip_level_count()
             && readback_pool::source_region_valid(
@@ -3725,7 +3762,7 @@ impl Gpu {
                 [w as u64, h as u64, if three { d as u64 } else { 1 }],
                 [mw as u64, mh as u64, if three { md as u64 } else { desc.d as u64 }])
             && readback_pool::full_texture_copy(rb_size, row_bytes, bpr, by as u64, d as u64, if three { d as u64 } else { 1 });
-        let rb = self.readback_buffer(rb_size.max(4), recycle);
+        let rb = self.readback_buffer(rb_size.max(4), recycle, error_generation);
         self.end_pass();
         let timestamp = self.profile_pair("readback", || format!("texture {src} {w}x{h}x{d} bytes={rb_size}"));
         let enc = self.encoder(); if let Some(t) = &timestamp { t.begin(enc); }
@@ -3754,7 +3791,7 @@ impl Gpu {
             }
         }
         if row_len < row_bytes { log_once(&format!("rbpitch{fmt:?}"), &format!("readback rows of {row_bytes} bytes clamped to the game's pitch {row_pitch} ({fmt:?})")); }
-        self.map_pending(rb, MapKind::Readback { flag, rows, recycle });
+        self.map_pending(rb, MapKind::Readback { flag, rows, recycle, error_generation });
     }
 
     fn map_pending(&mut self, buf: Buffer, kind: MapKind) {
@@ -3823,6 +3860,14 @@ impl Gpu {
         while i < self.pending_maps.len() {
             if !self.pending_maps[i].done.load(Ordering::SeqCst) { i += 1; continue; }
             let pm = self.pending_maps.swap_remove(i);
+            if pm.failed.load(Ordering::SeqCst) {
+                // Preserve the existing fatal failure protocol: no mapped view,
+                // no guest completion notification and no return to the pool.
+                let error = "GPU readback mapping failed; guest completion was not published";
+                crate::ffi::set_error(error);
+                panic!("{error}");
+            }
+            let mut guest_copies_complete = true;
             {
                 let range = pm.buf.slice(..).get_mapped_range().expect("mapped range");
                 match &pm.kind {
@@ -3831,7 +3876,9 @@ impl Gpu {
                             // Check the starting pointer even for a zero-byte
                             // copy; adding a pointer beyond the allocation is UB.
                             checked_value(memory_checks::span(range.len(), from, 0, 1), "mapped readback source start");
-                            let n = n.min(range.len() as u64 - from);
+                            let available = range.len() as u64 - from;
+                            guest_copies_complete &= n <= available;
+                            let n = n.min(available);
                             let source = checked_value(memory_checks::span(range.len(), from, n, 1), "mapped readback source");
                             let destination = guest_span(&self.mem, to, n, 1, "mapped readback guest destination");
                             crate::heapcheck::note(to, n, "gpu readback");
@@ -3855,14 +3902,19 @@ impl Gpu {
                 }
             }
             pm.buf.unmap();
-            if let MapKind::Readback { flag, recycle, .. } = pm.kind {
+            if let MapKind::Readback { flag, recycle, error_generation, .. } = pm.kind {
                 if flag != 0 { atomic(&self.mem, flag).store(0, Ordering::SeqCst); let _ = self.mem.atomic_notify(flag, u32::MAX); }
                 // Keep the existing copy -> view drop -> unmap -> guest flag/
                 // notify sequence. Only then may this uniquely owned buffer
                 // enter the idle cache; pending/mapped buffers never do.
-                if recycle && self.errors.load(Ordering::Relaxed) == 0
-                    && pm.buf.usage() == (BufferUsages::COPY_DST | BufferUsages::MAP_READ) {
-                    if let Some(pool) = self.readback_pool.as_mut() {
+                let current_generation = self.errors.load(Ordering::Acquire);
+                if let Some(pool) = self.readback_pool.as_mut() {
+                    // Clear old idle entries even when this in-flight lease is
+                    // now ineligible. A later clean generation may pool again.
+                    pool.observe_error_generation(current_generation);
+                    if readback_pool::clean_completion(error_generation, current_generation,
+                        recycle, true, guest_copies_complete)
+                        && pm.buf.usage() == (BufferUsages::COPY_DST | BufferUsages::MAP_READ) {
                         let key = readback_pool::Key { size: pm.buf.size(), usage: pm.buf.usage().bits() };
                         pool.return_unmapped(key, pm.buf);
                     }
@@ -4440,9 +4492,12 @@ impl Gpu {
                     "peakCachedBuffers":s.peak_buffers,"peakCachedBytes":s.peak_bytes,
                     "perKeyLimit":readback_pool::PER_KEY_LIMIT,"bufferLimit":readback_pool::BUFFER_LIMIT,
                     "byteLimit":readback_pool::BYTE_LIMIT,
+                    "errorInvalidations":s.error_invalidations,"errorInvalidatedBuffers":s.error_invalidated_buffers,
+                    "errorPolicy":"idle cache clears on uncaptured-error generation changes; only fully overwritten, successfully mapped/copied/unmapped leases with unchanged generation may return",
                     "scope":"cumulative readback counts and idle-cache capacity; in-flight buffers are not cached"
                 })));
             }
+            log(&format!("unsupported-render-attachments: {} (rejected uses; no substitute format or successful rendering is implied)", UNSUPPORTED_RENDER_ATTACHMENTS.load(Ordering::Relaxed)));
             if *MEM_STATS {
                 let mut by: Vec<(TextureFormat, u64, u64, u64)> = Vec::new();
                 for (f, p, e) in self.bc_live.values() {

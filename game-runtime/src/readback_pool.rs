@@ -21,11 +21,30 @@ pub struct Stats {
     pub cached_bytes: u64,
     pub peak_buffers: usize,
     pub peak_bytes: u64,
+    pub error_invalidations: u64,
+    pub error_invalidated_buffers: u64,
 }
 
-pub struct Pool<T> { idle: Vec<(Key, T)>, stats: Stats }
+pub struct Pool<T> { idle: Vec<(Key, T)>, stats: Stats, error_generation: u64 }
 impl<T> Pool<T> {
-    pub fn new() -> Self { Self { idle: Vec::new(), stats: Stats::default() } }
+    pub fn new() -> Self { Self { idle: Vec::new(), stats: Stats::default(), error_generation: 0 } }
+
+    /// Error generations are the monotonic, process-local uncaptured-error
+    /// count. In-flight leases live outside this pool and are not invalidated
+    /// by dropping idle entries; their completion must check its own generation.
+    pub fn observe_error_generation(&mut self, generation: u64) {
+        if generation == self.error_generation { return; }
+        self.clear_idle();
+        self.error_generation = generation;
+        self.stats.error_invalidations = self.stats.error_invalidations.saturating_add(1);
+    }
+
+    pub fn clear_idle(&mut self) {
+        self.stats.error_invalidated_buffers = self.stats.error_invalidated_buffers.saturating_add(self.idle.len() as u64);
+        self.idle.clear();
+        self.stats.cached_buffers = 0;
+        self.stats.cached_bytes = 0;
+    }
 
     pub fn take(&mut self, key: Key) -> Option<T> {
         let i = self.idle.iter().position(|(k, _)| *k == key)?;
@@ -59,6 +78,13 @@ impl<T> Pool<T> {
     }
 
     pub fn stats(&self) -> Stats { self.stats }
+}
+
+/// An error before a lease began is not a lifetime ban. An error during its
+/// submission/map/CPU-copy lifetime is: that lease must never return to idle.
+pub fn clean_completion(start_generation: u64, current_generation: u64,
+    fully_written: bool, map_succeeded: bool, guest_copies_complete: bool) -> bool {
+    fully_written && map_succeeded && guest_copies_complete && start_generation == current_generation
 }
 
 /// Strong eligibility: the entire allocation, not only exported guest rows,
@@ -155,5 +181,66 @@ mod tests {
             assert_eq!(drops.load(Ordering::Relaxed), 2);
         }
         assert_eq!(drops.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn an_error_retires_idle_and_inflight_leases_but_not_future_clean_work() {
+        let mut p = Pool::new();
+        let key = Key { size: 256, usage: 9 };
+        p.return_unmapped(key, "old idle".to_string());
+        p.return_unmapped(key, "old in-flight".to_string());
+        let old = p.take(key).unwrap();
+        let old_generation = 0;
+        p.observe_error_generation(2); // two validation errors, neither cleared
+        assert!(p.take(key).is_none());
+        assert!(!clean_completion(old_generation, 2, true, true, true));
+        drop(old); // the owner drops this lease rather than returning it
+        assert_eq!(p.stats().error_invalidations, 1);
+        assert_eq!(p.stats().error_invalidated_buffers, 1);
+        assert_eq!(p.stats().cached_buffers, 0);
+        assert_eq!(p.stats().cached_bytes, 0);
+        assert_eq!(p.stats().returned, 2); // cumulative counts were not reset
+
+        // A full overwrite that begins and completes after those old errors
+        // is safe to pool; a nonzero process lifetime count is not a ban.
+        assert!(clean_completion(2, 2, true, true, true));
+        p.return_unmapped(key, "new clean".to_string());
+        p.observe_error_generation(2); // no repeated invalidation
+        assert_eq!(p.take(key).as_deref(), Some("new clean"));
+        assert_eq!(p.stats().error_invalidations, 1);
+        assert_eq!(p.stats().reused, 2);
+    }
+
+    #[test]
+    fn mapping_cpu_copy_and_late_errors_all_prevent_return() {
+        assert!(!clean_completion(9, 9, true, false, true)); // failed mapping
+        assert!(!clean_completion(9, 9, true, true, false)); // truncated CPU rows
+        assert!(!clean_completion(9, 9, false, true, true)); // partial GPU write
+        assert!(!clean_completion(9, 10, true, true, true)); // error during copy
+        assert!(!clean_completion(0, 1, true, true, true));
+        assert!(clean_completion(10, 10, true, true, true));
+        assert!(clean_completion(u64::MAX, u64::MAX, true, true, true));
+    }
+
+    #[test]
+    fn errors_with_multiple_out_of_order_inflight_leases_never_reintroduce_old_idle() {
+        let mut p = Pool::new();
+        let key = Key { size: 256, usage: 9 };
+        let leases = [(0, "very old"), (1, "old"), (2, "current")];
+        p.observe_error_generation(2);
+        for (generation, bytes) in leases.into_iter().rev() {
+            if clean_completion(generation, 2, true, true, true) {
+                p.return_unmapped(key, bytes);
+            }
+        }
+        assert_eq!(p.stats().cached_buffers, 1);
+        assert_eq!(p.take(key), Some("current"));
+        assert!(p.take(key).is_none());
+        // An error after a successful return also invalidates that idle entry
+        // before the next checkout, without touching any in-flight owner.
+        p.return_unmapped(key, "returned before error");
+        p.observe_error_generation(3);
+        assert!(p.take(key).is_none());
+        assert_eq!(p.stats().error_invalidated_buffers, 1);
     }
 }
