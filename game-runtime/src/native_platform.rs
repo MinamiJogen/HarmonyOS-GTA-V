@@ -19,6 +19,7 @@ unsafe extern "C" {
     fn OH_NativeWindow_NativeObjectReference(object: *mut c_void) -> i32;
     fn OH_NativeWindow_NativeObjectUnreference(object: *mut c_void) -> i32;
     fn OH_NativeWindow_NativeWindowHandleOpt(window: *mut c_void, code: i32, ...) -> i32;
+    fn OH_NativeWindow_NativeWindowSetScalingModeV2(window: *mut c_void, mode: i32) -> i32;
 }
 
 #[derive(Debug)]
@@ -55,6 +56,20 @@ impl NativeWindow {
             OH_NativeWindow_NativeWindowHandleOpt(self.handle.as_ptr(), 0, width as i32, height as i32)
         };
         anyhow::ensure!(result == 0, "OHNativeWindow SET_BUFFER_GEOMETRY failed: {result}");
+        Ok(())
+    }
+
+    /// Apply the public window policy after swapchain configuration. Call on
+    /// the GPU thread, serialized with its NativeWindow/Vulkan operations.
+    /// Success confirms the request only; RS buffer mode needs device evidence.
+    pub fn set_aspect_fit(&self) -> anyhow::Result<()> {
+        // OHScalingModeV2 in SDK native_window/external_window.h, since API 12.
+        const OH_SCALING_MODE_SCALE_FIT_V2: i32 = 4;
+        let result = unsafe {
+            OH_NativeWindow_NativeWindowSetScalingModeV2(self.handle.as_ptr(), OH_SCALING_MODE_SCALE_FIT_V2)
+        };
+        eprintln!("[native-window] GPU post-configure aspect-fit request mode=4 result={result}");
+        anyhow::ensure!(result == 0, "OHNativeWindow post-configure SCALE_FIT request failed: {result}");
         Ok(())
     }
 }

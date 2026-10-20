@@ -1,7 +1,10 @@
 #include "game_surface.h"
 #include "game_resource_import.h"
+#include "game_save_import_core.h"
+#include "game_save_import.h"
 #include <ace/xcomponent/native_interface_xcomponent.h>
 #include <hilog/log.h>
+#include <native_window/external_window.h>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -24,6 +27,8 @@ bool gameStartedOnce = false;
 bool resourceImportBlocked = false;
 int32_t startResult = -1;
 std::string surfaceError;
+bool aspectFitApplied = false;
+int32_t aspectFitResult = -1;
 
 bool ResourceImportGate(bool begin) {
     std::lock_guard<std::mutex> lock(stateMutex);
@@ -75,6 +80,23 @@ void TryStartLocked() {
     // The game ability requests landscape asynchronously. Never freeze guest
     // render dimensions from a transitional portrait XComponent surface.
     if (surfaceWidth <= surfaceHeight) return;
+    if (!aspectFitApplied) {
+        // This window-wide policy survives size changes and applies to future
+        // buffers. Set it before handing the window to the GPU thread: the
+        // public NativeWindow API is not thread-safe, so OnChanged must not
+        // reapply it concurrently with the runtime's native window operations.
+        aspectFitResult = OH_NativeWindow_NativeWindowSetScalingModeV2(
+            static_cast<OHNativeWindow *>(nativeWindow), OH_SCALING_MODE_SCALE_FIT_V2);
+        aspectFitApplied = aspectFitResult == 0;
+        OH_LOG_Print(LOG_APP, aspectFitApplied ? LOG_INFO : LOG_ERROR, kDomain, kTag,
+            "SURFACE_ASPECT_FIT mode=%{public}d result=%{public}d window=%{public}p",
+            static_cast<int32_t>(OH_SCALING_MODE_SCALE_FIT_V2), aspectFitResult, nativeWindow);
+        if (!aspectFitApplied) {
+            surfaceError = "Cannot apply aspect-preserving native surface scaling: " +
+                std::to_string(aspectFitResult);
+            return;
+        }
+    }
 #if MG_HAS_GAME_RUNTIME
     startResult = mg_game_start(nativeWindow, surfaceWidth, surfaceHeight, filesDirectory.c_str());
     startDispatched = startResult == 0;
@@ -93,6 +115,8 @@ void OnCreated(OH_NativeXComponent *component, void *window) {
     int32_t result = OH_NativeXComponent_GetXComponentSize(component, window, &width, &height);
     std::lock_guard<std::mutex> lock(stateMutex);
     nativeWindow = window;
+    aspectFitApplied = false;
+    aspectFitResult = -1;
     surfaceWidth = static_cast<uint32_t>(width);
     surfaceHeight = static_cast<uint32_t>(height);
     surfaceError = result == OH_NATIVEXCOMPONENT_RESULT_SUCCESS ? "" : "Cannot read native surface dimensions.";
@@ -103,6 +127,10 @@ void OnChanged(OH_NativeXComponent *component, void *window) {
     uint64_t width = 0, height = 0;
     OH_NativeXComponent_GetXComponentSize(component, window, &width, &height);
     std::lock_guard<std::mutex> lock(stateMutex);
+    if (nativeWindow != window) {
+        aspectFitApplied = false;
+        aspectFitResult = -1;
+    }
     nativeWindow = window;
     surfaceWidth = static_cast<uint32_t>(width);
     surfaceHeight = static_cast<uint32_t>(height);
@@ -117,6 +145,8 @@ void OnDestroyed(OH_NativeXComponent *, void *window) {
     if (startDispatched) mg_game_stop();
 #endif
     nativeWindow = nullptr;
+    aspectFitApplied = false;
+    aspectFitResult = -1;
     surfaceWidth = surfaceHeight = 0;
     startDispatched = false;
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "SURFACE_DESTROYED window=%{public}p", window);
@@ -139,15 +169,42 @@ void OnTouch(OH_NativeXComponent *component, void *window) {
 OH_NativeXComponent_Callback callbacks{OnCreated, OnChanged, OnDestroyed, OnTouch};
 
 napi_value Configure(napi_env env, napi_callback_info info) {
-    size_t count = 1;
-    napi_value args[1]{};
+    size_t count = 3;
+    napi_value args[3]{};
     napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
     std::lock_guard<std::mutex> lock(stateMutex);
     if (resourceImportBlocked) {
         napi_throw_error(env, nullptr, "请等待游戏资源导入完成后再开始游戏。");
         return nullptr;
     }
-    if (count == 1) filesDirectory = ReadString(env, args[0]);
+    if (count < 1 || gameStartedOnce) {
+        napi_throw_error(env, nullptr, "请重新打开应用后选择游戏模式。");
+        return nullptr;
+    }
+    const auto directory = ReadString(env, args[0]);
+    const auto action = count > 1 ? ReadString(env, args[1]) : "demo";
+    const auto saveId = count > 2 ? ReadString(env, args[2]) : "";
+    if (directory.empty() || directory.front() != '/' || directory.find('\0') != std::string::npos ||
+        (action != "new" && action != "load" && action != "demo")) {
+        napi_throw_error(env, nullptr, "游戏启动参数无效。");
+        return nullptr;
+    }
+    if (action == "load") {
+        const auto saves = game_saves::List(directory);
+        bool found = false;
+        for (const auto& save : saves.saves) if (save.id == saveId && save.mode == 1 && !save.backup) found = true;
+        if (!saves.ok || !found) {
+            napi_throw_error(env, nullptr, "所选存档已不存在或不可读取，请刷新存档列表。");
+            return nullptr;
+        }
+    }
+#if MG_HAS_GAME_RUNTIME
+    if (mg_game_set_launch(action.c_str(), saveId.c_str()) != 0) {
+        napi_throw_error(env, nullptr, "无法使用所选游戏模式或存档，请重新打开应用后重试。");
+        return nullptr;
+    }
+#endif
+    filesDirectory = directory;
     startRequested = true;
     TryStartLocked();
     return Undefined(env);
@@ -182,6 +239,9 @@ napi_value Status(napi_env env, napi_callback_info) {
     SetBool(env, value, "startRequested", startRequested);
     SetBool(env, value, "startDispatched", startDispatched);
     SetInt(env, value, "startResult", startResult);
+    SetBool(env, value, "aspectFitApplied", aspectFitApplied);
+    SetInt(env, value, "aspectFitResult", aspectFitResult);
+    SetInt(env, value, "nativeScalingMode", static_cast<int32_t>(OH_SCALING_MODE_SCALE_FIT_V2));
     SetString(env, value, "error", surfaceError);
     SetString(env, value, "filesDirectory", filesDirectory);
 #if MG_HAS_GAME_RUNTIME
@@ -307,6 +367,7 @@ void RegisterGameSurface(napi_env env, napi_value exports) {
 }
 void ExportGameMethods(napi_env env, napi_value exports) {
     SetGameResourceImportGate(ResourceImportGate);
+    SetGameSaveImportGate(ResourceImportGate);
     napi_property_descriptor methods[] = {
         {"configureGame", nullptr, Configure, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startGame", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr},

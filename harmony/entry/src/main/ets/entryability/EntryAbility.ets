@@ -168,16 +168,54 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
+  private receiveGameSession(want: Want): void {
+    const parameters: Record<string, Object> | undefined = want.parameters;
+    if (parameters === undefined) { return; }
+    if (parameters === null || typeof parameters !== 'object') {
+      hilog.warn(0x4100, 'HarmonyGame', 'SESSION_REQUEST_IGNORED invalid parameters');
+      return;
+    }
+    const action = parameters['muguetSessionAction'];
+    const saveId = parameters['muguetSessionSaveId'];
+    // Ordinary launcher/file-open Wants carry no session request and must not
+    // replay a prior session or trigger a restart.
+    if (action === undefined && saveId === undefined) { return; }
+    if (typeof action !== 'string' || typeof saveId !== 'string') {
+      hilog.warn(0x4100, 'HarmonyGame', 'SESSION_REQUEST_IGNORED invalid action/save id types');
+      return;
+    }
+    if (action === 'load') {
+      const prefix: string = 'userdata/Documents/Rockstar Games/GTA V/Default/SGTA5';
+      const slot: string = saveId.slice(prefix.length);
+      if (!saveId.startsWith(prefix) || slot.length !== 4 || !/^[0-9]{4}$/.test(slot) || Number(slot) > 15) {
+        hilog.warn(0x4100, 'HarmonyGame', 'SESSION_REQUEST_IGNORED noncanonical story save id');
+        return;
+      }
+    } else if (action !== 'new' || saveId !== '') {
+      hilog.warn(0x4100, 'HarmonyGame', 'SESSION_REQUEST_IGNORED unsupported action or nonempty new save id');
+      return;
+    }
+    // Index watches the action, so publish its fully validated save id first.
+    // Native code independently rechecks the actual local save list on launch.
+    AppStorage.setOrCreate<string>('gameSessionRequestedSaveId', saveId);
+    AppStorage.setOrCreate<string>('gameSessionRequestedAction', action);
+    hilog.info(0x4100, 'HarmonyGame', 'SESSION_REQUEST_ACCEPTED action=%{public}s', action);
+  }
+
   onCreate(want: Want): void {
     AppStorage.setOrCreate<boolean>('gameAppForeground', false);
     AppStorage.setOrCreate<string>('gameImportRequestedUri', '');
+    AppStorage.setOrCreate<string>('gameSessionRequestedAction', '');
+    AppStorage.setOrCreate<string>('gameSessionRequestedSaveId', '');
     this.receiveGamePackage(want);
+    this.receiveGameSession(want);
     registerCrashEvidence(this.context);
     gamePerformanceCreate(this.context);
   }
 
   onNewWant(want: Want): void {
     this.receiveGamePackage(want);
+    this.receiveGameSession(want);
   }
 
   onForeground(): void {

@@ -8,6 +8,7 @@
 #include <sstream>
 #include "game_surface.h"
 #include "game_resource_import.h"
+#include "game_save_import.h"
 
 #if RP_HAS_VULKAN_PROBE
 #include "muguet_vulkan_probe.h"
@@ -283,6 +284,7 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_define_properties(env, exports, 1, descriptors);
     ExportGameMethods(env, exports);
     ExportGameResourceImport(env, exports);
+    ExportGameSaveImport(env, exports);
     ExportVulkanBufferDiagnostics(env, exports);
     RegisterGameSurface(env, exports);
     return exports;

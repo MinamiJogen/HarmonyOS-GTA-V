@@ -1,5 +1,130 @@
 # Vulkan capability probe
 
+## Independent AI frame generation experiment
+
+Build a separate diagnostic application with the public HMS Vulkan AI flow:
+
+```sh
+bash tools/build_fg_probe.sh com.example.harmonyfgprobe
+python3 native-diagnostics/test_frame_rate_policy.py
+```
+
+The build prints its ASCII project and unsigned HAP paths. It includes no game
+runtime, embedded AOT or game resources. The experiment enables
+`GraphicsAccelerateKit_FusionAware=Vulkan` in its generated manifest and exposes
+only `GraphicsFrameProbeAbility`; the working game's manifest is not changed.
+`HARMONY_FG_PROBE_FUSION_AWARE=0` omits that metadata for a loader control. Native
+AI system presentation then explicitly refuses to run; inspection and FG-OFF
+comparisons remain available.
+The default build includes the locally built shared-C++ Vulkan validation layer
+from `tools/build_vvl_shared.sh`. The prior static-C++ layer crashed at worker
+exit after the loader unmapped its thread-local destructor. The shared layer
+requires the app's matching `libc++_shared.so` to remain mapped. To use a
+different layer, set `HARMONY_VVL_SO`; `HARMONY_WITH_VVL=0` creates an unvalidated
+comparison package. Sign the generated project in DevEco using a profile for its
+own bundle and the target device, then install the signed HAP.
+
+Packaging the layer alone does not enable it. Following the
+[OpenHarmony Vulkan loader instructions](https://github.com/openharmony/third_party_vulkan-loader/blob/master/README_OpenHarmony.md),
+put its `VkLayer_khronos_validation.json` manifest in the app's files directory
+(with `library_path` set to `libVkLayer_khronos_validation.so`), then set both
+`debug.graphic.debug_layer=VkLayer_khronos_validation` and
+`debug.graphic.debug_hap=<experiment bundle>` before starting the process.
+Save and restore both previous parameter values after testing. Check the actual
+`validationLayerEnabled` and `validationNegativeControlObserved` fields; a zero
+error count with an inactive layer establishes no validation pass. Debug results
+can be retrieved using `hdc file recv -b <bundle> <sandbox path> <local path>`.
+
+Each process performs one bounded trial. Stop it before changing parameters:
+
+```sh
+hdc shell aa force-stop com.example.harmonyfgprobe
+hdc shell aa start -b com.example.harmonyfgprobe -a GraphicsFrameProbeAbility \
+  --pb fg_enabled true --pb fg_geometry true --pb fg_ui_prediction false \
+  --pi fg_seconds 20 --pi fg_source_fps 15 --pi fg_target_fps 30
+```
+
+Defaults are 15 source frames/s and a requested 30 output frames/s. Source rates
+must be integer 15–60 and output targets integer 30–144; enabled FG requires
+source < target. An OFF comparison uses the same source rate and geometry with
+`fg_enabled=false`. Explicit source 30 / target 60 reproduces the earlier
+cadence. Geometry motion uses elapsed time, so its speed is unchanged by rate.
+
+Results are saved under `filesDir/graphics-frame-surface-<pid>/`, including the
+actual installed module metadata, target setter result, source submits, real
+presents, validation messages and geometry readback qualification. AI receives
+real color and the synthetic scene's real VP/inverse, with no depth input as
+required by the [official AI Vulkan guide](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/graphics-accelerate-fg-ai-vulkan).
+These synthetic camera matrices are not used for the game's renderer.
+
+`HMS_FG_SetTargetFps_VK` is called before activation. Its public SDK contract says
+the setting takes effect after the game's first release. A successful setter or
+Dispatch does not establish effective 30fps output on a sideloaded package.
+`effectiveOutputTargetHz`, `generatedFramesVerified` and `displayFpsVerified`
+remain null until independently measured. Compare source timestamps with system
+composition timestamps and actual distinct output images; panel refresh and
+source-rate multiplication are insufficient. This experiment does not enable
+frame generation in the working game.
+
+For an interface-only audit, start a fresh process with
+`--pb fg_inspect_only true`. This creates no Vulkan context or XComponent surface;
+`filesDir/fg-public-interface-audit.json` records the five public capability
+queries and the actual system library owning the directly bound FG functions.
+Global `dlsym` visibility can differ from direct ELF bindings in OHOS library
+namespaces and must not be treated as a missing public API. The diagnostic
+Ability also registers the existing HiAppEvent crash collector. In inspection
+mode it additionally uses the deprecated public FaultLogger query to retrieve
+older self C++ crash logs that predate watcher registration. Collected logs are
+restricted to this diagnostic application's UID/bundle. A completed native
+result and zero unexpected VUIDs do not establish that the worker/process exited
+normally; inspect the corresponding crash events too.
+
+Inspection also writes `fg-model-access-audit.json`: metadata and read-only open
+checks for the two fixed stock model paths used by the inspected public
+capability implementation, the current directory, and bounded names-only lists
+of the core's two model directories. It does not identify the path selected by
+a particular FG context. Add `--pb fg_model_metadata true` to inspection mode for
+an asynchronous public NNRT build/descriptor audit in
+`fg-model-metadata-audit.json`. This executes no inference and establishes no
+model semantics or FG compatibility.
+
+### Alternative neural interpolation checks
+
+The explicit inspection flags `fg_npu_flow_benchmark=true` and
+`fg_rife_benchmark=true` run offscreen synthetic pixel-pair tests. Both also
+require `fg_inspect_only=true`. The former uses public NNRT/CANN and the stock
+`aifi2.om`, read and transformed only in memory; it exports no model bytes and
+tests packing/flow interpretation candidates. The latter requires the optional
+`HARMONY_RIFE_SDK` archive/header and the pinned RIFE v4.6 model in the app's
+`filesDir/rife-v4.6`. Results are `npu-flow-benchmark-result.json` and
+`rife-benchmark-result.json`, plus generated PPM images. Neither runs the game
+or verifies display FPS.
+
+With `HARMONY_FG_PROBE_FUSION_AWARE=0`, `HARMONY_WITH_VVL=0` and the RIFE SDK,
+start `GraphicsFrameProbeAbility --pb fg_rife_stream true --pi fg_seconds 30`
+to test a live 15Hz synthetic source, neural midpoint worker and 30Hz Vulkan
+output deadlines with a 200ms buffer. This path omits system FG metadata and
+does not call the failing system AI dispatch. It logs each source/mid/repeat
+present and bounded queue counters. Inspect its exact XComponent surface with
+`hidumper -s 10 -a 'graphics-frame-surface-probeSurface fps'`; composer refresh
+alone is insufficient.
+
+On the 2026-10-19 MatePad Pro Max / Maleoon 935 trial, the live RIFE path made
+451 source and 451 midpoint presents in 30 seconds, with zero repeats or skipped
+slots. Independent RenderService fence timestamps covered the first 217 updates
+(7.19 seconds), averaging 30.034Hz. Intervals were uneven (mostly 16.7/50ms);
+this establishes the tested surface's average update cadence, not uniform
+33.3ms pacing, full-resolution quality or game acceptance. Evidence is in
+`evidence/device/matepad-pro-max/fg30-20261019/rife-stream-analysis.json`.
+
+The same device's public stock-model test completed all RunSync calls with
+finite outputs, approximately 7ms median inference. Packed RGBA input and XY
+flow01→older/flow23→newer produced translation MAE 3.04 versus repeat 66.81 and
+blend 51.32. This is one synthetic numerical test; backend options alone do not
+independently prove hardware placement or production quality.
+
+## Capability probe
+
 Built with the installed HarmonyOS API 26 native SDK (26.0.0.105) and official
 Vulkan headers. The compiler target is `aarch64-linux-ohos26`; no Linux glibc or
 Android target is substituted. Vulkan is loaded with `dlopen("libvulkan.so")`,

@@ -23,6 +23,7 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 [features]
 default = []
 jit = []
+frame-interpolation = []
 [workspace]
 exclude = ["aot-compiler"]
 default-members = ["."]

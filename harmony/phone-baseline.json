@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "selectedOn": "2026-10-20",
+  "version": "0.8.0",
+  "purpose": "User-selected phone source baseline; excludes subsequent native experiments",
+  "referenceBinary": {
+    "bundle": "com.minami.harmonyruntimeprobe",
+    "hapSha256": "55a9e5a1ca72c4b44907b3205821e65a8698a78bf619c76cd5f44e47b9085e0e",
+    "hostLibrarySha256": "b20fe4a77d281a5c6c117de9667b8f7a330ac05b922db93ca2d6b104a175fb39",
+    "runtimeArchiveSha256": "455f2ec0f03a510fae9c17ddae7d587418501281bede310048216c6e5e71c192"
+  },
+  "runtimeRebuild": {
+    "exactOriginalArchiveMatch": true,
+    "feature": "frame-interpolation",
+    "sdkApi": 26
+  },
+  "sourceSha256": {
+    "game-runtime/src/gpu.rs": "46ce96e4cdc96afb0cd5e8560e7150fc7171885e6b847103b23a1868e4d08a96",
+    "game-runtime/src/frame_interpolation.rs": "951ee034313dc2c94066825672e5a8cdcd7628903455d417739cba0ba079fa50",
+    "game-runtime/src/ffi.rs": "eb25a6c69b5fd0df36897081d1fa749a124227ff6eb91afc3d04f128a252d1c6",
+    "game-runtime/src/native_platform.rs": "e4a7e9da6c8f47962e8f43075922a2913fa39eb1fef5680fd89540aa7cc08ddc",
+    "game-runtime/src/qos.rs": "9b22934a640925a499ef750d61acae5de6da1881340b65ef51b7eaa983d9de8a",
+    "game-runtime/src/config.rs": "77c93b64d490dee7c253a227357386a3a2df2f319b42e02d845fcb680ecb4ebd",
+    "game-runtime/src/readback_pool.rs": "bd920fd63c54c3baf6506cb1945b68cf7c87c010e363985f0b6f03d6c2b660d5",
+    "game-runtime/include/muguet_game_runtime.h": "f411746d3890f40f104c809f856b687eb9c9d9869e1265179f811a5b048446b7",
+    "harmony/entry/src/main/cpp/game_surface.cpp": "04263fde73a4cb7c3012a5f7f6be94733ae6478579779628d2d1676b34a4c4a8",
+    "harmony/entry/src/main/ets/entryability/EntryAbility.ets": "d97977bf448b471d616fba454886e70554380bc762917dd4349319c127d85e50",
+    "harmony/entry/src/main/ets/entryability/GamePerformance.ets": "097dffcaee77ea1d0cb0a86a938ec841de27beaf30c88060294eb5df45a33512",
+    "harmony/entry/src/main/ets/pages/Index.ets": "828766217006091dda6783fc5113b71b70c74854cec4c2031b4e18578afcc693",
+    "harmony/entry/src/main/ets/config/GameDefaults.ets": "a869ba5d2e3d8e2de6be503cc394bdf600f127921bd1f08cf69bb3992120d509",
+    "harmony/entry/src/main/ets/config/GameQuality.ets": "6948fb2f52a817f934dea34823e7542908acc2902cdf293f834475273bf5a3bf"
+  },
+  "runtimeRenderingProfile": "experiments/phone-selected-baseline.json",
+  "performance": {
+    "nativeInput": [
+      1714,
+      800
+    ],
+    "srOutput": [
+      2314,
+      1080
+    ],
+    "physicalDisplay": [
+      2442,
+      1140
+    ],
+    "powerModeLastSet": 602,
+    "meanEffectiveFps": 29.07423028883353,
+    "windowSeconds": 60.500311875,
+    "source": 889,
+    "ai": 870,
+    "repeatExcluded": 356,
+    "legacyHudIncludesRepeats": true,
+    "scope": "Short moving-world phone trial with performance overlay. Not acceptance of all presets, every scene, sustained >=30fps, or tablet regression."
+  },
+  "notIncluded": [
+    "same-process Vulkan surface replacement",
+    "effective-only HUD counter",
+    "keyThread hint experiment",
+    "source-wait bypass",
+    "512-command query publishing experiment",
+    "tight single-row readback allocation",
+    "GPU-only QoS level experiment",
+    "recursive 4x interpolation"
+  ],
+  "appRebuild": {
+    "compiled": true,
+    "sameOriginalBuildStage": true,
+    "hostLibrarySha256": "b20fe4a77d281a5c6c117de9667b8f7a330ac05b922db93ca2d6b104a175fb39",
+    "exactOriginalHostLibraryMatch": true,
+    "arkBytecodeSha256": "01d3d0298b106bfbed0acf33328e2b8f672854018e2f980510b556193bbcb9c3",
+    "referenceArkBytecodeSha256": "01d3d0298b106bfbed0acf33328e2b8f672854018e2f980510b556193bbcb9c3",
+    "exactOriginalArkBytecodeMatch": true
+  }
+}

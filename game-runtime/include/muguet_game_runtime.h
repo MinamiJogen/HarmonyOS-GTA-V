@@ -5,10 +5,19 @@
 extern "C" {
 #endif
 int32_t mg_game_start(void* native_window,uint32_t width,uint32_t height,const char* files_dir);
+/* Choose new/load/demo before constructing the guest. save_id is empty except
+ * for load, where it is an app-private canonical relative save identifier. */
+int32_t mg_game_set_launch(const char* action,const char* save_id);
 void mg_game_resize(uint32_t width,uint32_t height);
 void mg_game_key(uint32_t key_code,bool pressed);
 bool mg_game_key_event(uint32_t key_code,bool pressed,uint32_t unicode,bool suppress_text);
 void mg_game_focus(bool focused);
+/* App visibility is separate from input focus. Background is a reversible
+ * presentation/inference pause; it does not request terminal game stop. */
+void mg_game_app_foreground(bool foreground);
+/* Pause a session whose XComponent window was destroyed. A replacement surface
+ * is not attached automatically; status explicitly requires recovery. */
+void mg_game_surface_lost(void);
 /* Position is physical pixels; deltas are raw device movement units. */
 void mg_game_pointer(float x,float y,float dx,float dy,bool look);
 /* Fractional wheel notches are accumulated; positive is wheel up. */

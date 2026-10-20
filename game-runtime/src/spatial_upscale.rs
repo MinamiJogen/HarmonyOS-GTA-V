@@ -23,18 +23,29 @@ impl Mode {
 }
 #[derive(Clone, Copy)]
 struct Settings {
-    mode: Mode, sharpness: f32, sizes: Option<((u32,u32),(u32,u32))>,
-    match_display: bool, generation: u64,
+    enabled: bool, mode: Mode, sharpness: f32, sizes: Option<((u32,u32),(u32,u32))>,
+    match_display: bool, short_edges: Option<(u32,u32)>, generation: u64,
 }
 impl Settings {
+    fn requested(self) -> bool { self.enabled && self.mode != Mode::Off }
+    fn display_sizes(self, display:(u32,u32)) -> Option<((u32,u32),(u32,u32))> {
+        if let Some((input,output))=self.short_edges {
+            crate::spatial_dimensions::short_edge_sizes(input,output,display)
+        } else {
+            self.mode.sizes().map(|(input,output)|
+                (crate::spatial_dimensions::fit_aspect(input,display),
+                 crate::spatial_dimensions::fit_aspect(output,display)))
+        }
+    }
     fn target(self) -> Option<crate::spatial_resize_policy::ResizeTarget> {
+        if !self.requested() { return None; }
         self.sizes.map(|(input, output)| crate::spatial_resize_policy::ResizeTarget {
             input, output, generation: self.generation,
         })
     }
 }
 static SETTINGS: Mutex<Settings> = Mutex::new(Settings {
-    mode: Mode::Off, sharpness: 0.2, sizes: None, match_display: false, generation: 0,
+    enabled: true, mode: Mode::Off, sharpness: 0.2, sizes: None, match_display: false, short_edges: None, generation: 0,
 });
 static STATUS: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static RECORDED: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +55,22 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static INPUT_PATH: AtomicU8 = AtomicU8::new(0);
 static ORIGINAL_UNIQUE_HANDLES: OnceLock<Option<OsString>> = OnceLock::new();
 
+/// Cheap immutable identity for cached output pixels. This includes processing
+/// switches and all pixel-affecting settings, not just the configured extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputCacheSignature {
+    pub enabled: bool, pub mode: Mode, pub generation: u64,
+    pub sizes: Option<((u32,u32),(u32,u32))>, pub sharpness_bits: u32,
+}
+impl OutputCacheSignature {
+    pub(crate) fn requested(self) -> bool { self.enabled && self.mode != Mode::Off }
+}
+pub(crate) fn output_cache_signature() -> OutputCacheSignature {
+    let s = *SETTINGS.lock().unwrap();
+    OutputCacheSignature { enabled:s.enabled, mode:s.mode, generation:s.generation,
+        sizes:s.sizes, sharpness_bits:s.sharpness.to_bits() }
+}
+
 pub(crate) fn parse_mode(value: Option<&serde_json::Value>) -> Mode {
     match value.and_then(|v| v.as_str()) {
         Some("native_quality") => Mode::NativeQuality,
@@ -52,20 +79,55 @@ pub(crate) fn parse_mode(value: Option<&serde_json::Value>) -> Mode {
     }
 }
 pub(crate) fn configure(cfg: &serde_json::Value) {
-    let mode = parse_mode(cfg.get("spatial_upscale_mode"));
+    let enabled = crate::config::processing_enabled(cfg, "spatial_upscale_enabled");
+    let mut mode = parse_mode(cfg.get("spatial_upscale_mode"));
     let sharpness = cfg.get("spatial_upscale_sharpness").and_then(|v| v.as_f64())
         .filter(|v| v.is_finite() && (0.0..=1.0).contains(v)).unwrap_or(0.2) as f32;
-    let match_display = cfg.get("spatial_upscale_match_display").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut match_display = cfg.get("spatial_upscale_match_display").and_then(|v| v.as_bool()).unwrap_or(false);
     let display = crate::ffi::physical_size();
     // GPU probes omit match_display and retain their original exact fixtures.
     // The game's own resize protocol requires at least 320x240 input pixels.
-    let sizes = mode.sizes().map(|(input, output)| if match_display {
+    let mut sizes = mode.sizes().map(|(input, output)| if match_display {
         let fitted_input = crate::spatial_dimensions::fit_aspect(input, display);
         if crate::spatial_resize_policy::valid_input(fitted_input) {
             (fitted_input, crate::spatial_dimensions::fit_aspect(output, display))
         } else { (input, output) }
     } else { (input, output) });
-    *SETTINGS.lock().unwrap() = Settings { mode, sharpness, sizes, match_display, generation: 1 };
+    let explicit_requested = cfg.get("spatial_upscale_input_size").is_some() || cfg.get("spatial_upscale_output_size").is_some();
+    let short_requested = cfg.get("spatial_upscale_native_short_edge").is_some() || cfg.get("spatial_upscale_output_short_edge").is_some();
+    let mut short_edges = None;
+    let mut explicit_error = None;
+    if short_requested && mode != Mode::Off {
+        let edge=|key:&str|cfg.get(key).and_then(|v|v.as_u64()).and_then(|v|u32::try_from(v).ok());
+        let requested=edge("spatial_upscale_native_short_edge").zip(edge("spatial_upscale_output_short_edge"));
+        if let Some((edges,selected))=requested.and_then(|edges|
+            (!explicit_requested).then(|| crate::spatial_dimensions::short_edge_sizes(edges.0,edges.1,display))
+                .flatten().map(|selected|(edges,selected))) {
+            short_edges=Some(edges); sizes=Some(selected); match_display=true;
+        } else {
+            explicit_error=Some("invalid adaptive SR sizes: require two bounded even short edges, valid display aspect and no explicit size pairs");
+            eprintln!("[spatial-upscale] {}",explicit_error.unwrap());
+            mode=Mode::Off; sizes=None; match_display=false;
+        }
+    } else if explicit_requested && mode != Mode::Off {
+        let pair = |key: &str| -> Option<(u32,u32)> {
+            let values = cfg.get(key)?.as_array()?;
+            if values.len() != 2 { return None; }
+            Some((u32::try_from(values[0].as_u64()?).ok()?, u32::try_from(values[1].as_u64()?).ok()?))
+        };
+        let requested = pair("spatial_upscale_input_size").zip(pair("spatial_upscale_output_size"));
+        if let Some((input,output)) = requested.filter(|&(input,output)| crate::spatial_dimensions::valid_explicit_sizes(input,output)) {
+            sizes = Some((input,output)); match_display = false;
+        } else {
+            explicit_error = Some("invalid explicit SR sizes: require both even input/output pairs, input >=320x240, output >=input, matching aspect and extents <=8192");
+            eprintln!("[spatial-upscale] {}", explicit_error.unwrap());
+            mode = Mode::Off; sizes = None; match_display = false;
+        }
+    }
+    // Input resolution belongs to the guest, independently of whether XEngine
+    // runs afterward. Retain the validated dimensions when SR is switched off.
+    let settings = Settings { enabled, mode, sharpness, sizes, match_display, short_edges, generation: 1 };
+    *SETTINGS.lock().unwrap() = settings;
     RECORDED.store(0, Ordering::Relaxed);
     RESIZES.store(0, Ordering::Relaxed);
     ACTIVE.store(false, Ordering::Relaxed);
@@ -74,7 +136,7 @@ pub(crate) fn configure(cfg: &serde_json::Value) {
     // This documented setting disables only wrapping, preserving validation.
     // Applied before prepare_surface/Gpu::new creates the instance; OFF restores
     // the process's original setting rather than erasing another caller's value.
-    if mode != Mode::Off {
+    if settings.requested() {
         ORIGINAL_UNIQUE_HANDLES.get_or_init(|| std::env::var_os("VK_LAYER_UNIQUE_HANDLES"));
         std::env::set_var("VK_LAYER_UNIQUE_HANDLES", "0");
         eprintln!("[spatial-upscale] public VVL setting VK_LAYER_UNIQUE_HANDLES=0 before instance; core/shader/layout validation retained; legacy disables must not override this setting");
@@ -82,14 +144,17 @@ pub(crate) fn configure(cfg: &serde_json::Value) {
         match original { Some(value) => std::env::set_var("VK_LAYER_UNIQUE_HANDLES", value),
             None => std::env::remove_var("VK_LAYER_UNIQUE_HANDLES") }
     }
-    *STATUS.lock().unwrap() = Some(serde_json::json!({"mode":mode.name(),"requested":mode != Mode::Off,
+    *STATUS.lock().unwrap() = Some(serde_json::json!({"mode":if settings.requested(){mode.name()}else{"off"},
+        "enabled":enabled,"configuredMode":mode.name(),"requested":settings.requested(),
         "sharpness":sharpness,"requestedSizes":sizes,"matchDisplay":match_display,
+        "adaptiveShortEdges":short_edges,"adaptiveShortEdgeRequest":short_requested,
+        "explicitSizeRequest":explicit_requested,"explicitSizeError":explicit_error,
         "startupDisplaySize":display,"requestedDisplaySize":display,"resizeGeneration":1,
         "resizePending":false,"nativeCommandsEncoded":false,
         "gpuOutputVerified":false,"frameGeneration":false}));
     if let Some((render, output)) = sizes {
-        eprintln!("[spatial-upscale] requested mode={} gameRender={}x{} output={}x{} sharpness={} (spatial only; no generated frames)",
-            mode.name(), render.0, render.1, output.0, output.1, sharpness);
+        eprintln!("[spatial-upscale] enabled={} mode={} gameRender={}x{} configuredOutput={}x{} sharpness={} (guest dimensions retained with SR disabled)",
+            settings.requested(), mode.name(), render.0, render.1, output.0, output.1, sharpness);
     }
 }
 /// XComponent callbacks only queue the latest physical window. They must never
@@ -117,13 +182,12 @@ pub(crate) fn process_pending_resize(before_publish: impl FnOnce() -> std::resul
     // its request. Leave that newer request to its own stabilization interval.
     if display != crate::ffi::physical_size() { return; }
     let snapshot = *SETTINGS.lock().unwrap();
-    let (input, output) = if snapshot.mode == Mode::Off {
+    let (input, output) = if !snapshot.requested() {
         (crate::config::render_size(display.0,display.1), None)
     } else {
         if !snapshot.match_display { return; }
-        let Some((input_bound, output_bound)) = snapshot.mode.sizes() else { return; };
-        (crate::spatial_dimensions::fit_aspect(input_bound, display),
-            Some(crate::spatial_dimensions::fit_aspect(output_bound, display)))
+        let Some((input,output))=snapshot.display_sizes(display) else { return; };
+        (input,Some(output))
     };
     if !crate::spatial_resize_policy::valid_input(input) { return; }
     if let Some(output) = output {
@@ -150,7 +214,8 @@ pub(crate) fn process_pending_resize(before_publish: impl FnOnce() -> std::resul
     // request after a newer callback has supplied a different physical size.
     if display != crate::ffi::physical_size() { return; }
     let mut settings = SETTINGS.lock().unwrap();
-    if settings.mode != snapshot.mode || settings.match_display != snapshot.match_display
+    if settings.enabled != snapshot.enabled || settings.mode != snapshot.mode || settings.match_display != snapshot.match_display
+        || settings.short_edges != snapshot.short_edges
         || settings.generation != snapshot.generation || settings.sizes != snapshot.sizes { return; }
     crate::heapcheck::request_snapshot("before-resize-publish");
     if let Some(output) = output {
@@ -176,6 +241,15 @@ pub(crate) fn process_pending_resize(before_publish: impl FnOnce() -> std::resul
     }
 }
 pub(crate) fn render_size_override() -> Option<(u32,u32)> { SETTINGS.lock().unwrap().sizes.map(|s| s.0) }
+/// The output uses the combined interpolation graph, including exact repeats
+/// of its previously submitted private post-SR pixels. This is content scope,
+/// not a claim that a new SR dispatch or neural inference ran for this output.
+pub(crate) fn note_frame_generation(active: bool) {
+    if let Some(value) = STATUS.lock().unwrap().as_mut() {
+        value["frameGeneration"] = active.into();
+        value["frameGenerationScope"] = "combined graph output content, including private cached repeats; new inference/SR work and display cadence require separate counters and pixel verification".into();
+    }
+}
 pub(crate) fn status() -> serde_json::Value {
     let settings = SETTINGS.lock().unwrap();
     let mut value = STATUS.lock().unwrap().clone().unwrap_or_else(|| serde_json::json!({"mode":"off","requested":false}));
@@ -273,7 +347,7 @@ pub(crate) struct Spatial {
 impl Spatial {
     pub(crate) fn new(device: &Device, slot_count: usize) -> Option<Self> {
         let settings = *SETTINGS.lock().unwrap();
-        (settings.mode != Mode::Off).then(|| Self { settings,
+        settings.requested().then(|| Self { settings,
             slots: (0..slot_count).map(|_| None).collect(), device: device.clone(), conversion_pipeline: None,
             blocked_resize_generation: None })
     }
@@ -320,6 +394,7 @@ impl Spatial {
     fn prepare(&mut self, source: &Texture, slot: usize, blit: &RenderPipeline) -> Result<()> {
         validation_compatibility()?;
         let desired = *SETTINGS.lock().unwrap();
+        anyhow::ensure!(desired.requested(), "SR disabled by configuration");
         anyhow::ensure!(self.blocked_resize_generation != Some(desired.generation),
             "SR resize wait failed; old resources retained until a new request or restart");
         // A folding animation can return to an identical target before the

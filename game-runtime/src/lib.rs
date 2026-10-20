@@ -10,6 +10,8 @@ mod spatial_dimensions;
 mod spatial_resize_policy;
 mod fs;
 mod gpu;
+mod frame_capture;
+mod frame_interpolation;
 mod heapcheck;
 mod host;
 mod host_memory;

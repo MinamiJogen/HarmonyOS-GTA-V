@@ -1,5 +1,39 @@
 //! Even spatial-upscaling dimensions fitted to the actual display aspect ratio.
 
+/// Explicit private sizes retain even extents and the guest's per-axis minimum.
+pub(crate) fn valid_explicit_sizes(input:(u32,u32), output:(u32,u32)) -> bool {
+    let bounded_even = |(w,h):(u32,u32)| w >= 2 && h >= 2 && w <= 8192 && h <= 8192 && w % 2 == 0 && h % 2 == 0;
+    bounded_even(input) && bounded_even(output) && input.0 >= 320 && input.1 >= 240 &&
+        output.0 >= input.0 && output.1 >= input.1 &&
+        u64::from(input.0)*u64::from(output.1) == u64::from(input.1)*u64::from(output.0)
+}
+
+/// Select pixel sizes from the actual surface orientation and aspect ratio.
+/// Short edges round UP to even; long edges round to nearest even (ties up),
+/// so each long axis differs from the physical ratio by at most one pixel.
+/// This is intentionally independent of the exact-ratio explicit-size gate:
+/// two different short edges can require different integer-pixel rounding.
+/// Portrait math is supported here; the current game ability remains landscape.
+pub(crate) fn short_edge_sizes(native_short:u32,output_short:u32,display:(u32,u32)) -> Option<((u32,u32),(u32,u32))> {
+    if display.0<2||display.1<2||native_short<800||output_short<1080||output_short<native_short{return None;}
+    let size=|short:u32|->Option<(u32,u32)> {
+        let short=short.checked_add(short&1)?;
+        if short>8192{return None;}
+        let physical_short=u64::from(display.0.min(display.1));
+        let physical_long=u64::from(display.0.max(display.1));
+        let numerator=physical_long.checked_mul(u64::from(short))?;
+        let long=numerator.checked_add(physical_short)?.checked_div(physical_short.checked_mul(2)?)?.checked_mul(2)?;
+        if long<u64::from(short)||long>8192{return None;}
+        let long=u32::try_from(long).ok()?;
+        Some(if display.0>=display.1{(long,short)}else{(short,long)})
+    };
+    let input=size(native_short)?;let output=size(output_short)?;
+    // Same bound as the actual guest final-source RGBA8 snapshot path: 16 MiB.
+    if u64::from(input.0)*u64::from(input.1)*4>16*1024*1024||
+        output.0<input.0||output.1<input.1{return None;}
+    Some((input,output))
+}
+
 /// Fits the display aspect ratio inside the selected mode's maximum dimensions.
 ///
 /// Each dimension is rounded to its nearest even integer and stays within the
@@ -29,6 +63,59 @@ pub(crate) fn fit_aspect(bounds: (u32, u32), display: (u32, u32)) -> (u32, u32) 
 #[cfg(test)]
 mod tests {
     use super::fit_aspect;
+
+    #[test]
+    fn explicit_sr_sizes_keep_real_dimensions() {
+        assert!(super::valid_explicit_sizes((960,540),(1920,1080)));
+        assert!(super::valid_explicit_sizes((1280,720),(1920,1080)));
+        assert!(super::valid_explicit_sizes((960,640),(1920,1280)));
+        assert!(super::valid_explicit_sizes((1200,800),(1620,1080)));
+        assert!(super::valid_explicit_sizes((800,800),(1080,1080)));
+        assert!(super::valid_explicit_sizes((800,1200),(1080,1620)));
+        for (input,output) in [((960,540),(1920,1082)),((961,540),(1922,1080)),
+            ((960,540),(640,360)),((320,192),(1920,1080)),((960,540),(16384,9216)),((0,0),(0,0))] {
+            assert!(!super::valid_explicit_sizes(input,output));
+        }
+    }
+
+    #[test]
+    fn short_edges_follow_actual_surface_and_orientation() {
+        use super::short_edge_sizes as sizes;
+        assert_eq!(sizes(800,1080,(3000,2000)),Some(((1200,800),(1620,1080))));
+        assert_eq!(sizes(800,1080,(1920,1080)),Some(((1422,800),(1920,1080))));
+        assert_eq!(sizes(800,1080,(3184,2232)),Some(((1142,800),(1540,1080))));
+        assert_eq!(sizes(800,1080,(2000,3000)),Some(((800,1200),(1080,1620))));
+        assert_eq!(sizes(800,1080,(2232,3184)),Some(((800,1142),(1080,1540))));
+        assert_eq!(sizes(800,1080,(2000,2000)),Some(((800,800),(1080,1080))));
+        assert_eq!(sizes(800,1080,(2400,1080)),Some(((1778,800),(2400,1080))));
+        assert_eq!(sizes(801,1081,(3000,2000)),Some(((1204,802),(1624,1082))));
+    }
+
+    #[test]
+    fn short_edges_reject_invalid_requests_and_snapshot_overflow() {
+        use super::short_edge_sizes as sizes;
+        for display in [(0,0),(1,2000),(3000,0),(u32::MAX,2),(2,u32::MAX)] {
+            assert_eq!(sizes(800,1080,display),None);
+        }
+        for short in [(0,1080),(798,1080),(800,1078),(1200,1080),(8193,9000),(u32::MAX,u32::MAX)] {
+            assert_eq!(sizes(short.0,short.1,(3000,2000)),None);
+        }
+        assert_eq!(sizes(2048,2048,(2000,2000)),Some(((2048,2048),(2048,2048))));
+        assert_eq!(sizes(2050,2050,(2000,2000)),None);
+    }
+
+    #[test]
+    fn short_edge_rounding_has_one_pixel_long_axis_error() {
+        for display in [(3000,2000),(1920,1080),(3184,2232),(2232,3184),(2400,1080),(2000,2000),(3840,1600)] {
+            let (input,output)=super::short_edge_sizes(800,1080,display).unwrap();
+            for (size,short) in [(input,800),(output,1080)] {
+                assert_eq!(size.0.min(size.1),short);
+                assert_eq!(size.0%2,0);assert_eq!(size.1%2,0);
+                let ideal=short as f64*display.0.max(display.1) as f64/display.0.min(display.1) as f64;
+                assert!((size.0.max(size.1) as f64-ideal).abs()<=1.0);
+            }
+        }
+    }
 
     #[test]
     fn current_mate_xt_display_uses_its_actual_aspect() {

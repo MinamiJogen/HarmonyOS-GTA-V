@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use wasmtime::SharedMemory;
 use wgpu::util::DeviceExt;
 use crate::cpu_profile::{self, Metric as CpuMetric};
+use crate::frame_interpolation::slow_trace;
 use wgpu::*;
 
 #[path = "gpu_memory.rs"]
@@ -76,6 +77,63 @@ const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
 const BG_LIMIT: usize = 24000;
 
+// Independent bounded metadata only. The GPU thread never waits for file IO.
+mod native_render_audit {
+    use std::{collections::HashSet,io::Write,path::Path,sync::mpsc::{self,SyncSender}};
+    const LIMIT:usize=64;
+    pub(super) struct Audit { sender:SyncSender<serde_json::Value>,seen:HashSet<Vec<u64>>,queued:usize }
+    impl Audit {
+        pub(super) fn from_env()->Option<Self> {
+            let setup=||->Result<Option<Self>,String> {
+                let Some(root)=std::env::var_os("MUGUET_SUPPORT") else{return Ok(None);};
+                let config=match std::fs::read(Path::new(&root).join("config.json")) {
+                    Ok(bytes)=>serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e|e.to_string())?,
+                    Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(e)=>return Err(e.to_string()),
+                };
+                match config.get("frame_interpolation_native_render_audit") {
+                    None|Some(serde_json::Value::Bool(false))=>return Ok(None),Some(serde_json::Value::Bool(true))=>{},
+                    _=>return Err("frame_interpolation_native_render_audit must be boolean".into()),
+                }
+                let root=std::fs::canonicalize(root).map_err(|e|e.to_string())?;
+                if !root.is_dir(){return Err("app support root must be an existing directory".into());}
+                let path=root.join(format!("native-render-audit-{}.jsonl",std::process::id()));
+                use std::os::unix::fs::OpenOptionsExt;
+                let file=std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+                    .custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&path).map_err(|e|e.to_string())?;
+                let (sender,receiver)=mpsc::sync_channel::<serde_json::Value>(LIMIT);
+                std::thread::Builder::new().name("native-render-audit".into()).spawn(move|| {
+                    let mut file=std::io::BufWriter::new(file);
+                    let write=||->std::io::Result<()> {
+                        writeln!(file,"{}",serde_json::json!({"type":"header","pid":std::process::id(),"observationLimit":LIMIT,"writerQueueLimit":LIMIT,
+                            "defaultEnabled":false,"clock":"CLOCK_MONOTONIC_ns","capturePoint":"after_host_draw_API_call_and_dynamic_state_recording",
+                            "selection":"world_observed; nonempty_direct_draw_and_scissor; actual_depth_and_color0_attachments; real_per_vertex_buffer; vertex_index_and_obvious_fullscreen_shader_labels_excluded",
+                            "uniqueness":"pipeline_UID_attachment_IDs_mips_layers_and_applied_viewport_scissor; excludes_source_sequence_and_draw_count",
+                            "scope":"sampled_actual_guest_geometry_command_metadata_not_GPU_completion_or_exhaustive_scene_resolution; logical_WGPU_viewport_and_explicit_Vulkan_Y_flip_reported; no_pixel_readback_or_added_GPU_work"}))?;
+                        file.flush()?;
+                        for value in receiver {writeln!(file,"{value}")?;file.flush()?;}
+                        Ok(())
+                    };
+                    if let Err(e)=write(){eprintln!("[native-render-audit] writer stopped: {e}");}
+                }).map_err(|e|e.to_string())?;
+                eprintln!("[native-render-audit] enabled maxUniqueDraws={LIMIT} path={}",path.display());
+                Ok(Some(Self{sender,seen:HashSet::with_capacity(LIMIT),queued:0}))
+            };
+            match setup(){Ok(v)=>v,Err(e)=>{eprintln!("[native-render-audit] disabled: {e}");None}}
+        }
+        pub(super) fn record(&mut self,key:Vec<u64>,make:impl FnOnce(usize)->serde_json::Value) {
+            if self.finished()||!self.seen.insert(key){return;}
+            let value=make(self.queued+1);
+            match self.sender.try_send(value) {
+                Ok(())=>self.queued+=1,
+                // At most LIMIT events exist and the channel has LIMIT slots;
+                // writer lag cannot fill it before the fixed observation bound.
+                Err(e)=>{eprintln!("[native-render-audit] stopped without blocking GPU: {e}");self.queued=LIMIT;},
+            }
+        }
+        pub(super) fn finished(&self)->bool {self.queued>=LIMIT}
+    }
+}
+
 pub struct SurfaceHandoff {
     pub instance: Instance,
     pub surface: Surface<'static>,
@@ -102,6 +160,8 @@ pub fn start(mem: &SharedMemory, ring: u64, size: u64, dbg: u64) {
         .spawn(move || {
             let _cpu_thread = cpu_profile::register_thread(cpu_profile::Role::Gpu);
             crate::set_interactive_qos();
+            #[cfg(target_env = "ohos")]
+            crate::qos::gpu_initialization_begin();
             let handoff = SURFACE.lock().unwrap().take();
             let mut gpu = match Gpu::new(mem.clone(), ring, size, dbg, handoff) {
                 Ok(g) => g,
@@ -111,6 +171,8 @@ pub fn start(mem: &SharedMemory, ring: u64, size: u64, dbg: u64) {
                     drain_forever(&mem, ring);
                 }
             };
+            #[cfg(target_env = "ohos")]
+            crate::qos::gpu_initialized();
             gpu.run();
         })
         .expect("spawn gpu thread");
@@ -784,6 +846,7 @@ struct PipeJob {
 enum PipeEntry { Pending, Done(Option<Rc<Pl>>) }
 
 fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
+    let _slow=slow_trace::span("pipeline_compile_and_scope_pop",&job.label);
     let vbs: Vec<Option<VertexBufferLayout>> = job.vbs.iter().map(|v| v.as_ref().map(|(stride, step, attrs)| VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes: attrs })).collect();
     let desc = RenderPipelineDescriptor {
         label: Some(&job.label),
@@ -830,6 +893,56 @@ enum MapKind {
 }
 
 struct AstcJob { tex_id: u32, tex: Texture, mip: u32, origin: Origin3d, bx: u32, by: u32, layers: u32, dst_row: u32, src_word: u32, dst_byte: u64, first_block: u32 }
+
+static OUTPUT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_CACHE_COPIES: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_CACHE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_CACHE_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn output_cache_status() -> serde_json::Value {
+    serde_json::json!({"repeatHitSubmissions":OUTPUT_CACHE_HITS.load(Ordering::Relaxed),
+        "missSubmissions":OUTPUT_CACHE_MISSES.load(Ordering::Relaxed),
+        "privateCopySubmissions":OUTPUT_CACHE_COPIES.load(Ordering::Relaxed),
+        "invalidations":OUTPUT_CACHE_INVALIDATIONS.load(Ordering::Relaxed),
+        "allocationFailures":OUTPUT_CACHE_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        "eligibility":"immutable_owned_NPU_source_or_neural_flow_outputs_only; mutable_RIFE_RGB_upload_is_excluded",
+        "scope":"process cumulative; repeat hits reuse private post-processing pixels and remain repeats; cache copies are GPU submissions, not independently verified completions or new AI frames",
+        "storage":"one owned full-resolution texture, never a presented surface or mutable SR-slot alias"})
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutputCacheKey {
+    content: crate::frame_interpolation::OutputContentKey,
+    epoch: u64,
+    spatial: crate::spatial_upscale::OutputCacheSignature,
+    source_size: (u32,u32), source_format: TextureFormat,
+    output_size: (u32,u32), output_format: TextureFormat, surface_format: TextureFormat,
+}
+impl OutputCacheKey {
+    fn for_display(display:&crate::frame_interpolation::Display,epoch:u64,
+        spatial:crate::spatial_upscale::OutputCacheSignature,surface_format:TextureFormat)->Option<Self> {
+        // RIFE's RGB debug upload reuses a mutable texture. Restrict this cache
+        // to immutable owned NPU source/history/warp content.
+        let source=match display.gpu.as_ref()? {
+            crate::frame_interpolation::GpuFrame::Source(source)=>source,
+            crate::frame_interpolation::GpuFrame::Flow{newer,..}=>newer,
+        };
+        let source_size=(source.width(),source.height());
+        let output_size=if spatial.requested(){spatial.sizes?.1}else{source_size};
+        Some(Self {content:display.content_key.clone(),epoch,spatial,source_size,source_format:source.format(),
+            output_size,output_format:if spatial.requested(){TextureFormat::Rgba8Unorm}else{source.format()},surface_format})
+    }
+}
+fn repeat_output_cache_hit<K:PartialEq>(kind:&str,cached:Option<&K>,requested:Option<&K>,surface_matches:bool)->bool {
+    kind=="repeat" && surface_matches && cached.zip(requested).is_some_and(|(a,b)|a==b)
+}
+struct OutputCache {
+    key: OutputCacheKey,
+    texture: Texture,
+    binding: BindGroup,
+    sr_active: bool,
+}
 
 pub struct Gpu {
     mem: SharedMemory,
@@ -909,6 +1022,16 @@ pub struct Gpu {
     pending_events: Vec<(u32, u32, u64)>,
     pending_maps: Vec<PendingMap>,
     readback_pool: Option<readback_pool::Pool<Buffer>>,
+    frame_capture: Option<crate::frame_capture::Capture>,
+    native_render_audit: Option<native_render_audit::Audit>,
+    frame_interpolation: Option<crate::frame_interpolation::Interpolator>,
+    interpolation_spatial: Option<crate::spatial_upscale::Spatial>,
+    interpolation_sr_slot: usize,
+    interpolation_sr_fences: Vec<Option<SubmissionIndex>>,
+    interpolation_output_cache: Option<OutputCache>,
+    interpolation_output_capture: Option<crate::frame_capture::Capture>,
+    interpolation_output_capture_started: bool,
+    interpolation_output_capture_directory: Option<PathBuf>,
     counter_src: Option<Buffer>,
     counter_slot: u32,
     frame_slot_done: Vec<Option<SubmissionIndex>>,
@@ -951,6 +1074,7 @@ pub fn max_msaa() -> u32 {
 
 impl Gpu {
     fn new(mem: SharedMemory, ring: u64, _size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
+        slow_trace::initialize();
         if let Some(root) = std::env::var_os("MUGUET_SUPPORT") {
             let _ = std::fs::remove_file(std::path::Path::new(&root).join("gpu-memory-violation.txt"));
         }
@@ -1055,6 +1179,8 @@ impl Gpu {
             Some(job_tx)
         };
         let spatial = crate::spatial_upscale::Spatial::new(&device, FRAME_SLOTS);
+        let mut frame_interpolation=crate::frame_interpolation::Interpolator::from_env();
+        if let Some(interpolation)=frame_interpolation.as_mut(){interpolation.validate_adapter(&adapter);}
         Ok(Gpu {
             live_queries: Default::default(), query_done: Default::default(), stale_query_writes: 0, bc_live: HashMap::new(),
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
@@ -1069,6 +1195,11 @@ impl Gpu {
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(),
             readback_pool: std::env::var_os("MUGUET_READBACK_POOL").is_some_and(|v|v=="1").then(readback_pool::Pool::new),
+            frame_capture: crate::frame_capture::Capture::from_env(),
+            native_render_audit: native_render_audit::Audit::from_env(),
+            frame_interpolation,
+            interpolation_spatial:None,interpolation_sr_slot:0,interpolation_sr_fences:(0..FRAME_SLOTS).map(|_|None).collect(),interpolation_output_cache:None,
+            interpolation_output_capture:None,interpolation_output_capture_started:false,interpolation_output_capture_directory:None,
             counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
@@ -1152,6 +1283,7 @@ impl Gpu {
     }
 
     fn scoped<T>(&self, what: &str, f: impl FnOnce(&Device) -> T) -> Option<T> {
+        let _slow=slow_trace::span("scoped_create_and_scope_pop",what);
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
         let v = { let _span = cpu_profile::span(CpuMetric::ScopeCreate); f(&self.device) };
         let error = { let _span = cpu_profile::span(CpuMetric::ScopePop); pollster::block_on(scope.pop()) };
@@ -1192,6 +1324,7 @@ impl Gpu {
         }
     }
     fn flush(&mut self) {
+        let _slow=slow_trace::span("guest_flush","");
         self.flush_astc();
         self.astc_in_encoder = 0;
         self.end_pass();
@@ -1204,8 +1337,8 @@ impl Gpu {
             self.profile_finish_pending = false;
         }
         if let Some(enc) = self.enc.take() {
-            let command = { let _span = cpu_profile::span(CpuMetric::EncoderFinish); enc.finish() };
-            let idx = { let _span = cpu_profile::span(CpuMetric::Submit);
+            let command = { let _slow=slow_trace::span("guest_encoder_finish","");let _span = cpu_profile::span(CpuMetric::EncoderFinish); enc.finish() };
+            let idx = { let _slow=slow_trace::span("guest_queue_submit","");let _span = cpu_profile::span(CpuMetric::Submit);
                 if self.submit_prefix.is_empty() { self.queue.submit([command]) }
                 else {
                     let mut commands = std::mem::take(&mut self.submit_prefix);
@@ -1234,11 +1367,24 @@ impl Gpu {
         self.hdr(2).store(1, Ordering::SeqCst);
         log("running");
         loop {
+            if slow_trace::enabled(){slow_trace::command(None,None,self.hdr(0).load(Ordering::SeqCst),tail);}
+            let _slow_loop=slow_trace::span("gpu_run_iteration","");
             if SUSPENDED.load(Ordering::Relaxed) {
-                let _ = self.device.poll(PollType::Wait { submission_index: None, timeout: None });
-                while SUSPENDED.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(50)); }
+                self.invalidate_output_cache();
+                if let Some(interpolation) = self.frame_interpolation.as_mut() {
+                    interpolation.context(false, crate::ffi::physical_size());
+                }
+                // Retain all SR slots and private GPU resources while paused.
+                // Poll callbacks without an unbounded completion wait: a slow
+                // submission must not keep a healthy foreground resume asleep.
+                while SUSPENDED.load(Ordering::Acquire) {
+                    let _ = self.device.poll(PollType::Poll);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             self.process_maps(false);
+            self.poll_frame_capture();
+            self.tick_frame_interpolation();
             if let Some(p) = self.gpu_profile.as_mut() { p.collect(); }
             self.apply_query_results();
             if self.inflight.load(Ordering::SeqCst) > 0 {
@@ -1246,6 +1392,7 @@ impl Gpu {
                 let _ = self.device.poll(PollType::Poll);
             }
             let head = self.hdr(0).load(Ordering::SeqCst);
+            slow_trace::command(None,None,head,tail);
             if head == tail {
                 if !self.pending_events.is_empty() || !self.pending_resolve.is_empty() {
                     self.flush();
@@ -1255,9 +1402,13 @@ impl Gpu {
                     self.hdr(5).store(0, Ordering::SeqCst);
                     continue;
                 }
-                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 { 100 } else { 1 };
-                { let _span = cpu_profile::span(CpuMetric::RingWait);
-                    let _ = self.mem.atomic_wait32(self.ring, tail as u32, Some(Duration::from_millis(timeout))); }
+                let capture_pending = self.frame_capture.as_ref().is_some_and(|capture|capture.awaiting_gpu()) ||
+                    self.interpolation_output_capture.as_ref().is_some_and(|capture|capture.awaiting_gpu());
+                let timeout = if self.pending_maps.is_empty() && !capture_pending && self.inflight.load(Ordering::SeqCst) == 0 { 100 } else { 1 };
+                let wait = self.frame_interpolation.as_ref().map(|v|v.wait()).unwrap_or(Duration::from_millis(timeout));
+                { let _slow=slow_trace::span("ring_empty_atomic_wait","");let _span = cpu_profile::span(CpuMetric::RingWait);
+                    let _ = self.mem.atomic_wait32(self.ring, tail as u32, Some(wait.min(Duration::from_millis(timeout))));
+                    if slow_trace::enabled(){slow_trace::command(None,None,self.hdr(0).load(Ordering::SeqCst),tail);} }
                 self.hdr(5).store(0, Ordering::SeqCst);
                 continue;
             }
@@ -1268,14 +1419,19 @@ impl Gpu {
     }
 
     fn run_commands(&mut self, mut tail: i32, head: i32) -> i32 {
+        let _slow=slow_trace::span("run_commands_batch","");
         let _span = cpu_profile::span(CpuMetric::Commands);
         let ring_w = self.ring / 4;
         let mut since = 0u32;
         let mut executed = 0i32;
         while tail != head {
+            // Leave tail at the first unconsumed opcode. Backgrounding must
+            // not execute a large already-published ring batch before pausing.
+            if SUSPENDED.load(Ordering::Acquire) { break; }
             let base = checked_value(memory_checks::add(ring_w, tail as u64 >> 2), "ring command header word");
             let op = self.u(base);
             let n = self.u(base + 1) as u64;
+            slow_trace::command(Some(op),Some(n),head,tail);
             if op == 1 {
                 tail = RING_DATA as i32;
                 continue;
@@ -1284,7 +1440,16 @@ impl Gpu {
             let command_addr = checked_value(memory_checks::word(p, 0), "ring command payload address");
             let command_bytes = checked_value(memory_checks::mul(n, 4), "ring command payload length");
             guest_span(&self.mem, command_addr, command_bytes, 4, "ring command payload");
-            self.exec(op, p, n);
+            {
+                // Keep opcode context for targeted driver/wait spans without
+                // sampling four clocks for every ordinary guest command.
+                self.exec(op, p, n);
+                if let Some(interpolation)=self.frame_interpolation.as_ref(){interpolation.update_slow_trace_context();}
+                if slow_trace::enabled(){slow_trace::command(Some(op),Some(n),self.hdr(0).load(Ordering::SeqCst),tail);}
+            }
+            // A busy guest command ring must not starve the independent output
+            // clock. The opt-in module internally bounds polling to once/ms.
+            if self.frame_interpolation.is_some() { self.tick_frame_interpolation(); }
             executed += 1;
             let advance = checked_value(memory_checks::add(command_bytes, 8), "ring command advance");
             let next = checked_value(memory_checks::add(tail as u64, advance), "ring next command");
@@ -1297,6 +1462,7 @@ impl Gpu {
                 self.hdr(1).store(tail, Ordering::SeqCst);
                 let _ = self.mem.atomic_notify(self.ring + 4, u32::MAX);
                 self.process_maps(false);
+                self.poll_frame_capture();
                 if self.inflight.load(Ordering::SeqCst) > 0 { let _span = cpu_profile::span(CpuMetric::LoopPoll); let _ = self.device.poll(PollType::Poll); }
             }
         }
@@ -1317,7 +1483,7 @@ impl Gpu {
             7 => self.present(u(0)),
             8 => {
                 self.flush_guest_completion();
-                let completion = { let _span = cpu_profile::span(CpuMetric::Op8Wait);
+                let completion = { let _slow=slow_trace::span("guest_opcode8_gpu_wait","");let _span = cpu_profile::span(CpuMetric::Op8Wait);
                     self.device.poll(PollType::Wait { submission_index: None, timeout: None }) };
                 let completion = completion.map_err(|error| format!("guest fence GPU wait failed: {error:?}"))
                     .and_then(|_| self.finish_guest_writes());
@@ -1803,7 +1969,7 @@ impl Gpu {
             log_once(&format!("noshader{hash}"), &format!("no WGSL for {} shader {hash} ({label})", ["vs", "ps", "cs"].get(stage as usize).unwrap_or(&"?")));
             return None;
         }
-        let source = match std::fs::read_to_string(self.shader_dir.join(format!("{hash}.wgsl"))) {
+        let source = match {let _slow=slow_trace::span("shader_read_file",hash);std::fs::read_to_string(self.shader_dir.join(format!("{hash}.wgsl")))} {
             Ok(s) => s,
             Err(e) => { log_once(&format!("nosrc{hash}"), &format!("shader source {hash}: {e}")); return None; }
         };
@@ -3046,6 +3212,59 @@ impl Gpu {
             }
         }
         self.draws += 1;
+        if self.native_render_audit.is_some() {
+            self.audit_native_render_draw(&pl,&vs,ps.as_deref(),kind,indexed,d_count,d_inst,start,v_first,i_first,
+                if fold_v{0}else{base_vertex},pl.vb_req.iter().any(|required|!required.instance&&required.stride>0&&
+                    vb_binds.iter().any(|(slot,_,_,_,identity)|*slot==required.slot&&*identity!=u64::MAX)));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit_native_render_draw(&mut self,pl:&Pl,vs:&Program,ps:Option<&Program>,kind:u32,indexed:bool,count:i64,instances:i64,
+        index_first:u32,vertex_first:u32,instance_first:u32,base_vertex:i32,real_vertex_buffer:bool) {
+        // This hook runs only AFTER draw* was recorded using pass_st. Indirect
+        // argument contents are deliberately not read or guessed as nonempty.
+        if kind>=4||count<3||instances<=0||!real_vertex_buffer||vs.vid||!crate::ffi::world_player_observed()||
+            !pl.vb_req.iter().any(|v|!v.instance&&v.stride>0){return;}
+        let fullscreen=|label:&str| label.starts_with("im::")||label.starts_with("postfx::")||label.starts_with("scaleform")||
+            label.starts_with("deferred_lighting::")||label.to_ascii_lowercase().contains("screen")||label.to_ascii_lowercase().contains("cube");
+        if fullscreen(&vs.label)||ps.is_some_and(|p|fullscreen(&p.label)){return;}
+        let Some(pi)=self.pass_info.as_ref() else{return;};
+        let (Some(color_format),Some(depth_format))=(pi.rt_formats.first().copied().flatten(),pi.ds_format) else{return;};
+        let Some(rt)=self.s.rt.first() else{return;};let ds=&self.s.ds;
+        let (Some(color),Some(depth))=(self.tex(rt.tex),self.tex(ds.tex)) else{return;};
+        let extent=|t:&Tex,mip:u32|[(t.desc.w.checked_shr(mip).unwrap_or(0)).max(1),(t.desc.h.checked_shr(mip).unwrap_or(0)).max(1)];
+        let color_size=extent(color,rt.mip);let depth_size=extent(depth,ds.mip);
+        let color_desc=([color.desc.w,color.desc.h,color.desc.d],color.desc.samples);
+        let depth_desc=([depth.desc.w,depth.desc.h,depth.desc.d],depth.desc.samples);
+        let requested_applied=self.pass_st.vp;
+        let viewport=requested_applied.map(|v|[v[0],v[1],v[2].max(1.0),v[3].max(1.0),v[4].clamp(0.0,1.0),v[5].clamp(v[4].clamp(0.0,1.0),1.0)])
+            .unwrap_or([0.0,0.0,pi.width as f32,pi.height as f32,0.0,1.0]);
+        let scissor=self.pass_st.sc.unwrap_or([0,0,pi.width,pi.height]);
+        if scissor[2]==0||scissor[3]==0{return;}
+        let mut key=vec![pl.uid,rt.tex as u64,rt.mip as u64,rt.slice as u64,ds.tex as u64,ds.mip as u64,ds.slice as u64];
+        key.extend(viewport.iter().map(|v|v.to_bits() as u64));key.extend(scissor.iter().map(|&v|v as u64));
+        let attachment=|id:u32,desc:([u32;3],u32),mip:u32,layer:u32,size:[u32;2],format:TextureFormat|serde_json::json!({"textureId":id,
+            "textureExtent":desc.0,"viewExtent":size,"mipLevel":mip,"arrayLayer":layer,"viewFormat":format!("{format:?}"),"samples":desc.1});
+        if let Some(audit)=self.native_render_audit.as_mut() {
+            audit.record(key,|ordinal|serde_json::json!({"type":"geometry_draw","observationIndex":ordinal,"pid":std::process::id(),
+                "monotonicNs":crate::frame_interpolation::monotonic_ns(),"worldPlayerObserved":true,
+                "sourceSequence":self.presents+1,"sourceSequenceMeaning":"guest_final_source_sequence_under_construction_before_its_opcode7",
+                "completedGuestPresentSequence":self.presents,"recordedDrawOrdinal":self.draws,"encoderEpoch":self.enc_epoch,
+                "pipelineUid":pl.uid,"pipeline":pl.label.chars().take(256).collect::<String>(),
+                "firstVS":vs.label.chars().take(160).collect::<String>(),"firstPS":ps.map(|p|p.label.chars().take(160).collect::<String>()),
+                "shaderLabelMeaning":"actual_pipeline_shaders_for_this_recorded_draw",
+                "color0":attachment(rt.tex,color_desc,rt.mip,rt.slice,color_size,color_format),"depthStencil":attachment(ds.tex,depth_desc,ds.mip,ds.slice,depth_size,depth_format),
+                "depthReadOnly":pi.ro_depth,"stencilReadOnly":pi.ro_stencil,"passExtent":[pi.width,pi.height],
+                "appliedViewport":viewport,"viewportSource":if requested_applied.is_some(){"last_set_viewport_on_current_pass_after_API_clamping"}else{"wgpu_pass_default_full_attachment_extent"},
+                "vulkanViewportAfterYFlip":[viewport[0],viewport[1]+viewport[3],viewport[2],-viewport[3],viewport[4],viewport[5]],
+                "appliedScissor":scissor,"scissorSource":if self.pass_st.sc.is_some(){"last_set_scissor_on_current_pass"}else{"wgpu_pass_default_full_attachment_extent"},
+                "draw":{"kind":kind,"indexed":indexed,"count":count,"instanceCount":instances,"firstIndex":if indexed{Some(index_first)}else{None},
+                    "firstVertex":if indexed{None}else{Some(vertex_first)},"firstInstance":instance_first,"baseVertex":if indexed{Some(base_vertex)}else{None},
+                    "appliedIndexBinding":self.pass_st.ib.map(|(id,format,offset)|serde_json::json!({"bufferId":id,"format":format!("{format:?}"),"byteOffset":offset})),
+                    "topology":self.s.topo,"realVertexBuffer":true},"scope":"host_command_recorded_after_state_application_not_GPU_completion"}));
+        }
+        if self.native_render_audit.as_ref().is_some_and(|audit|audit.finished()){self.native_render_audit=None;}
     }
 
     fn do_dispatch(&mut self, x: u32, y: u32, z: u32) {
@@ -3554,6 +3773,7 @@ impl Gpu {
     }
 
     fn process_maps(&mut self, wait: bool) {
+        let _slow=slow_trace::span("guest_map_poll_and_copy",if wait{"wait"}else{"poll"});
         if self.pending_maps.is_empty() { return; }
         { let _span = cpu_profile::span(CpuMetric::MapPoll);
             let _ = self.device.poll(if wait { PollType::Wait { submission_index: None, timeout: None } } else { PollType::Poll }); }
@@ -3785,10 +4005,277 @@ impl Gpu {
         self.use_buf(res);
     }
 
+    fn poll_frame_capture(&mut self) {
+        if let Some(mut capture)=self.interpolation_output_capture.take(){
+            capture.poll(&self.device);
+            if !capture.finished(){self.interpolation_output_capture=Some(capture);}
+        }
+        if let Some(mut capture) = self.frame_capture.take() {
+            capture.poll(&self.device);
+            if !capture.finished() { self.frame_capture = Some(capture); }
+        }
+    }
+
+    fn present_interpolated_source(&mut self, id: u32) -> bool {
+        if !self.frame_interpolation.as_ref().is_some_and(|v|v.active()) { return false; }
+        let _slow=slow_trace::span("guest_interpolation_source_boundary","");
+        // Guest frameLimit is coarse. Explicit FG paces the real GPU source
+        // boundary at half its configured output rate as well.
+        // Keep servicing the output clock during this bounded per-frame wait.
+        {
+        let _slow=slow_trace::span("source_pacing_with_output_ticks","");
+        while !OCCLUDED.load(Ordering::Relaxed) && !SUSPENDED.load(Ordering::Relaxed) {
+            let wait = self.frame_interpolation.as_ref().map(|v|v.source_wait()).unwrap_or(Duration::ZERO);
+            if wait.is_zero() { break; }
+            self.tick_frame_interpolation(); self.process_maps(false); self.poll_frame_capture();
+            std::thread::sleep(wait.min(Duration::from_millis(1)));
+        }
+        }
+        let visible = !OCCLUDED.load(Ordering::Relaxed) && !SUSPENDED.load(Ordering::Relaxed);
+        if let Some(mut interpolation) = self.frame_interpolation.take() {
+            interpolation.context(visible, crate::ffi::physical_size());
+            if visible && self.surface.is_some() {
+                if let Some(tex) = self.tex(id).map(|t|t.tex.clone()) {
+                    // Complete all guest writes before the private snapshot.
+                    self.flush_astc(); self.end_pass(); self.flush_uniforms(); self.use_tex(id);
+                    let command={let _slow=slow_trace::span("source_snapshot_record","");let command=interpolation.record(&self.device, &tex, self.presents+1);
+                        interpolation.update_slow_trace_context();command};
+                    if let Some(command) = command {
+                        if let Some(before) = self.enc.take() { self.submit_prefix.push(before.finish()); }
+                        self.submit_prefix.push(command);
+                        self.encoder();
+                    }
+                    // Evidence capture remains available in the experimental
+                    // path and always sees the original full guest texture.
+                    if let Some(mut capture) = self.frame_capture.take() {
+                        if let Some(command) = capture.record(&self.device, &tex, self.presents+1) {
+                            if let Some(before) = self.enc.take() { self.submit_prefix.push(before.finish()); }
+                            self.submit_prefix.push(command); self.encoder();
+                        }
+                        if !capture.finished() { self.frame_capture = Some(capture); }
+                    }
+                }
+            }
+            self.frame_interpolation = Some(interpolation);
+        }
+        self.finish_gpu_profile_frame(); self.flush();
+        self.tick_frame_interpolation();
+        true
+    }
+
+    fn invalidate_output_cache(&mut self) {
+        if self.interpolation_output_cache.take().is_some() {
+            OUTPUT_CACHE_INVALIDATIONS.fetch_add(1,Ordering::Relaxed);
+        }
+    }
+    fn output_cache_candidate(&self,key:OutputCacheKey,source:&Texture,blit:&RenderPipeline,sr_active:bool)->Option<OutputCache> {
+        if (source.width(),source.height())!=key.output_size || source.format()!=key.output_format ||
+            !source.usage().contains(TextureUsages::COPY_SRC) || sr_active!=key.spatial.requested() { return None; }
+        if let Some(old)=self.interpolation_output_cache.as_ref().filter(|old|
+            old.key.output_size==key.output_size && old.key.output_format==key.output_format && old.key.surface_format==key.surface_format) {
+            // All cache writes and reads use the same tracked queue. Reusing
+            // this private allocation is ordered after every previous read;
+            // no SR-slot image or already-presented surface is copied/aliased.
+            return Some(OutputCache {key,texture:old.texture.clone(),binding:old.binding.clone(),sr_active});
+        }
+        let validation=self.device.push_error_scope(ErrorFilter::Validation);
+        let allocation=self.device.push_error_scope(ErrorFilter::OutOfMemory);
+        let texture=self.device.create_texture(&TextureDescriptor {label:Some("game-private-post-processing-repeat-cache"),
+            size:Extent3d{width:key.output_size.0,height:key.output_size.1,depth_or_array_layers:1},
+            mip_level_count:1,sample_count:1,dimension:TextureDimension::D2,format:key.output_format,
+            usage:TextureUsages::COPY_DST|TextureUsages::COPY_SRC|TextureUsages::TEXTURE_BINDING,view_formats:&[]});
+        let view=texture.create_view(&TextureViewDescriptor::default());
+        let binding=self.device.create_bind_group(&BindGroupDescriptor {label:Some("game-private-repeat-cache-blit"),
+            layout:&blit.get_bind_group_layout(0),entries:&[BindGroupEntry{binding:0,resource:BindingResource::TextureView(&view)}]});
+        let oom=pollster::block_on(allocation.pop());let invalid=pollster::block_on(validation.pop());
+        if oom.is_some()||invalid.is_some() {
+            OUTPUT_CACHE_ALLOCATION_FAILURES.fetch_add(1,Ordering::Relaxed);
+            log_once("output-cache-allocation",&format!("repeat cache allocation rejected; original output retained: oom={oom:?}, validation={invalid:?}"));
+            return None;
+        }
+        Some(OutputCache {key,texture,binding,sr_active})
+    }
+
+    fn tick_frame_interpolation(&mut self) {
+        // Called after every opcode. The interpolator records targeted spans
+        // only after its poll gate; do not time this frequent no-work wrapper.
+        let Some(mut interpolation) = self.frame_interpolation.take() else { return; };
+        interpolation.update_slow_trace_context();
+        let visible = !OCCLUDED.load(Ordering::Relaxed) && !SUSPENDED.load(Ordering::Relaxed)
+            && crate::ffi::app_presentation_allowed() && self.surface.is_some();
+        interpolation.context(visible, crate::ffi::physical_size());
+        let display=interpolation.tick(&self.device);
+        interpolation.update_slow_trace_context();
+        if !visible || !interpolation.active() { self.invalidate_output_cache(); }
+        let Some(display) = display else {self.frame_interpolation=Some(interpolation);return;};
+        // This wrapper runs between guest opcodes. Read the SR settings mutex
+        // only for an actual output deadline, after the interpolator poll gate.
+        let epoch=interpolation.cache_epoch();
+        let cache_signature=crate::spatial_upscale::output_cache_signature();
+        if self.interpolation_output_cache.as_ref().is_some_and(|cache|
+            cache.key.epoch!=epoch || cache.key.spatial!=cache_signature || cache.key.surface_format!=self.surface_format ||
+            cache.key.output_size!=self.surface_size) { self.invalidate_output_cache(); }
+        if self.blit.is_none() {
+            self.blit=Some(crate::spatial_upscale::blit_pipeline(&self.device,self.surface_format));
+        }
+        let Some(blit)=self.blit.clone() else {self.frame_interpolation=Some(interpolation);return;};
+        let cache_key=OutputCacheKey::for_display(&display,epoch,cache_signature,self.surface_format);
+        let cache_eligible=cache_key.is_some();
+        let cache_hit=repeat_output_cache_hit(display.kind,self.interpolation_output_cache.as_ref().map(|cache|&cache.key),
+            cache_key.as_ref(),cache_key.as_ref().is_some_and(|key|key.output_size==self.surface_size));
+        let slot=self.interpolation_sr_slot;
+        if !cache_hit && self.interpolation_spatial.is_none() {self.interpolation_spatial=crate::spatial_upscale::Spatial::new(&self.device,FRAME_SLOTS);}
+        if !cache_hit && self.interpolation_spatial.is_some() {
+            if let Some(index)=self.interpolation_sr_fences[slot].as_ref() {
+                // This is an OUTPUT slot, independent of the guest UBO
+                // slots. Never replace a raw SR context/view while pending.
+                let completion={let _slow=slow_trace::span("output_sr_slot_wait_1ms","");
+                    self.device.poll(PollType::Wait{submission_index:Some(index.clone()),timeout:Some(Duration::from_millis(1))})};
+                match completion {
+                    Ok(_)=>{self.interpolation_sr_fences[slot]=None;},
+                    Err(error)=>{interpolation.output_skipped(&format!("output SR slot {slot} not completed: {error:?}"));self.frame_interpolation=Some(interpolation);return;}
+                }
+            }
+        }
+        // Output is completely independent of the guest's open pass/encoder.
+        // Only owned immutable history and this output graph are submitted here.
+        let (before,raw,mut binding,final_texture,output_size,sr_active)=if cache_hit {
+            let cache=self.interpolation_output_cache.as_ref().unwrap();
+            // No SR context/slot is touched. This private image contains the
+            // exact prior processed content; its presentation remains a repeat.
+            (None,None,cache.binding.clone(),cache.texture.clone(),cache.key.output_size,cache.sr_active)
+        }else{
+            let mut before=self.device.create_command_encoder(&CommandEncoderDescriptor{label:Some("game-AI-output-tracked-before")});
+            let texture={let _slow=slow_trace::span("output_prepare_warp",display.kind);interpolation.prepare_output(&self.device,&self.queue,&display,&mut before)};
+            let Some(texture)=texture else {
+                self.invalidate_output_cache();crate::spatial_upscale::note_frame_generation(false);self.frame_interpolation=Some(interpolation);return;
+            };
+            let mut size=(texture.width(),texture.height());
+            let source_view=texture.create_view(&TextureViewDescriptor::default());
+            let mut binding=self.device.create_bind_group(&BindGroupDescriptor{label:Some("game-AI-source-output"),layout:&blit.get_bind_group_layout(0),
+                entries:&[BindGroupEntry{binding:0,resource:BindingResource::TextureView(&source_view)}]});
+            let mut raw=None;let mut final_texture=texture.clone();let mut sr=false;
+            if let Some(spatial)=self.interpolation_spatial.as_mut() {
+                let _slow=slow_trace::span("output_xeg_sr_record",display.kind);
+                match spatial.record(&texture,slot,&blit,&mut before) {
+                    Ok((command,output_binding,output_size))=>{
+                        raw=Some(command);binding=output_binding;size=output_size;sr=true;
+                        if let Some(output)=spatial.output_texture(slot) {final_texture=output;}
+                    },
+                    Err(error)=>spatial.report_fallback(&format!("AI output SR: {error:#}"),(texture.width(),texture.height())),
+                }
+            }
+            (Some(before),raw,binding,final_texture,size,sr)
+        };
+        crate::spatial_upscale::note_frame_generation(sr_active);
+        interpolation.output_size(output_size,sr_active);
+        let (w,h)=output_size;
+        if self.surface_size!=(w,h) {
+            self.invalidate_output_cache();
+            let _slow=slow_trace::span("output_surface_configure","");
+            if let Some((surface,window))=self.surface.as_ref() {
+                if let Err(error)=window.set_buffer_geometry(w,h){log_once("AI-geometry",&format!("AI native geometry: {error:#}"));}
+                let caps=surface.get_capabilities(&self.adapter);
+                surface.configure(&self.device,&SurfaceConfiguration{usage:TextureUsages::RENDER_ATTACHMENT,format:self.surface_format,width:w,height:h,
+                    present_mode:if caps.present_modes.contains(&PresentMode::Mailbox){PresentMode::Mailbox}else{PresentMode::Fifo},desired_maximum_frame_latency:2,
+                    alpha_mode:caps.alpha_modes[0],view_formats:vec![],color_space:SurfaceColorSpace::Auto});
+                if let Err(error)=window.set_aspect_fit() {
+                    let reason=format!("AI output surface aspect-fit rejected after configure: {error:#}");
+                    crate::ffi::set_error(&reason);
+                    interpolation.output_skipped(&reason);
+                    self.surface_size=(0,0);
+                    self.frame_interpolation=Some(interpolation);
+                    return;
+                }
+                self.surface_size=(w,h);log(&format!("combined AI/SR game surface configured {w}x{h}, SR={sr_active}"));
+            }
+        }
+        let frame={let _slow=slow_trace::span("output_surface_acquire",display.kind);self.surface.as_ref().and_then(|(surface,_)|match surface.get_current_texture(){
+            CurrentSurfaceTexture::Success(f)|CurrentSurfaceTexture::Suboptimal(f)=>Some(f),
+            other=>{log_once("AI-surface",&format!("AI surface unavailable: {other:?}"));None}
+        })};
+        if let Some(frame)=frame {
+            // Start the bounded diagnostic on a real inferred output. The
+            // subsequent synced captures may disturb pacing; a source-only
+            // six-frame sample would not provide any AI pixel evidence.
+            if sr_active && display.kind == "ai" && !self.interpolation_output_capture_started && crate::ffi::world_player_observed() {
+                if let Some(root)=std::env::var_os("MUGUET_SUPPORT") {
+                    let root=PathBuf::from(root);
+                    if root.join("fg-final-output-capture.request").is_file() {
+                        self.interpolation_output_capture_started=true;
+                        let directory=root.join(format!("fg-final-output-capture-{}",std::process::id()));
+                        match std::fs::create_dir(&directory) {
+                            Ok(())=>{
+                                self.interpolation_output_capture=crate::frame_capture::Capture::from_directory(directory.clone(),
+                                    "post_AI_warp_and_public_XEG_SR_before_native_present","output_slot_index",true);
+                                self.interpolation_output_capture_directory=Some(directory);
+                            },
+                            Err(error)=>log(&format!("final AI/SR capture directory rejected: {error}")),
+                        }
+                    }
+                }
+            }
+            let mut capture_command=None;
+            if sr_active {
+                if let Some(mut capture)=self.interpolation_output_capture.take() {
+                    capture_command=capture.record(&self.device,&final_texture,display.slot);
+                    if capture_command.is_some() {
+                        if let Some(directory)=self.interpolation_output_capture_directory.as_ref() {
+                            let directory=directory.to_string_lossy();interpolation.note_output_capture(&directory,&display);
+                            log(&format!("final AI/SR capture kind={} outputSlot={} sourceSequence={} size={w}x{h} directory={directory}",display.kind,display.slot,display.source_sequence));
+                        }
+                    }
+                    if !capture.finished(){self.interpolation_output_capture=Some(capture);}
+                }
+            }
+            let view=frame.texture.create_view(&TextureViewDescriptor::default());
+            let mut after=self.device.create_command_encoder(&CommandEncoderDescriptor{label:Some("game-AI-output-tracked-after")});
+            let cache_candidate=if cache_hit {None}else{cache_key.and_then(|key|self.output_cache_candidate(key,&final_texture,&blit,sr_active))};
+            if let Some(cache)=cache_candidate.as_ref() {
+                // before (warp/init) -> raw XEG -> optional readback -> tracked
+                // full-image copy -> final blit, all in this SAME queue submit.
+                // The destination is wholly initialized by this full copy.
+                after.copy_texture_to_texture(TexelCopyTextureInfo{texture:&final_texture,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},
+                    TexelCopyTextureInfo{texture:&cache.texture,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},
+                    Extent3d{width:w,height:h,depth_or_array_layers:1});
+                binding=cache.binding.clone();
+            }
+            {
+                let mut pass=after.begin_render_pass(&RenderPassDescriptor{label:Some("combined-AI-SR-final-blit"),
+                    color_attachments:&[Some(RenderPassColorAttachment{view:&view,depth_slice:None,resolve_target:None,ops:Operations{load:LoadOp::Clear(Color::BLACK),store:StoreOp::Store}})],
+                    depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
+                pass.set_pipeline(&blit);pass.set_bind_group(0,&binding,&[]);pass.draw(0..3,0..1);
+            }
+            let mut commands=Vec::new();
+            if let Some(before)=before {let _slow=slow_trace::span("output_before_encoder_finish",display.kind);commands.push(before.finish());}
+            if let Some(raw)=raw {commands.push(raw);}
+            if let Some(capture)=capture_command {commands.push(capture);}
+            {let _slow=slow_trace::span("output_after_encoder_finish",display.kind);commands.push(after.finish());}
+            let index={let _slow=slow_trace::span("output_queue_submit",display.kind);self.queue.submit(commands)};
+            self.submits+=1;self.last_submit=Some(index.clone());
+            if cache_hit {OUTPUT_CACHE_HITS.fetch_add(1,Ordering::Relaxed);}else if cache_eligible {OUTPUT_CACHE_MISSES.fetch_add(1,Ordering::Relaxed);}
+            // Publish a new content key only after its copy was submitted. An
+            // acquire/encode failure must never relabel old pixels as new ones.
+            if let Some(cache)=cache_candidate {self.interpolation_output_cache=Some(cache);OUTPUT_CACHE_COPIES.fetch_add(1,Ordering::Relaxed);}
+            if sr_active && !cache_hit {self.interpolation_sr_fences[slot]=Some(index);self.interpolation_sr_slot=(slot+1)%FRAME_SLOTS;}
+            // Do not on_submitted(): pending guest completion queries belong
+            // to its STILL OPEN encoder, not to this independent output graph.
+            let present_begin=crate::frame_interpolation::monotonic_ns();
+            {let _slow=slow_trace::span("output_queue_present",display.kind);self.queue.present(frame);}
+            let present_complete=crate::frame_interpolation::monotonic_ns();
+            PRESENTS.fetch_add(1,Ordering::Relaxed);interpolation.presented(&display,true,present_begin,present_complete);
+        }else{
+            self.invalidate_output_cache();self.surface_size=(0,0);interpolation.presented(&display,false,None,None);
+        }
+        self.frame_interpolation=Some(interpolation);
+    }
+
     fn present(&mut self, id: u32) {
         let _span = cpu_profile::span(CpuMetric::PresentTotal);
         self.materialize_clears(id);
         let visible = !OCCLUDED.load(Ordering::Relaxed);
+        if !self.present_interpolated_source(id) {
+        crate::spatial_upscale::note_frame_generation(false);
         if let (Some(t), Some(_), true) = (self.tex(id), self.surface.as_ref(), visible) {
             let (mut w, mut h) = (t.desc.w, t.desc.h);
             let tex = t.tex.clone();
@@ -3836,6 +4323,20 @@ impl Gpu {
                 }
                 self.spatial = Some(spatial);
             }
+            // Optional evidence only: read the ORIGINAL guest final-source tex,
+            // even when SR selected another presentation binding above. Keep
+            // capture in an isolated tracked CB so errors cannot invalidate the
+            // game's encoder. Preserve all existing SR commands and final blit.
+            if let Some(mut capture) = self.frame_capture.take() {
+                if let Some(command) = capture.record(&self.device,&tex,self.presents+1) {
+                    self.flush_astc();self.end_pass();self.flush_uniforms();self.use_tex(id);
+                    if let Some(before) = self.enc.take() { self.submit_prefix.push(before.finish()); }
+                    self.submit_prefix.push(command);
+                    self.encoder(); // Ensure acquire failure still submits the pending snapshot.
+                }
+                if !capture.finished() { self.frame_capture = Some(capture); }
+            }
+            let mut surface_fit_ready = true;
             if self.surface_size != (w, h) {
                 let (surface, window) = self.surface.as_ref().unwrap();
                 if let Err(error) = window.set_buffer_geometry(w, h) {
@@ -3853,13 +4354,24 @@ impl Gpu {
                     view_formats: vec![],
                     color_space: SurfaceColorSpace::Auto,
                 });
-                self.surface_size = (w, h);
-                log(&format!("surface configured {w}x{h} {:?}", self.surface_format));
+                match window.set_aspect_fit() {
+                    Ok(()) => {
+                        self.surface_size = (w, h);
+                        log(&format!("surface configured {w}x{h} {:?}", self.surface_format));
+                    }
+                    Err(error) => {
+                        crate::ffi::set_error(format!("game surface aspect-fit rejected after configure: {error:#}"));
+                        self.surface_size = (0, 0);
+                        surface_fit_ready = false;
+                    }
+                }
             }
-            let frame = match { let _span = cpu_profile::span(CpuMetric::Acquire); self.surface.as_ref().unwrap().0.get_current_texture() } {
-                CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => Some(f),
-                other => { log_once("surface", &format!("surface texture unavailable: {other:?}")); self.surface_size = (0, 0); None }
-            };
+            let frame = if surface_fit_ready {
+                match { let _span = cpu_profile::span(CpuMetric::Acquire); self.surface.as_ref().unwrap().0.get_current_texture() } {
+                    CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+                    other => { log_once("surface", &format!("surface texture unavailable: {other:?}")); self.surface_size = (0, 0); None }
+                }
+            } else { None };
             if let Some(frame) = frame {
                 let view = frame.texture.create_view(&TextureViewDescriptor::default());
                 self.use_tex(id);
@@ -3887,6 +4399,7 @@ impl Gpu {
             self.finish_gpu_profile_frame();
             self.flush();
         }
+        }
         self.collect_pipelines();
         self.presents += 1;
         self.pipe_wait_left = PIPELINE_WAIT;
@@ -3898,7 +4411,7 @@ impl Gpu {
         self.ubo_chunk = 0;
         self.ubo_off = 0;
         if let Some(idx) = self.frame_slot_done[self.ubo_slot].take() {
-            let _span = cpu_profile::span(CpuMetric::UboWait);
+            let _slow=slow_trace::span("guest_ubo_slot_wait","");let _span = cpu_profile::span(CpuMetric::UboWait);
             let completion = self.device.poll(PollType::Wait { submission_index: Some(idx), timeout: None });
             if self.spatial.is_some() { self.spatial_slot_ready[self.ubo_slot] = completion.is_ok(); }
         }

@@ -1,0 +1,37 @@
+{
+  "playable_defaults_version": 1,
+  "resolution": "640x360",
+  "scale": 0.4,
+  "fps_limit": 24,
+  "fullscreen": true,
+  "start_mode": 2,
+  "mouse_sensitivity": 2.0,
+  "mute": false,
+  "no_astc": false,
+  "extra_args": [
+    "-shadowQuality=-1",
+    "-reflectionQuality=0"
+  ],
+  "cpu_profile": false,
+  "gpu_diagnostics": false,
+  "gpu_profile": false,
+  "sync_submit": false,
+  "thread_qos": true,
+  "depth_reduce_opt": true,
+  "depth_reduce_no_zero": true,
+  "luminance_no_zero": true,
+  "spatial_upscale_mode": "native_quality",
+  "spatial_upscale_match_display": false,
+  "spatial_upscale_input_size": [
+    640,
+    360
+  ],
+  "spatial_upscale_output_size": [
+    1920,
+    1080
+  ],
+  "spatial_upscale_sharpness": 0.2,
+  "frame_interpolation_output_fps": 48,
+  "frame_interpolation_classifier_policy": "observe_only",
+  "frame_interpolation_slow_trace": false
+}

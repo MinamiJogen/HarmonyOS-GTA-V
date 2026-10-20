@@ -9,6 +9,29 @@ task_stage_root="${HARMONY_BUILD_STAGE:-/private/tmp/harmony-runtime-probe-${UID
 task_stage_dir="$task_stage_root/harmony"
 task_shell_only="${HARMONY_SHELL_ONLY:-0}"
 task_copy_build_output="${HARMONY_COPY_BUILD_OUTPUT:-1}"
+task_fg_probe_only="${HARMONY_FG_PROBE_ONLY:-0}"
+task_game_experiment_bundle="${HARMONY_GAME_EXPERIMENT_BUNDLE:-}"
+if [[ -n "$task_game_experiment_bundle" && ( "$task_fg_probe_only" != 0 || "$task_shell_only" != 0 || "$task_copy_build_output" != 0 ) ]]; then
+  print -u2 'A full-game experiment requires FG_PROBE_ONLY=0, SHELL_ONLY=0 and COPY_BUILD_OUTPUT=0.'
+  exit 2
+fi
+if [[ "$task_fg_probe_only" != 0 && "$task_fg_probe_only" != 1 ]]; then
+  print -u2 'HARMONY_FG_PROBE_ONLY must be 0 or 1.'
+  exit 2
+fi
+if [[ "$task_fg_probe_only" == 1 && ( "$task_shell_only" != 1 || "$task_copy_build_output" != 0 ) ]]; then
+  print -u2 'FG experiments require HARMONY_SHELL_ONLY=1 and HARMONY_COPY_BUILD_OUTPUT=0.'
+  exit 2
+fi
+if [[ "$task_fg_probe_only" == 1 || -n "$task_game_experiment_bundle" ]]; then
+  python3 - "$task_repo_dir" "$task_stage_dir" <<'PYFGPATH'
+import sys
+from pathlib import Path
+source, stage = (Path(p).resolve() for p in sys.argv[1:])
+if source == stage or source in stage.parents or stage in source.parents:
+    raise SystemExit('FG build stage must be outside the source checkout and must not contain it.')
+PYFGPATH
+fi
 if [[ "$task_shell_only" != 0 && "$task_shell_only" != 1 ]]; then
   print -u2 'HARMONY_SHELL_ONLY must be 0 or 1.'
   exit 2
@@ -26,18 +49,87 @@ fi
 /usr/bin/rsync -a --delete --exclude '/build-profile.json5' --exclude 'build-profile.local.json5' --exclude '.signing' --exclude '.idea' --exclude 'local.properties' --exclude '.hvigor' --exclude 'node_modules' --exclude 'oh_modules' --exclude 'entry/oh_modules' --exclude 'entry/build' --exclude 'build' --exclude 'logs' "$task_project_dir/" "$task_stage_dir/"
 # Mutate only the private ASCII mirror. Explicit ON/OFF also prevents a cached
 # shell mode from leaking into a later complete-game build in the same stage.
-python3 - "$task_stage_dir/entry/build-profile.json5" "$task_shell_only" <<'PYSHELL'
+python3 - "$task_stage_dir/entry/build-profile.json5" "$task_shell_only" "${HARMONY_RIFE_SDK:-}" <<'PYSHELL'
 import json
 import re
 import sys
 from pathlib import Path
 path = Path(sys.argv[1])
+rife_sdk = str(Path(sys.argv[3]).resolve()) if sys.argv[3] else ''
+if any(c.isspace() for c in rife_sdk):
+    raise SystemExit('HARMONY_RIFE_SDK requires an ASCII build path without whitespace.')
 profile = json.loads(path.read_text())
 options = profile.setdefault('buildOption', {}).setdefault('externalNativeOptions', {})
 arguments = re.sub(r'(?<!\S)-DMUGUET_SHELL_ONLY(?::[^=\s]+)?=[^\s]+', '', str(options.get('arguments', ''))).strip()
-options['arguments'] = (arguments + ' -DMUGUET_SHELL_ONLY=' + ('ON' if sys.argv[2] == '1' else 'OFF')).strip()
+arguments = re.sub(r'(?<!\S)-DMUGUET_RIFE_SDK(?::[^=\s]+)?=[^\s]*', '', arguments).strip()
+options['arguments'] = (arguments + ' -DMUGUET_SHELL_ONLY=' + ('ON' if sys.argv[2] == '1' else 'OFF') +
+                        ' -DMUGUET_RIFE_SDK=' + rife_sdk).strip()
 path.write_text(json.dumps(profile, indent=2) + '\n')
 PYSHELL
+if [[ "$task_fg_probe_only" == 1 ]]; then
+  # Apply the FG loader metadata only to a separate, runtime-free experiment.
+  # The working game manifest and its output directory remain independent.
+  python3 - "$task_stage_dir" "${HARMONY_FG_PROBE_BUNDLE:-com.example.harmonyfgprobe}" "${HARMONY_FG_PROBE_FUSION_AWARE:-1}" <<'PYFG'
+import json
+import re
+import sys
+from pathlib import Path
+root, bundle, fusion_aware = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+if fusion_aware not in ('0', '1'):
+    raise SystemExit('HARMONY_FG_PROBE_FUSION_AWARE must be 0 or 1.')
+if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', bundle):
+    raise SystemExit('Invalid FG experiment bundle name.')
+app_path = root / 'AppScope/app.json5'
+app = json.loads(app_path.read_text())
+if bundle == app['app']['bundleName']:
+    raise SystemExit('FG experiment must use a different bundle from the working game.')
+app['app']['bundleName'] = bundle
+app_path.write_text(json.dumps(app, indent=2) + '\n')
+module_path = root / 'entry/src/main/module.json5'
+module = json.loads(module_path.read_text())
+data = module['module']
+data['mainElement'] = 'GraphicsFrameProbeAbility'
+probe = next(a for a in data['abilities'] if a['name'] == 'GraphicsFrameProbeAbility')
+probe['skills'] = [{'entities': ['entity.system.home'], 'actions': ['ohos.want.action.home']}]
+data['abilities'] = [probe]
+data['metadata'] = [m for m in data.get('metadata', []) if m['name'] != 'GraphicsAccelerateKit_FusionAware']
+if fusion_aware == '1':
+    data['metadata'].append({'name': 'GraphicsAccelerateKit_FusionAware', 'value': 'Vulkan'})
+module_path.write_text(json.dumps(module, indent=2) + '\n')
+string_paths = list((root / 'AppScope/resources').glob('*/element/string.json'))
+string_paths += list((root / 'entry/src/main/resources').glob('*/element/string.json'))
+for path in string_paths:
+    values = json.loads(path.read_text())
+    for item in values.get('string', []):
+        if item['name'] == 'app_name':
+            item['value'] = 'AI FG 30 FPS Probe'
+    path.write_text(json.dumps(values, ensure_ascii=False, indent=2) + '\n')
+print('Independent FG experiment: ' + bundle + '; public SYSTEM presentation metadata ' + ('enabled' if fusion_aware == '1' else 'disabled for control'))
+PYFG
+fi
+if [[ -n "$task_game_experiment_bundle" ]]; then
+  python3 - "$task_stage_dir" "$task_game_experiment_bundle" <<'PYGAME'
+import json
+import re
+import sys
+from pathlib import Path
+root, bundle = Path(sys.argv[1]), sys.argv[2]
+if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', bundle):
+    raise SystemExit('Invalid full-game experiment bundle name.')
+app_path = root / 'AppScope/app.json5'
+app = json.loads(app_path.read_text())
+if bundle == app['app']['bundleName']:
+    raise SystemExit('Full-game experiment must use a different bundle from the working game.')
+app['app']['bundleName'] = bundle
+app_path.write_text(json.dumps(app, indent=2) + '\n')
+module_path = root / 'entry/src/main/module.json5'
+module = json.loads(module_path.read_text())
+module['module']['metadata'] = [m for m in module['module'].get('metadata', [])
+                              if m['name'] != 'GraphicsAccelerateKit_FusionAware']
+module_path.write_text(json.dumps(module, indent=2) + '\n')
+print('Private full-game experiment: ' + bundle + '; system FG loader metadata absent')
+PYGAME
+fi
 if [[ "$task_shell_only" == 1 ]]; then
   print 'Public shell: game runtime and all embedded AOT disabled'
 fi

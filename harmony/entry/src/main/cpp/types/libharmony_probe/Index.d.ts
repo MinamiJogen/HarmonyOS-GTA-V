@@ -56,12 +56,14 @@ export interface GameStatus {
   runtimeJson: string;
 }
 
-export const configureGame: (filesDirectory: string) => void;
+export const configureGame: (filesDirectory: string, action?: string, saveId?: string) => void;
 export const startGame: () => void;
 export const stopGame: () => void;
 export const gameStatus: () => GameStatus;
 export const checkGameResources: (filesDirectory: string) => Promise<string>;
 export const importGameResources: (sourceFd: number, filesDirectory: string) => Promise<string>;
+export const listGameSaves: (filesDirectory: string) => Promise<string>;
+export const importGameSaves: (sourceFd: number, filesDirectory: string) => Promise<string>;
 export const getGameImportStatus: () => string;
 export const cancelGameImport: () => void;
 export const sendKey: (keyName: string, pressed: boolean) => void;

@@ -111,3 +111,11 @@ export async function selectGamePackage(context: common.UIAbilityContext, direct
   const selected: string[] = await documentPicker.select(options);
   return selected.length > 0 ? selected[0] : '';
 }
+
+export async function selectSavePackage(context: common.UIAbilityContext, directoryUri: string): Promise<string> {
+  const documentPicker = new picker.DocumentViewPicker(context);
+  const options: picker.DocumentSelectOptions = { maxSelectNumber: 1, fileSuffixFilters: ['ZIP 存档包|.zip'] };
+  if (directoryUri.length > 0) { options.defaultFilePathUri = directoryUri; }
+  const selected: string[] = await documentPicker.select(options);
+  return selected.length > 0 ? selected[0] : '';
+}

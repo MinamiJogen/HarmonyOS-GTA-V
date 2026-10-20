@@ -6,16 +6,25 @@
 #include <napi/native_api.h>
 #include <syscap_ndk.h>
 #include <dlfcn.h>
+#include <dirent.h>
 #include <execinfo.h>
 #include "graphics_frame_surface_shaders.h"
 #include "graphics_frame_scene.h"
+#include "graphics_frame_rate_policy.h"
+#include "fg_model_metadata_audit.h"
+#include "fg_model_alias_scope.h"
+#include "fg_rife_benchmark.h"
+#include "fg_rife_surface.h"
+#include "fg_npu_flow_benchmark.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <mutex>
@@ -26,7 +35,7 @@
 #include <vector>
 
 namespace {
-constexpr uint32_t W = 1202, H = 800, FPS = 30;
+constexpr uint32_t W = 1202, H = 800;
 std::string quote(const std::string& s) {
     std::ostringstream o; o << '"';
     for (unsigned char c : s) {
@@ -69,7 +78,9 @@ struct FG {
     decltype(&HMS_FG_SetResolution_VK) resolution = nullptr;
     decltype(&HMS_FG_SetImageFormat_VK) format = nullptr;
     decltype(&HMS_FG_SetIntegrationMode_VK) integration = nullptr;
+    decltype(&HMS_FG_SetTargetFps_VK) targetFps = nullptr;
     decltype(&HMS_FG_Activate_VK) activate = nullptr;
+    decltype(&HMS_FG_IsActive_VK) isActive = nullptr;
     decltype(&HMS_FG_SetUiPredictionEnabled_VK) uiPrediction = nullptr;
     decltype(&HMS_FG_Dispatch_VK) dispatch = nullptr;
     decltype(&HMS_FG_CreateImage_VK) image = nullptr;
@@ -83,7 +94,8 @@ struct FG {
         supported=&HMS_FG_IsFrameGenerationSupported;create=&HMS_FG_CreateContext_VK;
         algorithm=&HMS_FG_SetAlgorithmMode_VK;resolution=&HMS_FG_SetResolution_VK;
         format=&HMS_FG_SetImageFormat_VK;integration=&HMS_FG_SetIntegrationMode_VK;
-        activate=&HMS_FG_Activate_VK;uiPrediction=&HMS_FG_SetUiPredictionEnabled_VK;
+        targetFps=&HMS_FG_SetTargetFps_VK;
+        activate=&HMS_FG_Activate_VK;isActive=&HMS_FG_IsActive_VK;uiPrediction=&HMS_FG_SetUiPredictionEnabled_VK;
         dispatch=&HMS_FG_Dispatch_VK;image=&HMS_FG_CreateImage_VK;
         destroyImage=&HMS_FG_DestroyImage_VK;deactivate=&HMS_FG_Deactivate_VK;
         destroy=&HMS_FG_DestroyContext_VK;
@@ -96,15 +108,21 @@ struct Trial {
     std::string directory, phase = "created", error;
     bool enabled, uiPredictionRequested=false, finished = false, teardownComplete = false, pending = false, uiPredictionDisabled = false;
     bool uiPredictionConfigured=false;FG_ErrorCode uiPredictionResult=FG_SUCCESS;
+    bool targetFpsConfigured=false;FG_ErrorCode targetFpsResult=FG_SUCCESS;
+    std::string fusionAwareMetadata;
+    std::string modelAliasAudit="null";
+    int modelAliasRestoreErrno=0;
     bool geometryRequested=false, geometryQualificationPassed=false, retainPendingGraph=false, geometryWindowReference=false, geometrySceneDestroyed=false;
+    bool swapchainSampledRequested=false, finalDepthStateRequested=false, finalDepthStateProvided=false;
     std::string geometryQualificationJson;
     std::unique_ptr<muguet::fg_scene::Scene> geometryScene;
-    uint32_t seconds, frames = 0, realPresents = 0, dispatches = 0, successes = 0, collecting = 0, events = 0;
+    uint32_t seconds, sourceFps, requestedTargetFps, frames = 0, realPresents = 0, dispatches = 0, successes = 0, collecting = 0, events = 0;
     std::atomic<bool>& stop;
     VkInstance instance = VK_NULL_HANDLE; VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t family = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE; VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D extent{}; VkFormat surfaceFormat = VK_FORMAT_UNDEFINED;
+    VkImageUsageFlags swapchainSupportedUsageFlags=0, swapchainRequestedUsageFlags=0, swapchainActualUsageFlags=0;
     uint32_t loaderApiVersion=VK_API_VERSION_1_0, physicalApiVersion=0;
     VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE, acquireFence = VK_NULL_HANDLE; VkSemaphore acquired = VK_NULL_HANDLE;
@@ -167,8 +185,12 @@ struct Trial {
         }
         return VK_FALSE;
     }
-    Trial(OHNativeWindow* w, std::string root, bool on, bool ui, bool geometry, uint32_t duration, std::atomic<bool>& stopping)
-        : window(w), directory(std::move(root)), enabled(on), uiPredictionRequested(ui), geometryRequested(geometry), seconds(duration), stop(stopping) {}
+    Trial(OHNativeWindow* w, std::string root, bool on, bool ui, bool geometry, uint32_t duration,
+        uint32_t sourceRate, uint32_t targetRate, std::string metadata, bool sampled, bool depthState, std::atomic<bool>& stopping)
+        : window(w), directory(std::move(root)), enabled(on), uiPredictionRequested(ui),
+          fusionAwareMetadata(std::move(metadata)), geometryRequested(geometry), swapchainSampledRequested(sampled),
+          finalDepthStateRequested(depthState), seconds(duration),
+          sourceFps(sourceRate), requestedTargetFps(targetRate), stop(stopping) {}
     void trace(const std::string& s, const std::string& fields = "") {
         phase = s;
         if (++events > 256) throw std::runtime_error("bounded surface trace limit exceeded");
@@ -179,6 +201,11 @@ struct Trial {
     void fgCheck(const char* name, FG_ErrorCode code) {
         trace(name, "\"FG_ErrorCode\":" + std::to_string(code));
         if (code != FG_SUCCESS) throw std::runtime_error(std::string(name) + " FG_ErrorCode=" + std::to_string(code));
+    }
+    void traceActiveState(const char* event) {
+        bool active=false;const auto code=fg.isActive(fg.context,&active);
+        trace(event,"\"FG_ErrorCode\":"+std::to_string(code)+",\"active\":"+
+            (code==FG_SUCCESS?std::string(boolean(active)):"null")+",\"modelReadyVerified\":false");
     }
     uint32_t memoryType(uint32_t bits) {
         VkPhysicalDeviceMemoryProperties m{}; vkGetPhysicalDeviceMemoryProperties(physical, &m);
@@ -263,10 +290,18 @@ struct Trial {
         auto vp=info<VkPipelineViewportStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);vp.viewportCount=vp.scissorCount=1;vp.pViewports=&viewport;vp.pScissors=&scissor;
         auto raster=info<VkPipelineRasterizationStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO);raster.polygonMode=VK_POLYGON_MODE_FILL;raster.cullMode=VK_CULL_MODE_NONE;raster.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE;raster.lineWidth=1;
         auto ms=info<VkPipelineMultisampleStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+        // Optional sample-parity control: supply a disabled state while retaining
+        // the same color-only renderpass and no depth/stencil attachment.
+        auto depthState=info<VkPipelineDepthStencilStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO);
+        depthState.depthTestEnable=VK_FALSE;depthState.depthWriteEnable=VK_FALSE;depthState.depthCompareOp=VK_COMPARE_OP_ALWAYS;
+        depthState.depthBoundsTestEnable=VK_FALSE;depthState.stencilTestEnable=VK_FALSE;depthState.minDepthBounds=0;depthState.maxDepthBounds=1;
         VkPipelineColorBlendAttachmentState colorWrite{};colorWrite.colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
         auto blend=info<VkPipelineColorBlendStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO);blend.attachmentCount=1;blend.pAttachments=&colorWrite;
         auto pi=info<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);pi.stageCount=2;pi.pStages=stages;pi.pVertexInputState=&vertex;pi.pInputAssemblyState=&assembly;pi.pViewportState=&vp;pi.pRasterizationState=&raster;pi.pMultisampleState=&ms;pi.pColorBlendState=&blend;pi.layout=finalPipelineLayout;pi.renderPass=finalRenderPass;
+        pi.pDepthStencilState=finalDepthStateRequested?&depthState:nullptr;
         check(vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&pi,nullptr,&finalPipeline),"create final fullscreen pipeline");
+        finalDepthStateProvided=finalDepthStateRequested;
+        trace("own-final-pipeline-created","\"finalDepthStateRequested\":"+std::string(boolean(finalDepthStateRequested))+",\"finalDepthStateProvided\":"+boolean(finalDepthStateProvided)+",\"depthTestEnabled\":false,\"depthWriteEnabled\":false,\"depthBoundsTestEnabled\":false,\"stencilTestEnabled\":false,\"depthAttachment\":null");
         vkDestroyShaderModule(device,finalVertex,nullptr);finalVertex=VK_NULL_HANDLE;vkDestroyShaderModule(device,finalFragment,nullptr);finalFragment=VK_NULL_HANDLE;
         finalPassCreated=true;
     }
@@ -304,7 +339,11 @@ struct Trial {
     }
     void setup() {
         if(geometryRequested){if(OH_NativeWindow_NativeObjectReference(window)!=0)throw std::runtime_error("cannot retain geometry trial window");geometryWindowReference=true;}
-        trace("begin", "\"fgEnabled\":" + std::string(boolean(enabled)) + ",\"uiPredictionRequested\":"+boolean(uiPredictionRequested)+",\"geometryRequested\":"+boolean(geometryRequested)+",\"publicLibraryIntegration\":\"ELF_DT_NEEDED_direct_symbols\",\"sourceResolution\":[1202,800],\"sourceTargetHz\":30");
+        trace("begin", "\"fgEnabled\":" + std::string(boolean(enabled)) + ",\"uiPredictionRequested\":"+boolean(uiPredictionRequested)+",\"geometryRequested\":"+boolean(geometryRequested)+",\"swapchainSampledRequested\":"+boolean(swapchainSampledRequested)+",\"finalDepthStateRequested\":"+boolean(finalDepthStateRequested)+",\"publicLibraryIntegration\":\"ELF_DT_NEEDED_direct_symbols\",\"sourceResolution\":[1202,800],\"sourceTargetHz\":"+std::to_string(sourceFps)+",\"requestedOutputTargetHz\":"+std::to_string(requestedTargetFps)+",\"fusionAwareMetadata\":"+quote(fusionAwareMetadata));
+        if(enabled && fusionAwareMetadata!="Vulkan") {
+            trace("system-presentation-metadata-unqualified", "\"expected\":\"GraphicsAccelerateKit_FusionAware=Vulkan\",\"observed\":"+quote(fusionAwareMetadata));
+            throw std::runtime_error("AI system presentation requires installed module metadata GraphicsAccelerateKit_FusionAware=Vulkan; observed "+fusionAwareMetadata+". Use the experimental metadata-enabled package.");
+        }
         if (!canIUse("SystemCapability.GraphicsGame.RenderAccelerate")) throw std::runtime_error("RenderAccelerate syscap absent");
         fg.load(); if (!fg.supported(INTERPOLATION_AI_VULKAN)) throw std::runtime_error("AI Vulkan capability false");
         requireVulkan13Loader();
@@ -371,10 +410,15 @@ struct Trial {
         trace("create-device");check(vkCreateDevice(physical,&dc,nullptr,&device),"vkCreateDevice");vkGetDeviceQueue(device,family,0,&queue);
         VkSurfaceCapabilitiesKHR caps{};check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical,surface,&caps),"surface capabilities");
         const VkImageUsageFlags requiredSurfaceUsage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        swapchainSupportedUsageFlags=caps.supportedUsageFlags;
+        swapchainRequestedUsageFlags=requiredSurfaceUsage|(swapchainSampledRequested?VK_IMAGE_USAGE_SAMPLED_BIT:0);
+        trace("swapchain-usage-policy","\"swapchainSampledRequested\":"+std::string(boolean(swapchainSampledRequested))+",\"swapchainSupportedUsageFlags\":"+std::to_string(swapchainSupportedUsageFlags)+",\"swapchainRequestedUsageFlags\":"+std::to_string(swapchainRequestedUsageFlags));
         // The public FG system-present integration creates color image views /
         // framebuffers for the swapchain. TRANSFER_DST alone is insufficient.
         if ((caps.supportedUsageFlags & requiredSurfaceUsage)!=requiredSurfaceUsage)
             throw std::runtime_error("surface TRANSFER_DST|COLOR_ATTACHMENT unsupported");
+        if(swapchainSampledRequested&&!(caps.supportedUsageFlags&VK_IMAGE_USAGE_SAMPLED_BIT))
+            throw std::runtime_error("requested surface SAMPLED usage unsupported");
         extent = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : VkExtent2D{std::clamp(W,caps.minImageExtent.width,caps.maxImageExtent.width),std::clamp(H,caps.minImageExtent.height,caps.maxImageExtent.height)};
         n=0;check(vkGetPhysicalDeviceSurfaceFormatsKHR(physical,surface,&n,nullptr),"surface formats count");if(!n || n>256)throw std::runtime_error("invalid surface formats");
         std::vector<VkSurfaceFormatKHR> formats(n);check(vkGetPhysicalDeviceSurfaceFormatsKHR(physical,surface,&n,formats.data()),"surface formats");
@@ -384,11 +428,14 @@ struct Trial {
         VkFormatProperties rgba{},dst{};vkGetPhysicalDeviceFormatProperties(physical,VK_FORMAT_R8G8B8A8_UNORM,&rgba);vkGetPhysicalDeviceFormatProperties(physical,surfaceFormat,&dst);
         const auto required=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_BLIT_SRC_BIT;
         if((rgba.optimalTilingFeatures & required)!=required || (dst.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT))!=(VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT))throw std::runtime_error("actual RGBA8 render/sample/blit-source and surface color/blit-destination features missing");
+        if(swapchainSampledRequested&&!(dst.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))throw std::runtime_error("requested surface format sampling unsupported");
         uint32_t imageCount=caps.minImageCount+1;if(caps.maxImageCount)imageCount=std::min(imageCount,caps.maxImageCount);if(!imageCount || imageCount>16)throw std::runtime_error("unreasonable swapchain image count");
         auto sw=info<VkSwapchainCreateInfoKHR>(VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);sw.surface=surface;sw.minImageCount=imageCount;sw.imageFormat=chosen.format;sw.imageColorSpace=chosen.colorSpace;sw.imageExtent=extent;
-        sw.imageArrayLayers=1;sw.imageUsage=requiredSurfaceUsage;sw.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE;sw.preTransform=caps.currentTransform;
+        sw.imageArrayLayers=1;sw.imageUsage=swapchainRequestedUsageFlags;sw.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE;sw.preTransform=caps.currentTransform;
         sw.compositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; if(!(caps.supportedCompositeAlpha & sw.compositeAlpha)) {for(auto a:{VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR})if(caps.supportedCompositeAlpha&a){sw.compositeAlpha=a;break;}}
         sw.presentMode=VK_PRESENT_MODE_FIFO_KHR;sw.clipped=VK_TRUE;check(vkCreateSwapchainKHR(device,&sw,nullptr,&swapchain),"vkCreateSwapchainKHR");
+        swapchainActualUsageFlags=sw.imageUsage;
+        trace("swapchain-created","\"swapchainSampledRequested\":"+std::string(boolean(swapchainSampledRequested))+",\"swapchainSampledEnabled\":"+boolean((swapchainActualUsageFlags&VK_IMAGE_USAGE_SAMPLED_BIT)!=0)+",\"swapchainSupportedUsageFlags\":"+std::to_string(swapchainSupportedUsageFlags)+",\"swapchainRequestedUsageFlags\":"+std::to_string(swapchainRequestedUsageFlags)+",\"swapchainActualUsageFlags\":"+std::to_string(swapchainActualUsageFlags));
         n=0;check(vkGetSwapchainImagesKHR(device,swapchain,&n,nullptr),"swapchain images count");if(!n||n>16)throw std::runtime_error("unreasonable actual swapchain count");swapImages.resize(n);check(vkGetSwapchainImagesKHR(device,swapchain,&n,swapImages.data()),"swapchain images");
         auto sem=info<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);rendered.resize(n,VK_NULL_HANDLE);for(auto& s:rendered)check(vkCreateSemaphore(device,&sem,nullptr,&s),"vkCreateSemaphore renderEnd");check(vkCreateSemaphore(device,&sem,nullptr,&acquired),"vkCreateSemaphore acquire");
         auto pc=info<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);pc.flags=VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;pc.queueFamilyIndex=family;check(vkCreateCommandPool(device,&pc,nullptr,&pool),"vkCreateCommandPool");
@@ -408,23 +455,29 @@ struct Trial {
         check(vkCreateRenderPass(device,&rp,nullptr,&renderPass),"vkCreateRenderPass");makeImage(scene);makeImage(predicted);
         trace("own-offscreen-objects-created","\"renderPass\":"+quote(std::to_string(reinterpret_cast<uintptr_t>(renderPass)))+",\"attachmentCount\":1,\"depthAttachment\":null,\"dependencyCount\":1,\"sceneFramebuffer\":"+quote(std::to_string(reinterpret_cast<uintptr_t>(scene.framebuffer)))+",\"predictedFramebuffer\":"+quote(std::to_string(reinterpret_cast<uintptr_t>(predicted.framebuffer)))+",\"sceneImage\":"+quote(std::to_string(reinterpret_cast<uintptr_t>(scene.image)))+",\"predictedImage\":"+quote(std::to_string(reinterpret_cast<uintptr_t>(predicted.image))));
         }
-        trace(geometryRequested?"final-path-geometry-sampled-color":"final-path-transfer-blit","\"finalColorRenderpassResourcesCreated\":"+std::string(boolean(finalPassCreated))+",\"acquireFenceReal\":true");
+        trace(geometryRequested?"final-path-geometry-sampled-color":"final-path-transfer-blit","\"finalColorRenderpassResourcesCreated\":"+std::string(boolean(finalPassCreated))+",\"finalDepthStateRequested\":"+boolean(finalDepthStateRequested)+",\"finalDepthStateProvided\":"+boolean(finalDepthStateProvided)+",\"acquireFenceReal\":true");
         if(enabled){
             FG_ContextDescription_VK cd{instance,physical,device,1,vkGetInstanceProcAddr};trace("before-FG-create");fg.context=fg.create(&cd);if(!fg.context)throw std::runtime_error("FG context returned null");
             FG_AlgorithmModeInfo mode{FG_PREDICTION_MODE_INTERPOLATION,FG_ME_MODE_ENHANCED};fgCheck("FG-set-algorithm",fg.algorithm(fg.context,&mode));
             FG_ResolutionInfo size{{W,H},{W,H},{W,H}};fgCheck("FG-set-resolution",fg.resolution(fg.context,&size));FG_ImageFormat_VK format{VK_FORMAT_R8G8B8A8_UNORM,geometryRequested?VK_FORMAT_D32_SFLOAT:VK_FORMAT_D24_UNORM_S8_UINT,VK_FORMAT_R8G8B8A8_UNORM};fgCheck("FG-set-format",fg.format(fg.context,&format));
             FG_IntegrationInfo integration{};integration.presentMode=FG_PRESENT_BY_SYSTEM;fgCheck("FG-set-system",fg.integration(fg.context,&integration));
+            // This setter's documented effect starts after the game's first
+            // release. A successful return is configuration, not 30 Hz output.
+            targetFpsResult=fg.targetFps(fg.context,int(requestedTargetFps));targetFpsConfigured=true;
+            trace("FG-set-target-fps", "\"FG_ErrorCode\":"+std::to_string(targetFpsResult)+",\"requestedOutputTargetHz\":"+std::to_string(requestedTargetFps)+",\"documentedEffectAfterFirstRelease\":true,\"effectiveOutputTargetHz\":null");
+            if(targetFpsResult!=FG_SUCCESS)throw std::runtime_error("FG SetTargetFps error="+std::to_string(targetFpsResult));
             // Public UI prediction is an explicit independent probe option.
             // The scene still contains no fabricated Vulkan UI draw.
             uiPredictionResult=fg.uiPrediction(fg.context,uiPredictionRequested);uiPredictionConfigured=true;
             fgCheck("FG-set-ui-prediction",uiPredictionResult);uiPredictionDisabled=!uiPredictionRequested;
             fgCheck("FG-activate",fg.activate(fg.context));fg.active=true;
+            traceActiveState("FG-active-state-after-activation");
             fg.source=fg.image(fg.context,frameSourceImage(),frameSourceView());if(!fg.source)throw std::runtime_error("FG source image registration returned null");
             trace("FG-system-source-only","\"sdkOutputImageRegistered\":false,\"dispatchOutputInfoZero\":true");
         }
         trace("ready", "\"swapchainSize\":["+std::to_string(extent.width)+","+std::to_string(extent.height)+"],\"surfaceFormat\":"+std::to_string(surfaceFormat));
     }
-    void draw(Image& image, bool bars) {
+    void draw(Image& image, bool bars, double sceneSeconds = 0) {
         VkClearValue background{};background.color.float32[0]=0.025f;background.color.float32[1]=0.045f;background.color.float32[2]=0.08f;background.color.float32[3]=1;
         auto rp=info<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);rp.renderPass=renderPass;rp.framebuffer=image.framebuffer;rp.renderArea={{0,0},{W,H}};rp.clearValueCount=1;rp.pClearValues=&background;
         currentApi=bars?"own-source-renderpass-begin":"own-predicted-init-renderpass-begin";
@@ -432,7 +485,7 @@ struct Trial {
         vkCmdBeginRenderPass(command,&rp,VK_SUBPASS_CONTENTS_INLINE);
         if(frames==0)trace("after-own-offscreen-begin","\"role\":"+quote(bars?"scene":"predicted-init"));
         if(bars){for(uint32_t i=0;i<3;++i){VkClearAttachment color{};color.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;color.colorAttachment=0;color.clearValue.color.float32[3]=1;color.clearValue.color.float32[i]=1;color.clearValue.color.float32[(i+1)%3]=0.4f;
-            const uint32_t x=(frames*12+i*320)%(W-96);VkClearRect rect{{{int32_t(x),int32_t(120+i*190)},{96,128}},0,1};vkCmdClearAttachments(command,1,&color,1,&rect);}}
+            const uint32_t x=muguet::fg_probe::movingBarX(sceneSeconds,i*320,W-96);VkClearRect rect{{{int32_t(x),int32_t(120+i*190)},{96,128}},0,1};vkCmdClearAttachments(command,1,&color,1,&rect);}}
         vkCmdEndRenderPass(command);
     }
     void imageBarrier(VkImage image,VkImageLayout before,VkImageLayout after,VkAccessFlags src,VkAccessFlags dst,VkPipelineStageFlags srcStage,VkPipelineStageFlags dstStage){
@@ -480,14 +533,15 @@ struct Trial {
         waitAcquiredImageFence();
         currentApi="own-reset-and-begin";check(vkResetFences(device,1,&fence),"vkResetFences");check(vkResetCommandPool(device,pool,0),"vkResetCommandPool");auto begin=info<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;check(vkBeginCommandBuffer(command,&begin),"vkBeginCommandBuffer");
         currentApi="source-renderpass";t=std::chrono::steady_clock::now();
-        if(geometryRequested){geometryScene->record(command,.18f*std::sin(float(frames)*6.283185307179586f/(FPS*4)));}else{draw(scene,true);if(frames==0)draw(predicted,false);}
+        const double sceneSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+        if(geometryRequested){geometryScene->record(command,muguet::fg_probe::geometryAngle(sceneSeconds));}else{draw(scene,true,sceneSeconds);if(frames==0)draw(predicted,false);}
         sourceRecordNs+=nanosSince(t);
         if(enabled){FG_DispatchDescription_VK d{};d.inputColorInfo.image=fg.source;
             FG_ImageSync_VK sync{VK_ACCESS_SHADER_READ_BIT,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};d.inputColorInfo.initialSync=d.inputColorInfo.finalSync=sync;
             // This is the real static screen-space camera of this constructed
             // synthetic scene. It is not a substitute for the game's camera.
             if(geometryRequested){std::copy(geometryScene->viewProj().begin(),geometryScene->viewProj().end(),d.viewProj.data);std::copy(geometryScene->invViewProj().begin(),geometryScene->invViewProj().end(),d.invViewProj.data);}else{for(int i:{0,5,10,15})d.viewProj.data[i]=d.invViewProj.data[i]=1;}d.vkCommandBuffer=command;d.frameIdx=0;
-            if(dispatches==0)trace("before-first-FG-dispatch");currentApi="HMS_FG_Dispatch_VK";t=std::chrono::steady_clock::now();const auto code=fg.dispatch(fg.context,&d);dispatchNs+=nanosSince(t);if(dispatches==0)trace("after-first-FG-dispatch","\"FG_ErrorCode\":"+std::to_string(code));++dispatches;if(code==FG_SUCCESS)++successes;else if(code==FG_COLLECTING_PREVIOUS_FRAMES)++collecting;else{trace("FG-dispatch-error","\"FG_ErrorCode\":"+std::to_string(code));throw std::runtime_error("FG Dispatch error="+std::to_string(code));}}
+            if(dispatches==0)trace("before-first-FG-dispatch");currentApi="HMS_FG_Dispatch_VK";t=std::chrono::steady_clock::now();const auto code=fg.dispatch(fg.context,&d);dispatchNs+=nanosSince(t);if(dispatches==0){trace("after-first-FG-dispatch","\"FG_ErrorCode\":"+std::to_string(code));traceActiveState("FG-active-state-after-first-dispatch");}++dispatches;if(code==FG_SUCCESS)++successes;else if(code==FG_COLLECTING_PREVIOUS_FRAMES)++collecting;else{trace("FG-dispatch-error","\"FG_ErrorCode\":"+std::to_string(code));throw std::runtime_error("FG Dispatch error="+std::to_string(code));}}
         if(geometryRequested){drawGeometryFinal(index);}else{
         currentApi="own-final-transfer-blit";
         imageBarrier(frameSourceImage(),VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -502,7 +556,7 @@ struct Trial {
         auto present=info<VkPresentInfoKHR>(VK_STRUCTURE_TYPE_PRESENT_INFO_KHR);present.waitSemaphoreCount=1;present.pWaitSemaphores=&rendered[index];present.swapchainCount=1;present.pSwapchains=&swapchain;present.pImageIndices=&index;
         currentApi="own-vkQueuePresentKHR";t=std::chrono::steady_clock::now();auto code=vkQueuePresentKHR(queue,&present);presentNs+=nanosSince(t);if(code!=VK_SUCCESS && code!=VK_SUBOPTIMAL_KHR)check(code,"vkQueuePresentKHR");++realPresents;
         if(frames<=2){acquireFenceStatusAfterPresent=vkGetFenceStatus(device,acquireFence);trace("own-acquire-fence-after-present","\"VkResult\":"+std::to_string(acquireFenceStatusAfterPresent)+",\"acquireFenceNotResetInThisFrame\":true");}
-        if(frames%30==0)trace("progress","\"dispatchCalls\":"+std::to_string(dispatches)+",\"dispatchSuccess\":"+std::to_string(successes)+",\"collecting\":"+std::to_string(collecting)+",\"realPresentSuccesses\":"+std::to_string(realPresents));
+        if(frames%sourceFps==0)trace("progress","\"dispatchCalls\":"+std::to_string(dispatches)+",\"dispatchSuccess\":"+std::to_string(successes)+",\"collecting\":"+std::to_string(collecting)+",\"realPresentSuccesses\":"+std::to_string(realPresents));
     }
     void destroyImage(Image& i){if(i.framebuffer)vkDestroyFramebuffer(device,i.framebuffer,nullptr);if(i.view)vkDestroyImageView(device,i.view,nullptr);if(i.image)vkDestroyImage(device,i.image,nullptr);if(i.memory)vkFreeMemory(device,i.memory,nullptr);i={};}
     void cleanup(){
@@ -531,26 +585,38 @@ struct Trial {
           << ",\"probe\":\"synthetic_ai_system_surface\",\"pid\":" << getpid()
           << ",\"requestedVulkanApiVersion\":" << VK_API_VERSION_1_3 << ",\"loaderApiVersion\":" << loaderApiVersion << ",\"physicalApiVersion\":" << physicalApiVersion
           << ",\"phase\":" << quote(phase) << ",\"error\":" << quote(error)
+          << ",\"modelAliasAudit\":" << modelAliasAudit << ",\"modelAliasRestoreErrno\":" << modelAliasRestoreErrno
           << ",\"geometryRequested\":" << boolean(geometryRequested) << ",\"geometryQualificationPassed\":" << boolean(geometryQualificationPassed)
           << ",\"geometrySceneDestroyed\":" << boolean(geometrySceneDestroyed) << ",\"pendingGraphRetainedForProcessLifetime\":" << boolean(retainPendingGraph)
           << ",\"geometryWindowReferenceRetained\":" << boolean(geometryWindowReference) << ",\"aiDepthInputProvided\":false"
           << ",\"uiPredictionRequested\":" << boolean(uiPredictionRequested)
           << ",\"uiPredictionConfigured\":" << boolean(uiPredictionConfigured) << ",\"uiPredictionSetResult\":" << (uiPredictionConfigured?std::to_string(uiPredictionResult):"null")
-          << ",\"uiPredictionExplicitlyDisabled\":" << boolean(uiPredictionDisabled) << ",\"swapchainUsage\":\"TRANSFER_DST|COLOR_ATTACHMENT\""
+          << ",\"uiPredictionExplicitlyDisabled\":" << boolean(uiPredictionDisabled)
+          << ",\"swapchainSampledRequested\":" << boolean(swapchainSampledRequested) << ",\"swapchainSampledEnabled\":" << boolean((swapchainActualUsageFlags&VK_IMAGE_USAGE_SAMPLED_BIT)!=0)
+          << ",\"swapchainSupportedUsageFlags\":" << swapchainSupportedUsageFlags << ",\"swapchainRequestedUsageFlags\":" << swapchainRequestedUsageFlags << ",\"swapchainActualUsageFlags\":" << swapchainActualUsageFlags
+          << ",\"swapchainUsage\":" << quote(!swapchainActualUsageFlags?"not_created":(swapchainActualUsageFlags&VK_IMAGE_USAGE_SAMPLED_BIT)?"TRANSFER_DST|COLOR_ATTACHMENT|SAMPLED":"TRANSFER_DST|COLOR_ATTACHMENT")
+          << ",\"finalDepthStateRequested\":" << boolean(finalDepthStateRequested) << ",\"finalDepthStateProvided\":" << boolean(finalDepthStateProvided)
+          << ",\"finalDepthTestEnabled\":false,\"finalDepthWriteEnabled\":false,\"finalDepthBoundsTestEnabled\":false,\"finalStencilTestEnabled\":false"
           << ",\"finalPresentationPath\":" << quote(finalPassCreated?"qualified_geometry_fullscreen_sampled_color":geometryRequested?"geometry_final_pass_not_prepared":"transfer_blit_with_independent_real_acquire_fence")
           << ",\"finalTriangleVertexCount\":" << (finalPassCreated?3:0) << ",\"finalColorRenderpassResourcesCreated\":" << boolean(finalPassCreated) << ",\"finalDrawsRecorded\":" << finalDrawsRecorded
           << ",\"sdkOutputImageRegistered\":false,\"dispatchOutputInfoZero\":true"
           << ",\"fgEnabled\":" << boolean(enabled) << ",\"sourceResolution\":[1202,800],\"swapchainResolution\":[" << extent.width << ',' << extent.height << ']'
-          << ",\"sourceTargetHz\":30,\"elapsedSeconds\":" << elapsed << ",\"renderElapsedSeconds\":" << renderElapsed
+          << ",\"sourceTargetHz\":" << sourceFps << ",\"requestedOutputTargetHz\":" << requestedTargetFps
+          << ",\"targetFpsSetCalled\":" << boolean(targetFpsConfigured) << ",\"targetFpsSetResult\":" << (targetFpsConfigured?std::to_string(targetFpsResult):"null")
+          << ",\"targetFpsDocumentedEffectAfterFirstRelease\":true,\"effectiveOutputTargetHz\":null"
+          << ",\"targetFpsEffectLimitation\":\"Public SetTargetFps takes effect after the game's first release; setter success does not establish its effect for a sideloaded package.\""
+          << ",\"fusionAwareMetadata\":" << quote(fusionAwareMetadata) << ",\"systemPresentationMetadataSatisfied\":" << boolean(fusionAwareMetadata=="Vulkan")
+          << ",\"motionClock\":\"steady_clock\",\"barSpeedPixelsPerSecond\":360,\"geometryMotionPeriodSeconds\":4"
+          << ",\"elapsedSeconds\":" << elapsed << ",\"renderElapsedSeconds\":" << renderElapsed
           << ",\"sourceSubmitRateHz\":" << (renderElapsed>0?frames/renderElapsed:0)
           << ",\"sourceRecordApiWallNs\":" << sourceRecordNs << ",\"dispatchApiWallNs\":" << dispatchNs
           << ",\"realPresentApiWallNs\":" << presentNs << ",\"acquireApiWallNs\":" << acquireNs << ",\"fenceWaitApiWallNs\":" << fenceNs
           << ",\"acquireFenceWaitApiWallNs\":" << acquireFenceWaitNs << ",\"acquireFenceWaits\":" << acquireFenceWaits << ",\"acquireFenceResets\":" << acquireFenceResets << ",\"acquireFenceStatusAfterFirstPresents\":" << (realPresents?std::to_string(acquireFenceStatusAfterPresent):"null")
           << ",\"sourceFrames\":" << frames << ",\"realPresentSuccesses\":" << realPresents << ",\"dispatchCalls\":" << dispatches
           << ",\"dispatchSuccessReturns\":" << successes << ",\"collectingReturns\":" << collecting
-          << ",\"stoppedEarly\":" << boolean(stop.load()) << ",\"requestedSourceFrames\":" << seconds*FPS
+          << ",\"stoppedEarly\":" << boolean(stop.load()) << ",\"requestedSourceFrames\":" << seconds*sourceFps
           << ",\"generatedFramesVerified\":null,\"displayFpsVerified\":null,\"sourceTimesTwoIsNotEvidence\":true"
-          << ",\"completeTeardown\":" << boolean(teardownComplete) << ",\"libraryUnloaded\":false,\"libraryRetainedForProcessLifetime\":true,\"publicLibraryIntegration\":\"ELF_DT_NEEDED_direct_symbols\",\"lateDlopenCalled\":false,\"normalGameStarted\":false"
+          << ",\"completeTeardown\":" << boolean(teardownComplete) << ",\"libraryUnloaded\":false,\"libraryRetainedForProcessLifetime\":true,\"publicLibraryIntegration\":\"ELF_DT_NEEDED_direct_symbols\",\"lateFgDlopenCalled\":false,\"normalGameStarted\":false"
           << ",\"validationErrorsObserved\":" << (callbackInstalled?std::to_string(validationErrors.load()):"null")
           << ",\"validationWarningsObserved\":" << (callbackInstalled?std::to_string(validationWarnings.load()):"null")
           << ",\"validationCallbackInstalled\":" << boolean(callbackInstalled) << ",\"validationLayerEnabled\":" << boolean(validationEnabled)
@@ -562,27 +628,295 @@ struct Trial {
           << ",\"observationScope\":\"Real synthetic color rendering, optional no-depth AI Dispatch and real Vulkan swapchain presentation. Timings are CPU API wall durations, not GPU or scanout timings. Source, Dispatch and real present API counts do not verify generated/display frames. Public library retained for process lifetime.\"}";
         return r.str();
     }
-    std::string run(){try{setup();started=std::chrono::steady_clock::now();for(uint32_t i=0;i<seconds*FPS && !stop.load();++i){std::this_thread::sleep_until(started+std::chrono::nanoseconds(1'000'000'000ULL*i/FPS));if(stop.load())break;frame();}finished=true;}catch(const std::exception& e){error=e.what();try{trace("error","\"detail\":"+quote(error));}catch(...) {}}
+    bool waitForNativeDebugger() {
+        // The marker is fixed inside this app's filesDir. No caller-supplied
+        // debugger path or GPU resource is used before this bounded wait.
+        const std::string marker=directory+"/../fg-debug-wait";
+        if(access(marker.c_str(),F_OK)!=0)return !stop.load();
+        const auto waitStart=std::chrono::steady_clock::now();
+        const auto deadline=waitStart+std::chrono::seconds(30);
+        trace("waiting-for-native-debugger","\"marker\":"+quote(marker)+",\"maxWaitMs\":30000,\"pollIntervalMs\":50,\"gpuResourcesCreated\":false");
+        std::string reason;int markerError=0;
+        while(true){
+            if(stop.load()){reason="stop_requested";break;}
+            errno=0;
+            if(access(marker.c_str(),F_OK)!=0){markerError=errno;reason=markerError==ENOENT?"marker_removed":"marker_unavailable";break;}
+            const auto now=std::chrono::steady_clock::now();
+            if(now>=deadline){reason="timeout";break;}
+            std::this_thread::sleep_until(std::min(deadline,now+std::chrono::milliseconds(50)));
+        }
+        const auto elapsedMs=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-waitStart).count();
+        trace("native-debugger-wait-ended","\"reason\":"+quote(reason)+",\"waitedMs\":"+std::to_string(elapsedMs)+",\"markerErrno\":"+std::to_string(markerError)+",\"stopRequested\":"+boolean(stop.load())+",\"gpuResourcesCreated\":false");
+        return !stop.load();
+    }
+    std::string run(){
+        std::unique_ptr<muguet::fg_probe::ModelAliasScope> alias;
+        auto restoreAlias=[&] {
+            if(!alias)return;
+            modelAliasRestoreErrno=alias->restore();
+            if(modelAliasRestoreErrno){if(!error.empty())error+="; ";error+="cwd restoration failed errno="+std::to_string(modelAliasRestoreErrno);}
+            try{trace("model-alias-cwd-restored","\"restoreErrno\":"+std::to_string(modelAliasRestoreErrno));}catch(...){}
+        };
+        try{
+            if(waitForNativeDebugger()&&!stop.load()){
+                alias=std::make_unique<muguet::fg_probe::ModelAliasScope>(directory+"/..");
+                modelAliasAudit=alias->prepareIfRequested();
+                trace("model-alias-preparation","\"audit\":"+modelAliasAudit);
+                if(modelAliasAudit.find("\"status\":\"failed\"")!=std::string::npos)
+                    throw std::runtime_error("model path adaptation failed; see modelAliasAudit");
+                setup();started=std::chrono::steady_clock::now();
+                for(uint32_t i=0;i<seconds*sourceFps&&!stop.load();++i){
+                    std::this_thread::sleep_until(started+std::chrono::nanoseconds(muguet::fg_probe::sourceDeadlineNs(i,sourceFps)));
+                    if(stop.load())break;frame();
+                }
+            }
+            finished=true;
+        }catch(const std::exception& e){error=e.what();try{trace("error","\"detail\":"+quote(error));}catch(...) {}}
         if(started.time_since_epoch().count())renderElapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
-        if(retainPendingGraph){try{trace("qualification-pending-graph-retained","\"forceStopRequired\":true,\"cleanupSkipped\":true");}catch(...){}auto r=result();save(directory+"/result.json",r+'\n');return r;}
-        try{cleanup();}catch(const std::exception& e){if(geometryRequested&&geometryScene)retainPendingGraph=true;if(!error.empty())error+="; ";error+=std::string("teardown: ")+e.what();}try{trace("before-library-retire","\"willDlclose\":false");trace("after-library-retire","\"retainedForProcessLifetime\":true");}catch(const std::exception& e){error+=std::string("; trace: ")+e.what();}auto r=result();save(directory+"/result.json",r+'\n');return r;}
+        if(retainPendingGraph){restoreAlias();try{trace("qualification-pending-graph-retained","\"forceStopRequired\":true,\"cleanupSkipped\":true");}catch(...){}auto r=result();save(directory+"/result.json",r+'\n');return r;}
+        try{cleanup();}catch(const std::exception& e){if(geometryRequested&&geometryScene)retainPendingGraph=true;if(!error.empty())error+="; ";error+=std::string("teardown: ")+e.what();}
+        restoreAlias();
+        try{trace("before-library-retire","\"willDlclose\":false");trace("after-library-retire","\"retainedForProcessLifetime\":true");}catch(const std::exception& e){error+=std::string("; trace: ")+e.what();}auto r=result();save(directory+"/result.json",r+'\n');return r;}
 };
 struct Engine {
     std::mutex mutex,shutdownMutex;std::thread worker;std::atomic<bool> stop{false};OHNativeWindow* window=nullptr;
-    std::string directory,latest="{\"status\":\"not_started\"}";bool configured=false,enabled=true,uiPrediction=false,geometry=false,started=false;uint32_t seconds=20;
+    std::string directory,latest="{\"status\":\"not_started\"}",fusionAwareMetadata="unavailable";bool configured=false,enabled=true,uiPrediction=false,geometry=false,swapchainSampled=false,finalDepthState=false,rifeStream=false,started=false;uint32_t seconds=20,sourceFps=muguet::fg_probe::kDefaultSourceFps,targetFps=muguet::fg_probe::kDefaultTargetFps;
     ~Engine(){shutdown();}
-    void startLocked(){if(!configured||!window||started)return;started=true;stop=false;auto w=window;auto path=directory;auto on=enabled;auto ui=uiPrediction;auto useGeometry=geometry;auto duration=seconds;
-        latest="{\"status\":\"running\",\"pid\":"+std::to_string(getpid())+",\"directory\":"+quote(path)+"}";worker=std::thread([this,w,path,on,ui,useGeometry,duration]{auto trial=std::make_unique<Trial>(w,path,on,ui,useGeometry,duration,stop);auto json=trial->run();if(trial->retainPendingGraph){(void)trial.release();}/* Pending graph is intentionally never destroyed; root force-stops this process. */std::lock_guard<std::mutex>lock(mutex);latest=std::move(json);});}
+    void startLocked(){if(!configured||!window||started)return;started=true;stop=false;auto w=window;auto path=directory;auto on=enabled;auto ui=uiPrediction;auto useGeometry=geometry;auto duration=seconds;auto source=sourceFps;auto target=targetFps;auto metadata=fusionAwareMetadata;auto sampled=swapchainSampled;auto depthState=finalDepthState;auto useRife=rifeStream;
+        latest="{\"status\":\"running\",\"pid\":"+std::to_string(getpid())+",\"directory\":"+quote(path)+",\"sourceTargetHz\":"+std::to_string(source)+",\"requestedOutputTargetHz\":"+std::to_string(target)+",\"fusionAwareMetadata\":"+quote(metadata)+",\"swapchainSampledRequested\":"+boolean(sampled)+",\"finalDepthStateRequested\":"+boolean(depthState)+",\"rifeStream\":"+boolean(useRife)+"}";worker=std::thread([this,w,path,on,ui,useGeometry,duration,source,target,metadata,sampled,depthState,useRife]{std::string json;if(useRife){json=muguet::fg_probe::runRifeSurface(w,path,metadata,duration,stop);}else{auto trial=std::make_unique<Trial>(w,path,on,ui,useGeometry,duration,source,target,metadata,sampled,depthState,stop);json=trial->run();if(trial->retainPendingGraph){(void)trial.release();}/* Pending graph is intentionally never destroyed; root force-stops this process. */}std::lock_guard<std::mutex>lock(mutex);latest=std::move(json);});}
     void surface(void* w){std::lock_guard<std::mutex>lock(mutex);if(window)return;window=static_cast<OHNativeWindow*>(w);if(OH_NativeWindow_NativeObjectReference(window)!=0){window=nullptr;latest="{\"status\":\"error\",\"error\":\"native window reference failed\"}";return;}startLocked();}
     void shutdown(){std::lock_guard<std::mutex> serial(shutdownMutex);std::thread joining;{std::lock_guard<std::mutex>lock(mutex);stop=true;joining=std::move(worker);}if(joining.joinable())joining.join();std::lock_guard<std::mutex>lock(mutex);if(window)OH_NativeWindow_NativeObjectUnreference(window);window=nullptr;}
 } engine;
 std::string readString(napi_env env,napi_value v){size_t n=0;if(napi_get_value_string_utf8(env,v,nullptr,0,&n)!=napi_ok||n>4096)return{};std::string s(n+1,'\0');if(napi_get_value_string_utf8(env,v,s.data(),s.size(),&n)!=napi_ok)return{};s.resize(n);return s;}
-napi_value configure(napi_env env,napi_callback_info cb){size_t n=5;napi_value a[5]{};napi_get_cb_info(env,cb,&n,a,nullptr,nullptr);bool on=true,ui=false,geometry=false;double duration=20;uint32_t seconds=20;std::string root=n?readString(env,a[0]):"";bool ok=(n>=3&&n<=5)&&!root.empty()&&napi_get_value_bool(env,a[1],&on)==napi_ok&&napi_get_value_double(env,a[2],&duration)==napi_ok&&std::isfinite(duration)&&duration>=3&&duration<=60&&std::floor(duration)==duration&&(n==3||napi_get_value_bool(env,a[3],&ui)==napi_ok)&&(n<5||napi_get_value_bool(env,a[4],&geometry)==napi_ok);if(ok)seconds=uint32_t(duration);
-    if(ok){std::lock_guard<std::mutex>lock(engine.mutex);ok=!engine.started;if(ok){engine.directory=root+"/graphics-frame-surface-"+std::to_string(getpid());ok=mkdir(engine.directory.c_str(),0700)==0||errno==EEXIST;if(ok){engine.enabled=on;engine.uiPrediction=ui;engine.geometry=geometry;engine.seconds=seconds;engine.configured=true;engine.startLocked();}}}napi_value r;napi_get_boolean(env,ok,&r);return r;}
+struct ModelMetadataWork {
+    napi_async_work work=nullptr;
+    napi_deferred deferred=nullptr;
+    std::string root,result;
+    bool rifeAudit=false;
+    bool npuAudit=false;
+};
+napi_value scheduleDiagnostic(napi_env env,napi_callback_info cb,bool rifeAudit,bool npuAudit=false) {
+    size_t count=1;napi_value args[1]{};
+    napi_get_cb_info(env,cb,&count,args,nullptr,nullptr);
+    auto task=std::make_unique<ModelMetadataWork>();
+    task->rifeAudit=rifeAudit;
+    task->npuAudit=npuAudit;
+    task->root=count?readString(env,args[0]):"";
+    if(task->root.empty()){napi_throw_error(env,nullptr,"Expected own files directory");return nullptr;}
+    napi_value promise=nullptr,name=nullptr;
+    if(napi_create_promise(env,&task->deferred,&promise)!=napi_ok||
+        napi_create_string_utf8(env,npuAudit?"NpuFlowInterpolationAudit":rifeAudit?"RifeInterpolationAudit":"FgModelMetadataAudit",NAPI_AUTO_LENGTH,&name)!=napi_ok){
+        napi_throw_error(env,nullptr,"Cannot create model metadata work");return nullptr;
+    }
+    auto execute=[](napi_env,void* data){
+        auto& work=*static_cast<ModelMetadataWork*>(data);
+        try {work.result=work.npuAudit?muguet::fg_probe::inspectNpuFlowInterpolation(work.root):work.rifeAudit?muguet::fg_probe::inspectRifeInterpolation(work.root):muguet::fg_probe::inspectSystemModelMetadata();}
+        catch(const std::exception& e){work.result="{\"status\":\"error\",\"message\":"+quote(e.what())+"}";}
+        catch(...){work.result="{\"status\":\"error\",\"message\":\"Unknown metadata audit failure\"}";}
+        if(!save(work.root+(work.npuAudit?"/npu-flow-benchmark-result.json":work.rifeAudit?"/rife-benchmark-result.json":"/fg-model-metadata-audit.json"),work.result+'\n'))
+            work.result="{\"status\":\"error\",\"message\":\"Cannot save model metadata audit\"}";
+    };
+    auto complete=[](napi_env environment,napi_status status,void* data){
+        std::unique_ptr<ModelMetadataWork> work(static_cast<ModelMetadataWork*>(data));
+        napi_value result=nullptr;
+        const std::string output=status==napi_ok?work->result:"{\"status\":\"cancelled\"}";
+        napi_create_string_utf8(environment,output.c_str(),output.size(),&result);
+        napi_resolve_deferred(environment,work->deferred,result);
+        napi_delete_async_work(environment,work->work);
+    };
+    if(napi_create_async_work(env,nullptr,name,execute,complete,task.get(),&task->work)!=napi_ok){
+        napi_throw_error(env,nullptr,"Cannot create model metadata work");return nullptr;
+    }
+    if(napi_queue_async_work(env,task->work)!=napi_ok){
+        napi_delete_async_work(env,task->work);napi_throw_error(env,nullptr,"Cannot queue model metadata work");return nullptr;
+    }
+    task.release();return promise;
+}
+napi_value inspectModelMetadata(napi_env env,napi_callback_info cb){return scheduleDiagnostic(env,cb,false);}
+napi_value inspectRife(napi_env env,napi_callback_info cb){return scheduleDiagnostic(env,cb,true);}
+napi_value inspectNpuFlow(napi_env env,napi_callback_info cb){return scheduleDiagnostic(env,cb,false,true);}
+constexpr char modelPathScope[]="known_IsSupported_check_paths_not_confirmed_core_initialization_failure_paths";
+std::string inspectCapabilityModelPaths() {
+    // These fixed filenames come from the inspected public NDK capability
+    // check. A successful metadata/open check does not load or validate a model,
+    // and does not identify the filename in the core's canonicalPath failure.
+    constexpr const char* paths[]={
+        "/sys_prod/etc/graphics_game/ai_model/aifi1.om",
+        "/sys_prod/etc/graphics_game/ai_model/aifi2.om"
+    };
+    constexpr const char* directories[]={
+        "/sys_prod/etc/graphics_game/ai_model",
+        "/system/etc/graphics_game/AIModel"
+    };
+    char cwd[4096]{};errno=0;
+    const bool cwdSucceeded=getcwd(cwd,sizeof(cwd))!=nullptr;
+    const int cwdError=cwdSucceeded?0:errno;
+    std::ostringstream out;
+    out<<"{\"pid\":"<<getpid()<<",\"pathScope\":"<<quote(modelPathScope)
+       <<",\"operations\":\"stat_realpath_open_readonly_cloexec_close_fixed_directory_names_getcwd_only\",\"modelBytesRead\":0,\"modelReadyVerified\":false"
+       <<",\"getcwdBufferBytes\":"<<sizeof(cwd)<<",\"getcwdSucceeded\":"<<boolean(cwdSucceeded)<<",\"getcwdReturn\":";
+    if(cwdSucceeded)out<<quote(cwd);else out<<"null";
+    out<<",\"getcwdErrno\":"<<cwdError<<",\"paths\":[";
+    bool first=true;
+    for(const char* path:paths){
+        struct stat metadata{};errno=0;
+        const int statResult=stat(path,&metadata);
+        const int statError=statResult<0?errno:0;
+        errno=0;char* canonical=realpath(path,nullptr);
+        const bool canonicalSucceeded=canonical!=nullptr;
+        const int canonicalError=canonicalSucceeded?0:errno;
+        const std::string canonicalPath=canonicalSucceeded?canonical:"";
+        std::free(canonical);
+        errno=0;const int fd=open(path,O_RDONLY|O_CLOEXEC);
+        const int openError=fd<0?errno:0;
+        int closeResult=0,closeError=0;
+        if(fd>=0){errno=0;closeResult=close(fd);closeError=closeResult<0?errno:0;}
+        if(!first)out<<',';first=false;
+        out<<"{\"path\":"<<quote(path)<<",\"statReturn\":"<<statResult<<",\"statErrno\":"<<statError<<",\"sizeBytes\":";
+        if(statResult==0)out<<metadata.st_size;else out<<"null";
+        out<<",\"realpathSucceeded\":"<<boolean(canonicalSucceeded)<<",\"canonicalPath\":";
+        if(canonicalSucceeded)out<<quote(canonicalPath);else out<<"null";
+        out<<",\"realpathErrno\":"<<canonicalError<<",\"openFlags\":\"O_RDONLY|O_CLOEXEC\",\"openReturn\":"<<fd<<",\"openErrno\":"<<openError
+           <<",\"closeReturn\":";
+        if(fd>=0)out<<closeResult;else out<<"null";
+        out<<",\"closeErrno\":";
+        if(fd>=0)out<<closeError;else out<<"null";
+        out<<'}';
+    }
+    out<<"],\"directoryScope\":\"fixed_Core_whitelist_directories_names_only_no_recursion\",\"directoryEntryLimit\":64,\"directories\":[";
+    first=true;
+    for(const char* path:directories){
+        errno=0;DIR* directoryHandle=opendir(path);
+        const bool opened=directoryHandle!=nullptr;
+        const int openError=opened?0:errno;
+        if(!first)out<<',';first=false;
+        out<<"{\"path\":"<<quote(path)<<",\"opendirSucceeded\":"<<boolean(opened)<<",\"opendirErrno\":"<<openError<<",\"entries\":[";
+        uint32_t count=0;int readError=0,closeResult=0,closeError=0;
+        bool reachedEnd=false;
+        if(opened){
+            while(count<64){
+                errno=0;dirent* entry=readdir(directoryHandle);
+                if(!entry){readError=errno;reachedEnd=readError==0;break;}
+                if(std::strcmp(entry->d_name,".")==0||std::strcmp(entry->d_name,"..")==0)continue;
+                if(count++)out<<',';
+                out<<"{\"name\":"<<quote(entry->d_name)<<",\"dtype\":"<<unsigned(entry->d_type)<<'}';
+            }
+            errno=0;closeResult=closedir(directoryHandle);closeError=closeResult<0?errno:0;
+        }
+        out<<"],\"entryCount\":"<<count<<",\"entryLimitReached\":"<<boolean(count==64)<<",\"readdirReachedEnd\":"<<boolean(reachedEnd)<<",\"readdirErrno\":";
+        if(opened)out<<readError;else out<<"null";
+        out<<",\"closedirReturn\":";
+        if(opened)out<<closeResult;else out<<"null";
+        out<<",\"closedirErrno\":";
+        if(opened)out<<closeError;else out<<"null";
+        out<<'}';
+    }
+    out<<"]}";return out.str();
+}
+napi_value inspectPublicInterfaces(napi_env env,napi_callback_info cb) {
+    size_t count=1; napi_value args[1]{};
+    napi_get_cb_info(env,cb,&count,args,nullptr,nullptr);
+    const std::string root=count?readString(env,args[0]):"";
+    const std::string modelAudit=inspectCapabilityModelPaths();
+    const bool modelAuditPersisted=!root.empty()&&save(root+"/fg-model-access-audit.json",modelAudit+'\n');
+    const bool syscap=canIUse("SystemCapability.GraphicsGame.RenderAccelerate");
+    struct Feature { FG_FeatureType value; const char* name; } features[] = {
+        {INTERPOLATION_GPU_GLES,"INTERPOLATION_GPU_GLES"},
+        {INTERPOLATION_GPU_VULKAN,"INTERPOLATION_GPU_VULKAN"},
+        {EXTRAPOLATION_GPU_GLES,"EXTRAPOLATION_GPU_GLES"},
+        {EXTRAPOLATION_GPU_VULKAN,"EXTRAPOLATION_GPU_VULKAN"},
+        {INTERPOLATION_AI_VULKAN,"INTERPOLATION_AI_VULKAN"}
+    };
+    FG api;api.load();
+    struct Symbol { const char* name; void* address; };
+    const Symbol symbols[]={
+        {"HMS_FG_IsFrameGenerationSupported",reinterpret_cast<void*>(api.supported)},
+        {"HMS_FG_CreateContext_VK",reinterpret_cast<void*>(api.create)},
+        {"HMS_FG_SetAlgorithmMode_VK",reinterpret_cast<void*>(api.algorithm)},
+        {"HMS_FG_SetResolution_VK",reinterpret_cast<void*>(api.resolution)},
+        {"HMS_FG_SetImageFormat_VK",reinterpret_cast<void*>(api.format)},
+        {"HMS_FG_SetIntegrationMode_VK",reinterpret_cast<void*>(api.integration)},
+        {"HMS_FG_SetTargetFps_VK",reinterpret_cast<void*>(api.targetFps)},
+        {"HMS_FG_SetUiPredictionEnabled_VK",reinterpret_cast<void*>(api.uiPrediction)},
+        {"HMS_FG_Activate_VK",reinterpret_cast<void*>(api.activate)},
+        {"HMS_FG_IsActive_VK",reinterpret_cast<void*>(api.isActive)},
+        {"HMS_FG_CreateImage_VK",reinterpret_cast<void*>(api.image)},
+        {"HMS_FG_Dispatch_VK",reinterpret_cast<void*>(api.dispatch)},
+        {"HMS_FG_DestroyImage_VK",reinterpret_cast<void*>(api.destroyImage)},
+        {"HMS_FG_Deactivate_VK",reinterpret_cast<void*>(api.deactivate)},
+        {"HMS_FG_DestroyContext_VK",reinterpret_cast<void*>(api.destroy)}
+    };
+    std::ostringstream out;
+    out<<"{\"pid\":"<<getpid()<<",\"scope\":\"public_interfaces_only_no_Vulkan_context_or_surface_created\",\"pathScope\":"<<quote(modelPathScope)
+       <<",\"modelAccessAuditFile\":\"fg-model-access-audit.json\",\"modelAccessAuditPersisted\":"<<boolean(modelAuditPersisted)
+       <<",\"renderAccelerateSyscap\":"<<boolean(syscap)<<",\"features\":[";
+    bool first=true;
+    for(const auto& feature:features){
+        if(!first)out<<',';first=false;
+        out<<"{\"name\":"<<quote(feature.name)<<",\"enumValue\":"<<int(feature.value)<<",\"supported\":";
+        if(syscap)out<<boolean(HMS_FG_IsFrameGenerationSupported(feature.value));else out<<"null";
+        out<<'}';
+    }
+    out<<"],\"publicSymbols\":[";first=true;
+    for(const auto& symbol:symbols){
+        const char* name=symbol.name;
+        if(!first)out<<',';first=false;
+        void* address=symbol.address;Dl_info owner{};
+        const bool resolved=address&&dladdr(address,&owner)!=0;
+        out<<"{\"name\":"<<quote(name)<<",\"available\":"<<boolean(address!=nullptr)
+           <<",\"binding\":\"direct_ELF_dependency\",\"globalLookupVisible\":"<<boolean(dlsym(RTLD_DEFAULT,name)!=nullptr)
+           <<",\"library\":"<<quote(resolved&&owner.dli_fname?owner.dli_fname:"")
+           <<",\"relativeAddress\":";
+        if(resolved&&owner.dli_fbase)out<<reinterpret_cast<uintptr_t>(address)-reinterpret_cast<uintptr_t>(owner.dli_fbase);else out<<"null";
+        out<<'}';
+    }
+    out<<"],\"modelReadyVerified\":false,\"generatedFramesVerified\":null}";
+    std::string result=out.str();
+    if(root.empty()||!save(root+"/fg-public-interface-audit.json",result+'\n'))
+        result="{\"status\":\"error\",\"reason\":\"Cannot persist public interface audit\"}";
+    napi_value value;napi_create_string_utf8(env,result.c_str(),result.size(),&value);return value;
+}
+napi_value configure(napi_env env,napi_callback_info cb) {
+    size_t n=12; napi_value a[12]{};
+    const bool read=napi_get_cb_info(env,cb,&n,a,nullptr,nullptr)==napi_ok;
+    bool on=true,ui=false,geometry=false,sampled=false,depthState=false,rife=false;
+    double duration=20,source=muguet::fg_probe::kDefaultSourceFps,target=muguet::fg_probe::kDefaultTargetFps;
+    std::string root=n?readString(env,a[0]):"",metadata="unavailable";
+    bool ok=read&&n>=3&&n<=11&&!root.empty()&&
+        napi_get_value_bool(env,a[1],&on)==napi_ok&&
+        napi_get_value_double(env,a[2],&duration)==napi_ok&&std::isfinite(duration)&&duration>=3&&duration<=60&&std::floor(duration)==duration&&
+        (n<4||napi_get_value_bool(env,a[3],&ui)==napi_ok)&&
+        (n<5||napi_get_value_bool(env,a[4],&geometry)==napi_ok)&&
+        (n<6||napi_get_value_double(env,a[5],&source)==napi_ok)&&
+        (n<7||napi_get_value_double(env,a[6],&target)==napi_ok)&&
+        (n<9||napi_get_value_bool(env,a[8],&sampled)==napi_ok)&&
+        (n<10||napi_get_value_bool(env,a[9],&depthState)==napi_ok)&&
+        (n<11||napi_get_value_bool(env,a[10],&rife)==napi_ok)&&
+        muguet::fg_probe::validFrameRates(source,target,on)&&
+        (!rife||(!on&&!ui&&!geometry&&source==15&&target==30));
+    if(ok&&n>=8){metadata=readString(env,a[7]);ok=!metadata.empty();}
+    {
+        std::lock_guard<std::mutex>lock(engine.mutex);
+        if(engine.started)ok=false;
+        else if(!ok)engine.latest="{\"status\":\"configuration_error\",\"error\":\"Expected files directory, boolean FG, integer seconds 3..60, optional boolean UI/geometry, integer source FPS 15..60 and output target FPS 30..144, metadata string, boolean swapchain sampling and boolean final depth state; enabled FG requires source < target.\"}";
+        else {
+            engine.directory=root+"/graphics-frame-surface-"+std::to_string(getpid());
+            ok=mkdir(engine.directory.c_str(),0700)==0||errno==EEXIST;
+            if(ok){
+                engine.enabled=on;engine.uiPrediction=ui;engine.geometry=geometry;engine.seconds=uint32_t(duration);
+                engine.swapchainSampled=sampled;engine.finalDepthState=depthState;engine.rifeStream=rife;
+                engine.sourceFps=uint32_t(source);engine.targetFps=uint32_t(target);engine.fusionAwareMetadata=metadata;engine.configured=true;
+                engine.latest="{\"status\":\"configured\",\"sourceTargetHz\":"+std::to_string(engine.sourceFps)+",\"requestedOutputTargetHz\":"+std::to_string(engine.targetFps)+",\"fusionAwareMetadata\":"+quote(metadata)+",\"swapchainSampledRequested\":"+(sampled?"true":"false")+",\"finalDepthStateRequested\":"+(depthState?"true":"false")+"}";
+                engine.startLocked();
+            }else engine.latest="{\"status\":\"configuration_error\",\"error\":\"Cannot create independent probe result directory.\"}";
+        }
+    }
+    napi_value r;napi_get_boolean(env,ok,&r);return r;
+}
 napi_value status(napi_env env,napi_callback_info){std::lock_guard<std::mutex>lock(engine.mutex);napi_value r;napi_create_string_utf8(env,engine.latest.c_str(),engine.latest.size(),&r);return r;}
 napi_value shutdown(napi_env env,napi_callback_info){engine.shutdown();napi_value r;napi_get_undefined(env,&r);return r;}
 void created(OH_NativeXComponent*,void* w){engine.surface(w);}void changed(OH_NativeXComponent*,void*){}void destroyed(OH_NativeXComponent*,void*){engine.shutdown();}void touch(OH_NativeXComponent*,void*){}
-napi_value init(napi_env env,napi_value exports){napi_property_descriptor p[]={{"configure",nullptr,configure,nullptr,nullptr,nullptr,napi_default,nullptr},{"status",nullptr,status,nullptr,nullptr,nullptr,napi_default,nullptr},{"stop",nullptr,shutdown,nullptr,nullptr,nullptr,napi_default,nullptr}};napi_define_properties(env,exports,3,p);
+napi_value init(napi_env env,napi_value exports){napi_property_descriptor p[]={{"configure",nullptr,configure,nullptr,nullptr,nullptr,napi_default,nullptr},{"status",nullptr,status,nullptr,nullptr,nullptr,napi_default,nullptr},{"stop",nullptr,shutdown,nullptr,nullptr,nullptr,napi_default,nullptr},{"inspectPublicInterfaces",nullptr,inspectPublicInterfaces,nullptr,nullptr,nullptr,napi_default,nullptr},{"inspectModelMetadata",nullptr,inspectModelMetadata,nullptr,nullptr,nullptr,napi_default,nullptr},{"inspectRife",nullptr,inspectRife,nullptr,nullptr,nullptr,napi_default,nullptr},{"inspectNpuFlow",nullptr,inspectNpuFlow,nullptr,nullptr,nullptr,napi_default,nullptr}};napi_define_properties(env,exports,7,p);
     napi_value object=nullptr;OH_NativeXComponent* xc=nullptr;if(napi_get_named_property(env,exports,OH_NATIVE_XCOMPONENT_OBJ,&object)==napi_ok&&napi_unwrap(env,object,reinterpret_cast<void**>(&xc))==napi_ok&&xc){static OH_NativeXComponent_Callback callbacks{created,changed,destroyed,touch};OH_NativeXComponent_RegisterCallback(xc,&callbacks);}return exports;}
 napi_module module={1,0,nullptr,init,"graphics_frame_surface",nullptr,{0}};
 __attribute__((constructor)) void registerModule(){napi_module_register(&module);}

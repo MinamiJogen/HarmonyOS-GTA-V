@@ -36,7 +36,9 @@ const DEFAULT_CONFIG: &str = r#"{
   "readback_pool": false,
   "luminance_no_zero": false,
   "spatial_upscale_mode": "off",
+  "spatial_upscale_enabled": true,
   "spatial_upscale_sharpness": 0.2,
+  "frame_interpolation_enabled": true,
   "multiplayer": false,
   "host": false,
   "server": "",
@@ -81,13 +83,33 @@ struct DisplaySettings {
     resolution: Option<(u32, u32)>,
     scale: f64,
     fps_limit: f64,
+    frame_interpolation_enabled: bool,
 }
 
 static DISPLAY_SETTINGS: Mutex<DisplaySettings> = Mutex::new(DisplaySettings {
     resolution: None,
     scale: 0.4,
     fps_limit: 30.0,
+    frame_interpolation_enabled: true,
 });
+
+/// Missing switches preserve existing opt-in modes/markers. Invalid values do
+/// not accidentally enable processing; these are booleans, not truthy strings.
+pub(crate) fn processing_enabled(cfg: &serde_json::Value, key: &str) -> bool {
+    cfg.get(key).map_or(true, |value| value.as_bool().unwrap_or(false))
+}
+
+/// Explicit app settings can select the default NPU backend without a legacy
+/// diagnostic marker. Missing settings retain the original marker-only opt-in.
+pub(crate) fn select_interpolation_backend(
+    cfg: &serde_json::Value, npu_marker: bool, rife_marker: bool,
+) -> Option<&'static str> {
+    if !processing_enabled(cfg, "frame_interpolation_enabled") { return None; }
+    if npu_marker { Some("npu") }
+    else if rife_marker { Some("rife") }
+    else if cfg.get("frame_interpolation_enabled").and_then(|value| value.as_bool()) == Some(true) { Some("npu") }
+    else { None }
+}
 
 fn parse_resolution(value: &str) -> Option<(u32, u32)> {
     let (w, h) = value.trim().split_once('x')?;
@@ -105,7 +127,8 @@ fn configure_display(cfg: &serde_json::Value) {
     let fps_limit = env_number("MUGUET_FPS").or_else(|| number("fps_limit")).unwrap_or(30.0);
     // Do not export JSON values to the environment: a later setup must read the
     // current file rather than mistake values from a previous setup for overrides.
-    *DISPLAY_SETTINGS.lock().unwrap() = DisplaySettings { resolution, scale, fps_limit };
+    let frame_interpolation_enabled = processing_enabled(cfg, "frame_interpolation_enabled");
+    *DISPLAY_SETTINGS.lock().unwrap() = DisplaySettings { resolution, scale, fps_limit, frame_interpolation_enabled };
 }
 
 /// Explicit resolution takes precedence over scale. Both paths retain the OHOS
@@ -124,6 +147,10 @@ pub(crate) fn render_size(width: u32, height: u32) -> (u32, u32) {
 
 pub(crate) fn fps_target() -> f64 {
     DISPLAY_SETTINGS.lock().unwrap().fps_limit
+}
+
+pub(crate) fn frame_interpolation_enabled() -> bool {
+    DISPLAY_SETTINGS.lock().unwrap().frame_interpolation_enabled
 }
 
 /// Explicit opt-in for the synchronous-submit compatibility diagnostic.
@@ -320,7 +347,9 @@ fn settings(cfg_path: &Path) -> Vec<String> {
 }
 
 fn fix_settings(texture_quality: Option<i64>, no_msaa: bool) {
-    let path = support_dir().join("saves/userdata/Documents/Rockstar Games/GTA V/settings.xml");
+    let fs_root = std::env::var_os("MUGUET_FSROOT").map(PathBuf::from)
+        .unwrap_or_else(|| support_dir().join("saves"));
+    let path = fs_root.join("userdata/Documents/Rockstar Games/GTA V/settings.xml");
     let Ok(xml) = std::fs::read_to_string(&path) else { return };
     let mut new = xml.clone();
     let mut set = |tag: &str, fix: &dyn Fn(i64) -> i64| {
@@ -348,5 +377,69 @@ fn fix_settings(texture_quality: Option<i64>, no_msaa: bool) {
     }
     if new != xml {
         let _ = std::fs::write(&path, new.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod processing_switch_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn switches_default_on_and_require_real_booleans() {
+        for key in ["spatial_upscale_enabled", "frame_interpolation_enabled"] {
+            assert!(processing_enabled(&json!({}), key));
+            for value in [json!(false), json!(null), json!("true"), json!(1), json!([]), json!({})] {
+                assert!(!processing_enabled(&json!({key: value}), key));
+            }
+            assert!(processing_enabled(&json!({key: true}), key));
+        }
+    }
+
+    #[test]
+    fn backend_selection_preserves_markers_and_requires_explicit_default_opt_in() {
+        for npu in [false,true] {
+            for rife in [false,true] {
+                let existing = if npu {Some("npu")} else if rife {Some("rife")} else {None};
+                assert_eq!(select_interpolation_backend(&json!({}),npu,rife),existing);
+                assert_eq!(select_interpolation_backend(&json!({"frame_interpolation_enabled":true}),npu,rife),
+                    existing.or(Some("npu")));
+                for value in [json!(false),json!(null),json!("true"),json!(1),json!([]),json!({})] {
+                    assert_eq!(select_interpolation_backend(&json!({"frame_interpolation_enabled":value}),npu,rife),None);
+                }
+                // SR has no role in backend selection, including SR-off/FG-on.
+                assert_eq!(select_interpolation_backend(&json!({"spatial_upscale_enabled":false,
+                    "frame_interpolation_enabled":true}),npu,rife),existing.or(Some("npu")));
+            }
+        }
+    }
+
+    #[test]
+    fn independent_switches_keep_the_same_native_input() {
+        let previous = *DISPLAY_SETTINGS.lock().unwrap();
+        for sr in [false, true] {
+            for fg in [false, true] {
+                let cfg = json!({"spatial_upscale_mode":"native_quality",
+                    "spatial_upscale_enabled":sr, "frame_interpolation_enabled":fg,
+                    // No native window is initialized in a unit-test process.
+                    // Aspect-adaptive sizing has its own physical-size tests.
+                    "spatial_upscale_input_size":[1200,800],"spatial_upscale_output_size":[1620,1080]});
+                configure_display(&cfg);
+                crate::spatial_upscale::configure(&cfg);
+                assert_eq!(render_size(3000,2000),(1200,800), "sr={sr} fg={fg}");
+                assert_eq!(frame_interpolation_enabled(),fg);
+                let status = crate::spatial_upscale::status();
+                assert_eq!(status["enabled"],sr);
+                assert_eq!(status["requested"],sr);
+                assert_eq!(status["mode"],if sr {"native_quality"}else{"off"});
+                assert_eq!(status["nativeRecordedFrames"],0);
+            }
+        }
+        // Legacy explicit mode=off still has no size override and remains off
+        // even though the new processing switches default to true.
+        crate::spatial_upscale::configure(&json!({"spatial_upscale_mode":"off"}));
+        assert_eq!(crate::spatial_upscale::render_size_override(),None);
+        assert_eq!(crate::spatial_upscale::status()["requested"],false);
+        *DISPLAY_SETTINGS.lock().unwrap() = previous;
     }
 }
