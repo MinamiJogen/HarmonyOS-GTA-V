@@ -148,6 +148,12 @@ fn dispatch(mut caller: &mut Caller<'_, HostState>, name: &str, params: &[Val], 
             export_call(&mut caller, "_emscripten_thread_init", &[Val::I64(tb), Val::I32(1), Val::I32(1), Val::I32(1), Val::I64(1_048_576), Val::I32(0)])?;
         }
         "muguet_script" => crate::mp::script_tick(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?,
+        "muguet_virtual_pad" => crate::virtual_pad::apply(mem, int(params, 0) as u64),
+        "muguet_control_read" => crate::fivestar_state::record_control_read(
+            int(params, 0) as u32, int(params, 1) as u32, int(params, 2) as u32,
+            f32::from_bits(int(params, 3) as u32)),
+        "muguet_control_script_read" => crate::fivestar_state::record_script_read(
+            mem, int(params, 0) as u32, int(params, 1) as u64, int(params, 2) != 0),
         "muguet_explosion" => crate::mp::explosion(int(params, 0) as u64),
         "muguet_timewarp" => set_int(results, crate::mp::time_warp(int(params, 0))),
         "muguet_resource_map" => merge_physical_pages(mem, int(params, 0) as u64),

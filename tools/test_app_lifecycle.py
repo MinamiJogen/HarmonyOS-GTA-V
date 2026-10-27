@@ -24,6 +24,8 @@ def main():
     policy_and_api = ffi[start:end]
     harness = r'''
 use std::sync::{Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
+mod status_sampler { pub fn notify() {} }
+mod native_telemetry { pub fn reset_source_window() {} }
 mod gpu {
     pub static SUSPENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub static OCCLUDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

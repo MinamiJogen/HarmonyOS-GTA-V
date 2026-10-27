@@ -17,7 +17,7 @@ const DEFAULT_CONFIG: &str = r#"{
   "scale": 0.4,
   "mouse_sensitivity": 2.0,
   "fullscreen": true,
-  "fps_limit": 30,
+  "fps_limit": 0,
   "start_mode": 2,
   "mute": false,
   "no_astc": false,
@@ -28,8 +28,24 @@ const DEFAULT_CONFIG: &str = r#"{
   "sync_submit": false,
   "gpu_diagnostics": false,
   "cpu_profile": false,
+  "frame_interval_trace": false,
+  "native_benchmark_monitor": false,
   "gpu_profile": false,
   "thread_qos": true,
+  "shared_memory_fastpath": true,
+  "cached_readback": false,
+  "occlusion_pool": false,
+  "subresource_proxies": false,
+  "pipeline_cache": false,
+  "pipeline_cache_read_only": false,
+  "pso_warmup": true,
+  "pso_warmup_read_only": false,
+  "native_render_fastpath": false,
+  "io_handle_lru": false,
+  "inline_upload_borrow": false,
+  "native_command_fastpath": false,
+  "skip_empty_render_prepass": false,
+  "render_prepass_diagnostics": false,
   "depth_reduce_opt": true,
   "depth_reduce_no_zero": true,
   "skip_empty_init_transition": false,
@@ -89,7 +105,7 @@ struct DisplaySettings {
 static DISPLAY_SETTINGS: Mutex<DisplaySettings> = Mutex::new(DisplaySettings {
     resolution: None,
     scale: 0.4,
-    fps_limit: 30.0,
+    fps_limit: 0.0,
     frame_interpolation_enabled: true,
 });
 
@@ -124,7 +140,7 @@ fn configure_display(cfg: &serde_json::Value) {
         .or_else(|| cfg.get("resolution").and_then(|v| v.as_str()).and_then(parse_resolution));
     let scale = env_number("MUGUET_SCALE").filter(|v| *v > 0.0)
         .or_else(|| number("scale").filter(|v| *v > 0.0)).unwrap_or(0.4);
-    let fps_limit = env_number("MUGUET_FPS").or_else(|| number("fps_limit")).unwrap_or(30.0);
+    let fps_limit = env_number("MUGUET_FPS").or_else(|| number("fps_limit")).unwrap_or(0.0);
     // Do not export JSON values to the environment: a later setup must read the
     // current file rather than mistake values from a previous setup for overrides.
     let frame_interpolation_enabled = processing_enabled(cfg, "frame_interpolation_enabled");
@@ -308,6 +324,35 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     crate::cpu_profile::configure(flag("cpu_profile"));
     configure_gpu_profile(flag("gpu_profile"));
     crate::qos::configure(flag("thread_qos"));
+    for (key, environment) in [("frame_interval_trace", "MUGUET_FRAME_INTERVAL_TRACE"),
+        ("cached_readback", "MUGUET_CACHED_READBACK"),
+        ("occlusion_pool", "MUGUET_OCCLUSION_POOL"),
+        ("subresource_proxies", "MUGUET_SUBRESOURCE_PROXIES"),
+        ("pipeline_cache", "MUGUET_PIPELINE_CACHE"),
+        ("pipeline_cache_read_only", "MUGUET_PIPELINE_CACHE_READ_ONLY"),
+        ("pso_warmup_read_only", "MUGUET_PSO_WARMUP_READ_ONLY"),
+        ("native_render_fastpath", "MUGUET_NATIVE_RENDER_FASTPATH"),
+        ("io_handle_lru", "MUGUET_IO_HANDLE_LRU"),
+        ("inline_upload_borrow", "MUGUET_INLINE_UPLOAD_BORROW"),
+        ("native_command_fastpath", "MUGUET_NATIVE_COMMAND_FASTPATH"),
+        ("native_benchmark_monitor", "MUGUET_NATIVE_BENCHMARK_MONITOR"),
+        ("skip_empty_render_prepass", "MUGUET_SKIP_EMPTY_RENDER_PREPASS"),
+        ("render_prepass_diagnostics", "MUGUET_RENDER_PREPASS_DIAGNOSTICS")] {
+        if flag(key) { std::env::set_var(environment, "1"); }
+        else { std::env::remove_var(environment); }
+    }
+    // Default-on bounds caching can be disabled for an otherwise identical
+    // cold-process comparison. Never infer a truthy string as an enabled flag.
+    if cfg.get("shared_memory_fastpath").is_some_and(|value| value.as_bool() != Some(true)) {
+        std::env::set_var("MUGUET_SHARED_MEMORY_FASTPATH", "0");
+    } else {
+        std::env::remove_var("MUGUET_SHARED_MEMORY_FASTPATH");
+    }
+    if cfg.get("pso_warmup").is_some_and(|value| value.as_bool() != Some(true)) {
+        std::env::set_var("MUGUET_PSO_WARMUP", "0");
+    } else {
+        std::env::remove_var("MUGUET_PSO_WARMUP");
+    }
     if flag("depth_reduce_opt") { std::env::set_var("MUGUET_DEPTH_REDUCE_OPT", "1"); }
     else { std::env::remove_var("MUGUET_DEPTH_REDUCE_OPT"); }
     if flag("depth_reduce_no_zero") { std::env::set_var("MUGUET_DEPTH_REDUCE_NO_ZERO", "1"); }
@@ -339,9 +384,9 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     if let Some(extra) = cfg.get("extra_args").and_then(|v| v.as_array()) {
         engine_args.extend(extra.iter().filter_map(|a| a.as_str().map(String::from)));
     }
-    if !engine_args.iter().any(|a| a.to_ascii_lowercase().starts_with("-framequeuelimit")) {
-        engine_args.push("-FrameQueueLimit=3".into());
-    }
+    if fps<=0.0 {crate::engine_args::normalize_unlimited_frame_limit(&mut engine_args);}
+    let frame_queue = crate::engine_args::normalize_frame_queue(&mut engine_args);
+    eprintln!("[config] effective -FrameQueueLimit={frame_queue}; one canonical argument; default 3");
     fix_settings(num("texture_quality").map(|q| q as i64), flag("no_msaa"));
     engine_args
 }

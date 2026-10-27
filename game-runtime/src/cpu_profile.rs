@@ -1,11 +1,16 @@
-//! Opt-in CPU clocks and bounded wall-span aggregates; no GPU work or trace files.
+//! Opt-in CPU clocks, wall aggregates and bounded asynchronous interval tracing.
+//! All timings here describe host work/wait, never GPU execution.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+#[path = "frame_interval_profile.rs"]
+pub(crate) mod frame_intervals;
+use frame_intervals::{Stage as Phase, PHASE_COUNT, PHASE_NAMES};
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 const MAX_THREADS: usize = 128;
-const N: usize = 20;
+const N: usize = 25;
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -13,15 +18,13 @@ pub(crate) enum Metric {
     Commands, DrawSample, ScopeCreate, ScopePop, Submit, Acquire, Present,
     UboWait, Op8Wait, MapPoll, LoopPoll, PipelineCreate, RingWait, PresentTotal, EncoderFinish,
     StageBindGroup, BindingResolve, PackCopy, BindGroupCreate, BindingProbe,
+    Upload, SourcePacing, SourceSnapshot, OutputOther, OutputWait,
 }
 const NAMES: [&str; N] = ["commands", "drawSample64", "scopedCreate", "scopedPop", "queueSubmit",
     "surfaceAcquire", "queuePresent", "uboWait", "guestOp8Wait", "mapPoll", "loopPoll", "pipelineCreate", "ringWait", "presentTotal", "encoderFinish",
-    "stageBindGroupSample64", "bindingResolveSample", "packCopySample", "bindGroupCreate", "bindingProbeOverheadSample"];
-#[derive(Clone, Copy)]
-#[repr(usize)]
-enum Phase { LoopOther, CommandsOther, RingWait, PresentOther, Submit, Acquire, PresentCall, UboWait, Op8Wait, Poll, ResourceCreate, ScopePop, PipelineCreate, EncoderFinish }
-const PHASE_NAMES: [&str; 14] = ["loopOther", "commandsOther", "ringWait", "presentOther", "submit", "acquire", "presentCall", "uboWait", "op8Wait", "poll", "resourceCreate", "scopePop", "pipelineCreate", "encoderFinish"];
-static EXCLUSIVE: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    "stageBindGroupSample64", "bindingResolveSample", "packCopySample", "bindGroupCreate", "bindingProbeOverheadSample",
+    "upload", "sourcePacing", "sourceSnapshot", "outputOther", "outputSlotWait"];
+static EXCLUSIVE: [AtomicU64; PHASE_COUNT] = [const { AtomicU64::new(0) }; PHASE_COUNT];
 struct PhaseState { phase: Phase, since: Instant }
 std::thread_local! { static GPU_PHASE: std::cell::RefCell<Option<PhaseState>> = const { std::cell::RefCell::new(None) }; }
 fn change_phase(next: Option<Phase>, now: Instant) -> Option<Phase> {
@@ -44,6 +47,9 @@ impl Metric {
         Self::MapPoll | Self::LoopPoll => Phase::Poll, Self::PipelineCreate => Phase::PipelineCreate,
         Self::RingWait => Phase::RingWait, Self::PresentTotal => Phase::PresentOther,
         Self::EncoderFinish => Phase::EncoderFinish,
+        Self::Upload => Phase::Upload, Self::SourcePacing => Phase::SourcePacing,
+        Self::SourceSnapshot => Phase::SourceSnapshot, Self::OutputOther => Phase::OutputOther,
+        Self::OutputWait => Phase::OutputWait,
     }) }
 }
 struct Stat { calls: AtomicU64, samples: AtomicU64, ns: AtomicU64, max_ns: AtomicU64 }
@@ -56,27 +62,41 @@ impl Stat {
     }
 }
 static STATS: [Stat; N] = [const { Stat::new() }; N];
-pub(crate) struct Span(Option<(usize, Instant, Option<Phase>)>);
-impl Span { pub(crate) fn is_sampled(&self) -> bool { self.0.is_some() } }
+pub(crate) struct Span {
+    aggregate: Option<(usize, Instant, Option<Phase>)>,
+    interval: Option<frame_intervals::Mark>,
+}
+impl Span {
+    fn empty() -> Self { Self { aggregate:None,interval:None } }
+    pub(crate) fn is_sampled(&self) -> bool { self.aggregate.is_some() }
+}
 impl Drop for Span {
     fn drop(&mut self) {
-        if let Some((i, start, old)) = self.0 {
+        if let Some((i, start, old)) = self.aggregate {
             let now = Instant::now();
             if old.is_some() { change_phase(old, now); }
             STATS[i].record(now.duration_since(start).as_nanos().min(u64::MAX as u128) as u64);
         }
+        if let Some(mark)=self.interval.take() { frame_intervals::leave(mark); }
     }
 }
 #[inline]
 pub(crate) fn span(metric: Metric) -> Span { sampled(metric, 1) }
 #[inline]
-pub(crate) fn span_if(metric: Metric, active: bool) -> Span { if active { span(metric) } else { Span(None) } }
+pub(crate) fn span_if(metric: Metric, active: bool) -> Span { if active { span(metric) } else { Span::empty() } }
 #[inline]
 pub(crate) fn sampled(metric: Metric, every: u64) -> Span {
-    if !ENABLED.load(Ordering::Relaxed) { return Span(None); }
+    let profile=ENABLED.load(Ordering::Relaxed);
+    if !profile && (metric.phase().is_none() || !frame_intervals::enabled()) { return Span::empty(); }
     let i = metric as usize;
-    let n = STATS[i].calls.fetch_add(1, Ordering::Relaxed);
-    Span((n % every == 0).then(|| { let now=Instant::now(); let old=metric.phase().and_then(|phase|change_phase(Some(phase),now)); (i,now,old) }))
+    let aggregate=if profile {
+        let n=STATS[i].calls.fetch_add(1,Ordering::Relaxed);
+        (n % every == 0).then(|| { let now=Instant::now();let old=metric.phase().and_then(|phase|change_phase(Some(phase),now));(i,now,old) })
+    } else {None};
+    // Sampled draw/binding spans remain aggregate-only. No clocks per opcode,
+    // signature allocations or packing observation are enabled by this trace.
+    let interval=if every==1 {metric.phase().and_then(frame_intervals::enter)} else {None};
+    Span {aggregate,interval}
 }
 
 pub(crate) fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) }

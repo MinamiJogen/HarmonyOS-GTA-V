@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "declaredBeforeFirstMeasurement": true,
+  "correctness": "All differential cases, equal single validation-walk counts, expected selection and command-buffer reduction, lifecycle checks must pass.",
+  "primaryFixtures": ["Direct", "Indexed", "StateChanges"],
+  "primaryDrawsPerPass": [32, 256],
+  "requiredMedianImprovementPercent": 3.0,
+  "maximumP95RegressionPercent": 2.0,
+  "maximumFallbackMedianRegressionPercent": 2.0,
+  "minimumRepresentativePassCoveragePercent": 50.0,
+  "minimumRepresentativeDirectDrawCoveragePercent": 50.0,
+  "unknownRepresentativeCoverage": "NO_PROMOTION",
+  "hostCostFailure": "STOP_THIS_PROTOTYPE",
+  "deviceAcceptance": "Only after host and representative coverage gates pass: at least three paired controlled A/B trials, source/native total-frame-time median improves at least 3 percent, p95 regresses no more than 2 percent, same workload and conditions, no correctness or input-latency regression. Driver-call counts alone never pass.",
+  "limits": "NOOP has no real Vulkan/driver management cost. A host cost loss stops this prototype under the conservative offline gate; it does not prove every possible driver or future implementation must lose. No extrapolated driver savings may turn a failed gate into success."
+}

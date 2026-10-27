@@ -5,7 +5,7 @@
     "vendor": "HarmonyOS-GTA-V",
     "versionCode": 1000101,
     "versionName": "1.0.1",
-    "icon": "$media:app_icon_gta5",
+    "icon": "$media:app_icon_gta5_layered",
     "label": "$string:app_name"
   }
 }

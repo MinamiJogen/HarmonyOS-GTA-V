@@ -24,6 +24,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("IsCutsceneActive", "cutscene_commands::CommandIsCutsceneActive()"),
     ("IsLoadingScreenActive", "dlc_commands::CommandCheckIsLoadingScreenActive()"),
     ("SetControlValueNextFrame", "pad_commands::CommandSetControlValueNextFrame(int, int, float)"),
+    ("FiveStarSetMenuPreference", "CPauseMenu::SetMenuPreference(int, int)"),
+    ("FiveStarProfileSettingsSet", "CProfileSettings::Set(CProfileSettings::ProfileSettingId, int)"),
+    ("GetCurrentPedVehicleWeapon", "weapon_commands::CommandGetCurrentPedVehicleWeapon(int, int&)"),
+    ("SetCurrentPedVehicleWeapon", "weapon_commands::CommandSetCurrentPedVehicleWeapon(int, int)"),
     ("IsControlJustPressed", "pad_commands::CommandIsControlJustPressed(int, int)"),
     ("IsPedJumping", "ped_commands::CommandIsPedJumping(int)"),
     ("GetVehicleClass", "vehicle_commands::CommandGetVehicleClass(int)"),
@@ -935,6 +939,7 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
         // Read-only UI observations stay independent of controller activation.
         crate::input::guest_script_tick();
         crate::touch_state::sample(&mut c, thread);
+        fivestar_input_tick(&mut c);
         observe_input_channels(&mut c);
         for (group, control, value) in crate::touch_controls::snapshot() {
             c.touch_control(group, control, value);
@@ -1235,6 +1240,51 @@ fn weapon_name(hash: u32) -> Option<&'static str> {
         ("vehicle_weapon_tank", "tank"), ("weapon_fall", "fall"), ("weapon_fire", "fire"),
     ];
     NAMES.iter().find(|(n, _)| proto::joaat(n) == hash).map(|(_, s)| *s)
+}
+
+/// Five Star's deferred controller actions execute with the current guest
+/// thread/TLS and scratch allocation, never on an ArkUI or NAPI thread.
+fn fivestar_input_tick(c: &mut Cmd) {
+    let (aircraft, targeting) = crate::virtual_pad::take_requests();
+    if let Some(mode) = targeting {
+        c.i("FiveStarSetMenuPreference", &[i(3), i(mode)]);
+        if let Some(profile) = read_u64(c.mem(), 19_571_440).filter(|p| *p != 0) {
+            c.i("FiveStarProfileSettingsSet", &[Val::I64(profile as i64), i(0), i(mode)]);
+        }
+        eprintln!("[fivestar-input] targeting preference requested {mode}; runtime mode remains observable separately");
+    }
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    let sample_trailer = FRAMES.fetch_add(1, Ordering::Relaxed) % 15 == 0;
+    if !aircraft && !sample_trailer { return; }
+    let ped = c.i("PlayerPedId", &[]);
+    if ped == 0 || !c.exists(ped) {
+        if sample_trailer { crate::fivestar_state::set_trailer_attached(false); }
+        return;
+    }
+    if sample_trailer {
+        let vehicle = c.i("GetVehiclePedIsIn", &[i(ped), b(false)]);
+        let attached = vehicle != 0 && vehicle != -1 && c.i("IsVehicleAttachedToTrailer", &[i(vehicle)]) != 0;
+        crate::fivestar_state::set_trailer_attached(attached);
+    }
+    if aircraft {
+        const NAMES: &[&str] = &["VEHICLE_WEAPON_PLAYER_LAZER", "VEHICLE_WEAPON_SPACE_ROCKET",
+            "VEHICLE_WEAPON_PLAYER_BUZZARD", "VEHICLE_WEAPON_PLAYER_SAVAGE",
+            "VEHICLE_WEAPON_PLAYER_BULLET", "VEHICLE_WEAPON_PLANE_ROCKET"];
+        let output = c.ref_arg(0);
+        let found = c.i("GetCurrentPedVehicleWeapon", &[i(ped), output]);
+        let current = read_u32(c.mem(), c.scratch + S_INT).unwrap_or(0);
+        let at = NAMES.iter().position(|name| proto::joaat(name) == current).map(|n| n as i32).unwrap_or(-1);
+        for step in 1..=NAMES.len() as i32 {
+            let next = (at + step + NAMES.len() as i32) % NAMES.len() as i32;
+            if next == at { break; }
+            let name = NAMES[next as usize];
+            if c.i("SetCurrentPedVehicleWeapon", &[i(ped), i(proto::joaat(name) as i32)]) != 0 {
+                eprintln!("[fivestar-input] aircraft weapon {name}, previous=0x{current:x}, found={found}");
+                return;
+            }
+        }
+        eprintln!("[fivestar-input] no other aircraft weapon; current=0x{current:x}, found={found}");
+    }
 }
 
 fn vehicle_mode(c: &mut Cmd, ped: i32, in_car: bool) {

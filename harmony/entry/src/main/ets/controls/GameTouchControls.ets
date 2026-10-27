@@ -1,21 +1,23 @@
 import game from 'libharmony_probe.so';
 import { LengthMetrics } from '@kit.ArkUI';
 import { TouchAction, TouchProfile, DrawerAction, TOUCH_PROFILES, TOUCH_DRAWER_ACTIONS, touchProfile } from './TouchLayout';
-import { TouchInputController, TouchInputSink, TouchVector, joystickVector, taskJoystickVector, touchEventPoints, missingTouchUp, TouchMoveTraceGate, clampTouch } from './TouchInput';
+import { TouchInputController, TouchInputSink, TouchButtonTracker, TouchButtonContact, touchEventPoints, missingTouchUp, TouchMoveTraceGate, clampTouch } from './TouchInput';
 import { TouchStateResolver, TouchResolution } from './TouchState';
-import { touchSlotFrame, TouchFrame, legalJoystickOrigin, prewarmJoystickGeometry } from './TouchGeometry';
+import { touchSlotFrame, TouchFrame, directionButtonFrame } from './TouchGeometry';
 import { TASK_WIDGETS, TaskWidget } from './TaskPadLayout';
 import { TouchFamilySettings, TouchLayoutSettings, TouchSlotAdjustment, adjustedTouchFrame, defaultTouchFamilySettings, touchSettingsFamily, validateTouchSettings, sanitizeTouchFamily } from './TouchSettings';
 import { readTouchPreferences, writeTouchPreferences } from './TouchPreferenceStore';
-import { RawTouchBinding, RawTouchAxis, rawTouchBinding, rawTouchAxis } from './RawTouchBindings';
+import { RawTouchBinding, rawTouchBinding } from './RawTouchBindings';
 import { hasLiteralTouchInput, isDirectTouchAction } from './TouchBindingPolicy';
+import { TouchTraceRing } from './TouchTrace';
+import { DirectionButton, directionButtons } from './DirectionButtons';
 
 interface ControlPointer { id: number; owner: string; binding: string; x: number; y: number; epoch: number; }
 interface GameTouchTraceEntry {
   seq: number; atMs: number; handler: string; phase: string; eventType: number;
   changedCount: number; touchesCount: number; pointId: number; touchX: number; touchY: number;
-  stickX: number; stickY: number; stickPointer: number; lookPointer: number;
-  axisX: string; axisY: string; vectorX: number; vectorY: number;
+  lookPointer: number; heldDirections: string[];
+  axisX: string; axisY: string;
   canPlay: boolean; contextEpoch: number;
 }
 interface GameTouchTrace { seq: number; events: GameTouchTraceEntry[]; lastDown?: GameTouchTraceEntry; }
@@ -46,14 +48,6 @@ export struct GameTouchControls {
   @State private taskVisible: boolean = false;
   @State private manualId: string = '';
   @State private pinnedDetonate: boolean = false;
-  @State private stickActive: boolean = false;
-  @State private stickX: number = 96;
-  @State private stickY: number = 304;
-  @State private knobX: number = 0;
-  @State private knobY: number = 0;
-  @State private taskStickX: number[] = [0, 0];
-  @State private taskStickY: number[] = [0, 0];
-  @State private taskTriggerValues: number[] = [0, 0];
   @State private feedback: string = '';
   @State private buttonOpacity: number = 55;
   @State private lookSensitivity: number = 1;
@@ -76,7 +70,7 @@ export struct GameTouchControls {
     }
   } as TouchInputSink);
   private pointers: ControlPointer[] = [];
-  private stickPointer: number = -1;
+  private buttonTracker: TouchButtonTracker = new TouchButtonTracker();
   private lookPointer: number = -1;
   private lookX: number = 0;
   private lookY: number = 0;
@@ -88,13 +82,12 @@ export struct GameTouchControls {
   private lastTransport: string = '';
   private timer: number = -1;
   private active: boolean = false;
+  @StorageLink('gameTouchTraceEnabled') @Watch('onTraceEnabledChanged') private traceEnabled: boolean = false;
   private traceMoveGate: TouchMoveTraceGate = new TouchMoveTraceGate();
   private traceFlushScheduled: boolean = false;
   private traceSequence: number = 0;
-  private traceEvents: GameTouchTraceEntry[] = [];
+  private traceEvents: TouchTraceRing<GameTouchTraceEntry> = new TouchTraceRing<GameTouchTraceEntry>();
   private traceLastDown: GameTouchTraceEntry | undefined = undefined;
-  private lastVectorX: number = 0;
-  private lastVectorY: number = 0;
 
   aboutToAppear(): void {
     this.active = true;
@@ -115,7 +108,7 @@ export struct GameTouchControls {
   private onResetRequested(): void { this.releaseTouches(); }
   private onCloseRequested(): void { this.closePanels(); }
   private onMouseModeChanged(): void { this.releaseTouches(); }
-  private onGeometryChanged(): void { this.releaseTouches(); this.settingsFamily = ''; this.applySettingsFamily(); this.prewarmJoystick(); }
+  private onGeometryChanged(): void { this.releaseTouches(); this.settingsFamily = ''; this.applySettingsFamily(); }
   private onInputChanged(): void { if (!this.inputEnabled) { this.releaseTouches(); } }
   private onVisibilityChanged(): void { if (!this.visible) { this.closePanels(); } }
   private binding(action: TouchAction): string { return `${action.action}|${action.control}|${action.rawKey}|${action.gesture}|${action.uiAction}`; }
@@ -127,8 +120,10 @@ export struct GameTouchControls {
     const changedGeneration: boolean = this.snapshotGeneration !== next.generation;
     const changedFamily: boolean = this.stateFamily(this.profileId) !== this.stateFamily(next.profile.id);
     const becameStale: boolean = this.lastFresh && !next.fresh;
+    const changedAxes: boolean = this.axisX !== next.axisX || this.axisY !== next.axisY ||
+      this.directions.length !== next.directions.length || this.directions.some((value: string, index: number): boolean => value !== next.directions[index]);
     const changedTransport: boolean = this.lastTransport.length > 0 && next.transport.length > 0 && this.lastTransport !== next.transport;
-    if (changedGeneration || changedFamily || becameStale || changedTransport) { this.releaseTouches(); }
+    if (changedGeneration || changedFamily || becameStale || changedTransport || changedAxes) { this.releaseTouches(); }
     this.snapshotGeneration = next.generation;
     this.lastFresh = next.fresh; this.lastTransport = next.transport;
     const allowed: string[] = [];
@@ -146,9 +141,8 @@ export struct GameTouchControls {
       displayed.push(action); allowed.push(this.binding(action));
     }
     if (next.profile.id.indexOf('FOOT_') === 0) { allowed.push('raw:runShift'); }
-    if (next.axisX.length > 0) { allowed.push(`axis:${next.axisX}`); }
-    if (next.axisY.length > 0) { allowed.push(`axis:${next.axisY}`); }
-    for (let i = 0; i < next.directions.length; i++) { allowed.push(`axis:${next.directions[i]}`); }
+    const nextDirections: DirectionButton[] = directionButtons(next.axisX, next.axisY, next.directions);
+    for (const button of nextDirections) { allowed.push(button.binding); }
     // Drawer and SCRIPT pad are deliberate raw surfaces, separate from automatic semantic invalidation.
     if (!this.drawerVisible && !this.taskVisible) { this.controller.retainBindings(allowed); }
     if (this.profileId !== next.profile.id) { this.profileId = next.profile.id; }
@@ -159,14 +153,8 @@ export struct GameTouchControls {
     if (this.axisX !== next.axisX) { this.axisX = next.axisX; }
     if (this.axisY !== next.axisY) { this.axisY = next.axisY; }
     if (this.directions.length !== next.directions.length || this.directions.some((direction: string, index: number): boolean => direction !== next.directions[index])) { this.directions = next.directions.slice(); }
-    if (!this.sameActions(displayed, this.actions)) { this.actions = displayed; this.prewarmJoystick(); }
+    if (!this.sameActions(displayed, this.actions)) { this.actions = displayed; }
     this.updatePressed();
-  }
-  private prewarmJoystick(): void {
-    if (this.axisX.length === 0 && this.axisY.length === 0 && this.directions.length === 0) { return; }
-    const slots: string[] = this.actions.map((action: TouchAction): string => action.slot); slots.push('S3');
-    if (this.profileId.indexOf('FOOT_') === 0) { slots.push('RUN'); }
-    prewarmJoystickGeometry(this.rectWidth(), this.rectHeight(), slots, slots.map((slot: string): TouchFrame => this.frame(slot)));
   }
   private sameActions(left: TouchAction[], right: TouchAction[]): boolean {
     if (left.length !== right.length) { return false; }
@@ -178,15 +166,20 @@ export struct GameTouchControls {
   private updatePressed(): void {
     const active: string[] = [];
     for (let i = 0; i < this.actions.length; i++) { const key: string = this.binding(this.actions[i]); if (this.controller.held(key)) { active.push(key); } }
+    for (const button of directionButtons(this.axisX, this.axisY, this.directions)) {
+      if (this.controller.held(button.binding)) { active.push(button.binding); }
+    }
+    for (const widget of TASK_WIDGETS) {
+      const binding: string = `task:${widget.id}`;
+      if (this.controller.held(binding)) { active.push(binding); }
+    }
     if (active.length !== this.pressed.length || active.some((binding: string, index: number): boolean => binding !== this.pressed[index])) { this.pressed = active; }
   }
   private releaseTouches(): void {
     this.controller.releaseAll(); game.releaseSemanticInputs(); this.pointers = [];
-    this.stickPointer = -1; this.lookPointer = -1; this.lastVectorX = 0; this.lastVectorY = 0;
-    this.stickActive = false; this.knobX = 0; this.knobY = 0;
+    this.buttonTracker.reset(); this.lookPointer = -1;
     if (this.pressed.length > 0) { this.pressed = []; }
     if (this.runActive) { this.runActive = false; AppStorage.setOrCreate<boolean>('gameSprintHeld', false); }
-    this.taskStickX = [0, 0]; this.taskStickY = [0, 0]; this.taskTriggerValues = [0, 0];
   }
   private closePanels(): void {
     this.releaseTouches(); this.drawerVisible = false; this.taskVisible = false; this.onPanelChanged(false);
@@ -229,7 +222,7 @@ export struct GameTouchControls {
   private saveFamily(family: TouchFamilySettings): void {
     this.settings.families[this.settingsFamily] = family;
     this.familySettings = family; this.buttonOpacity = family.opacity; this.lookSensitivity = family.sensitivity;
-    this.prewarmJoystick();
+
     try {
       if (this.settingsDirectory.length > 0) { writeTouchPreferences(this.settingsDirectory, this.settings); }
       this.feedback = '已保存当前状态族与屏幕比例的布局';
@@ -249,7 +242,7 @@ export struct GameTouchControls {
     this.saveFamily(family);
   }
   private held(action: TouchAction): boolean { return this.pressed.indexOf(this.binding(action)) >= 0; }
-  private canPlay(): boolean { return this.visible && this.inputEnabled && !this.drawerVisible && !this.taskVisible; }
+  private canPlay(): boolean { return this.active && this.visible && this.inputEnabled && !this.drawerVisible && !this.taskVisible; }
   private findPointer(id: number): ControlPointer | undefined {
     for (let i = 0; i < this.pointers.length; i++) { if (this.pointers[i].id === id) { return this.pointers[i]; } }
     return undefined;
@@ -273,27 +266,20 @@ export struct GameTouchControls {
     const mapping: RawTouchBinding | undefined = rawTouchBinding(action.control);
     return mapping ? this.controller.pressMapped(owner, binding, mapping) : false;
   }
-  private rawAxis(owner: string, control: string, value: number): void {
-    const axis: RawTouchAxis | undefined = rawTouchAxis(control);
-    if (!axis) { return; }
-    const negative: RawTouchBinding | undefined = rawTouchBinding(axis.negative);
-    const positive: RawTouchBinding | undefined = rawTouchBinding(axis.positive);
-    if (value < -0.02 && negative) { this.controller.pressMapped(`${owner}:negative`, `axis:${control}`, negative); }
-    else { this.controller.release(`${owner}:negative`); }
-    if (value > 0.02 && positive) { this.controller.pressMapped(`${owner}:positive`, `axis:${control}`, positive); }
-    else { this.controller.release(`${owner}:positive`); }
-  }
-  private joystickKeys(): string {
-    const x: RawTouchAxis | undefined = rawTouchAxis(this.axisX);
-    const y: RawTouchAxis | undefined = rawTouchAxis(this.axisY);
-    if (x && y && x.label === 'A / D' && y.label === 'W / S') { return 'W A S D'; }
-    return `${x ? x.label : ''}${y ? ` · ${y.label}` : ''}`;
+  private directionKeys(): DirectionButton[] { return directionButtons(this.axisX, this.axisY, this.directions); }
+  private directionFrame(button: DirectionButton): TouchFrame {
+    return directionButtonFrame(button.direction, this.rectWidth(), this.rectHeight());
   }
   /** Move carries the active pointer set; some platform/injected events have no changed list. */
   private eventPoints(event: TouchEvent): TouchObject[] {
     return touchEventPoints<TouchObject>(event.type === TouchType.Move, event.changedTouches, event.touches);
   }
+  private onTraceEnabledChanged(): void {
+    this.traceEvents.clear(); this.traceSequence = 0; this.traceLastDown = undefined;
+    if (!this.traceEnabled) { AppStorage.setOrCreate<string>('gameTouchInputTrace', ''); }
+  }
   private traceTouch(handler: string, event: TouchEvent, phase: string): void {
+    if (!this.traceEnabled) { return; }
     if (event.type === TouchType.Move && !this.traceMoveGate.shouldCapture(event.timestamp, Date.now())) { return; }
     const points: TouchObject[] = this.eventPoints(event);
     const point: TouchObject | undefined = points.length > 0 ? points[0] : undefined;
@@ -302,18 +288,18 @@ export struct GameTouchControls {
       seq: this.traceSequence, atMs: Date.now(), handler: handler, phase: phase, eventType: event.type,
       changedCount: event.changedTouches.length, touchesCount: event.touches.length,
       pointId: point ? point.id : -1, touchX: point ? point.x : -1, touchY: point ? point.y : -1,
-      stickX: this.stickX, stickY: this.stickY, stickPointer: this.stickPointer, lookPointer: this.lookPointer,
-      axisX: this.axisX, axisY: this.axisY, vectorX: this.lastVectorX, vectorY: this.lastVectorY,
+      lookPointer: this.lookPointer, heldDirections: this.directionKeys().filter((button: DirectionButton): boolean => this.controller.held(button.binding)).map((button: DirectionButton): string => button.id),
+      axisX: this.axisX, axisY: this.axisY,
       canPlay: this.canPlay(), contextEpoch: this.controller.getEpoch()
     };
     if (event.type === TouchType.Down && phase === 'received') { this.traceLastDown = entry; }
     this.traceEvents.push(entry);
-    if (this.traceEvents.length > 16) { this.traceEvents = this.traceEvents.slice(this.traceEvents.length - 16); }
     if (!this.traceFlushScheduled) {
       this.traceFlushScheduled = true;
       Promise.resolve().then((): void => {
         this.traceFlushScheduled = false;
-        const trace: GameTouchTrace = { seq: this.traceSequence, events: this.traceEvents, lastDown: this.traceLastDown };
+        if (!this.traceEnabled || !this.active) { return; }
+        const trace: GameTouchTrace = { seq: this.traceSequence, events: this.traceEvents.snapshot(), lastDown: this.traceLastDown };
         AppStorage.setOrCreate<string>('gameTouchInputTrace', JSON.stringify(trace));
       });
     }
@@ -327,22 +313,29 @@ export struct GameTouchControls {
     game.setInputFocus(true);
     this.traceTouch('run', event, 'processed');
   }
+  private endActionPointers(binding: string, event: TouchEvent, ownerPrefix: boolean = false): boolean {
+    if (event.type !== TouchType.Up && event.type !== TouchType.Cancel) { return false; }
+    const ended: ControlPointer[] = this.pointers.filter((pointer: ControlPointer): boolean => {
+      const target: boolean = ownerPrefix ? pointer.owner.indexOf(binding) === 0 : pointer.binding === binding;
+      return target && (event.type === TouchType.Cancel ||
+        event.changedTouches.some((touch: TouchObject): boolean => touch.id === pointer.id) ||
+        !event.touches.some((touch: TouchObject): boolean => touch.id === pointer.id));
+    });
+    for (const pointer of ended) { this.controller.release(pointer.owner); this.removePointer(pointer.id); }
+    return true;
+  }
   private actionTouch(action: TouchAction, event: TouchEvent): void {
     this.traceTouch(`action:${action.slot}:${action.label}`, event, 'received');
     event.stopPropagation();
     if (event.type === TouchType.Down && !this.canPlay()) { return; }
     if (event.type === TouchType.Down) { game.setInputFocus(true); }
     const points: TouchObject[] = this.eventPoints(event);
-    if (event.type === TouchType.Cancel && points.length === 0) {
-      const binding: string = this.binding(action);
-      const cancelled: ControlPointer[] = this.pointers.filter((pointer: ControlPointer): boolean => pointer.binding === binding);
-      for (let n = 0; n < cancelled.length; n++) { this.controller.release(cancelled[n].owner); this.removePointer(cancelled[n].id); }
-    }
+    if (this.endActionPointers(this.binding(action), event)) { this.updatePressed(); return; }
     for (let i = 0; i < points.length; i++) {
       const touch: TouchObject = points[i];
       const owner: string = `button:${touch.id}`;
       if (event.type === TouchType.Down) {
-        if (this.findPointer(touch.id)) { continue; }
+        if (this.findPointer(touch.id) || this.buttonTracker.contains(touch.id) || touch.id === this.lookPointer) { continue; }
         if (action.uiAction === 'manual_mode_picker') { this.openDrawer('手动模式'); return; }
         if (action.gesture === 'open_keyboard') { this.openKeyboard(); return; }
         if (!hasLiteralTouchInput(action)) { this.feedback = `${action.label}尚待验证，可使用全键盘原始输入`; this.openDrawer('本状态'); return; }
@@ -351,7 +344,7 @@ export struct GameTouchControls {
         this.pointers.push({ id: touch.id, owner: owner, binding: binding, x: touch.x, y: touch.y, epoch: this.controller.getEpoch() });
       } else {
         const pointer: ControlPointer | undefined = this.findPointer(touch.id);
-        if (!pointer || pointer.epoch !== this.controller.getEpoch()) { continue; }
+        if (!pointer || pointer.epoch !== this.controller.getEpoch() || pointer.binding !== this.binding(action)) { continue; }
         if (event.type === TouchType.Move && this.mouseLook &&
           (action.gesture === 'hold_drag' || action.gesture === 'hold_drag_release')) {
           this.controller.pointer(0, 0, (touch.x - pointer.x) * this.lookSensitivity,
@@ -366,51 +359,37 @@ export struct GameTouchControls {
     this.updatePressed();
     this.traceTouch(`action:${action.slot}:${action.label}`, event, 'processed');
   }
-  private stickTouch(event: TouchEvent, fromBackground: boolean = false): void {
-    this.traceTouch('stick', event, 'received');
+  private endButtonContacts(target: string, event: TouchEvent): void {
+    const ended: TouchButtonContact[] = this.buttonTracker.end(target, event.type === TouchType.Up,
+      event.type === TouchType.Cancel, event.changedTouches, event.touches, event.timestamp);
+    for (const contact of ended) { this.controller.release(contact.owner); }
+  }
+  private directionTouch(button: DirectionButton, event: TouchEvent): void {
+    this.traceTouch(`direction:${button.id}`, event, 'received');
     event.stopPropagation();
-    if (event.type === TouchType.Cancel) { this.releaseStick(); this.traceTouch('stick', event, 'cancelled'); return; }
-    if (missingTouchUp<TouchObject>(event.type === TouchType.Up, this.stickPointer, event.changedTouches, event.touches)) {
-      this.releaseStick(); this.traceTouch('stick', event, 'up-missing'); return;
-    }
-    const points: TouchObject[] = this.eventPoints(event);
-    for (let i = 0; i < points.length; i++) {
-      const touch: TouchObject = points[i];
-      if (event.type === TouchType.Down && this.canPlay() && this.stickPointer < 0) {
-        if (fromBackground && touch.x > this.rectWidth() * 0.35) { continue; }
-        if (touch.y < this.rectHeight() * 0.3 + 12) { continue; }
-        const ids: string[] = this.actions.map((a: TouchAction): string => a.slot); ids.push('S3');
-        if (this.profileId.indexOf('FOOT_') === 0) { ids.push('RUN'); }
-        const origin: TouchVector = legalJoystickOrigin(touch.x, touch.y, this.rectWidth(), this.rectHeight(), ids, ids.map((id: string): TouchFrame => this.frame(id)));
-        this.stickPointer = touch.id; this.stickX = origin.x; this.stickY = origin.y; this.stickActive = true;
-        game.setInputFocus(true);
-      }
-      if (touch.id !== this.stickPointer) { continue; }
-      if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-        this.releaseStick(); continue;
-      }
-      const dx: number = touch.x - this.stickX; const dy: number = touch.y - this.stickY;
-      const magnitude: number = Math.max(1, Math.sqrt(dx * dx + dy * dy) / 44);
-      this.knobX = dx / magnitude; this.knobY = dy / magnitude;
-      const value: TouchVector = joystickVector(dx, dy);
-      this.lastVectorX = value.x; this.lastVectorY = value.y;
-      if (this.axisX.length > 0) { this.rawAxis('joystick:x', this.axisX, value.x); }
-      if (this.axisY.length > 0) { this.rawAxis('joystick:y', this.axisY, value.y); }
-      if (this.directions.length === 4) {
-        const values: number[] = [Math.max(0, -value.x), Math.max(0, value.x), Math.max(0, -value.y), Math.max(0, value.y)];
-        for (let n = 0; n < 4; n++) {
-          const mapping: RawTouchBinding | undefined = rawTouchBinding(this.directions[n]);
-          if (values[n] > 0.02 && mapping) { this.controller.pressMapped(`joystick:d${n}`, `axis:${this.directions[n]}`, mapping); }
-          else { this.controller.release(`joystick:d${n}`); }
+    const target: string = `direction:${button.id}`;
+    this.endButtonContacts(target, event);
+    if (event.type === TouchType.Down && this.canPlay()) {
+      // A queued Down from a removed/changed node cannot reintroduce its old
+      // binding after an UNKNOWN/profile/axis transition.
+      const current: DirectionButton | undefined = this.directionKeys().find((entry: DirectionButton): boolean =>
+        entry.id === button.id && entry.binding === button.binding && entry.control === button.control);
+      if (!current || (!current.mapping && !current.mouseAxis)) { return; }
+      game.setInputFocus(true);
+      for (const touch of this.eventPoints(event)) {
+        if (this.findPointer(touch.id) || touch.id === this.lookPointer) { continue; }
+        const contact: TouchButtonContact | undefined = this.buttonTracker.begin(target, touch.id, this.controller.getEpoch(), event.timestamp);
+        if (contact) {
+          const accepted: boolean = current.mapping ?
+            this.controller.pressMapped(contact.owner, current.binding, current.mapping) :
+            this.controller.pressLookDirection(contact.owner, current.binding, current.mouseAxis || '',
+              current.mouseSign || 0, 6 * this.lookSensitivity);
+          if (!accepted) { this.feedback = '当前电脑输入通道尚未就绪'; }
         }
       }
     }
-    this.traceTouch('stick', event, 'processed');
-  }
-  private releaseStick(): void {
-    this.controller.release('joystick:x'); this.controller.release('joystick:y');
-    for (let n = 0; n < 4; n++) { this.controller.release(`joystick:d${n}`); }
-    this.stickPointer = -1; this.stickActive = false; this.knobX = 0; this.knobY = 0; this.lastVectorX = 0; this.lastVectorY = 0;
+    this.updatePressed();
+    this.traceTouch(`direction:${button.id}`, event, 'processed');
   }
   private lookTouch(event: TouchEvent, backgroundOffsetX: number = 0): void {
     this.traceTouch('look', event, 'received');
@@ -425,6 +404,7 @@ export struct GameTouchControls {
       const localX: number = touch.x - backgroundOffsetX;
       if (event.type === TouchType.Down && this.canPlay() && this.lookPointer < 0) {
         if (backgroundOffsetX > 0 && localX < 0) { continue; }
+        if (this.findPointer(touch.id) || this.buttonTracker.contains(touch.id)) { continue; }
         game.setInputFocus(true);
         this.lookPointer = touch.id; this.lookX = localX; this.lookY = touch.y;
         if (!this.mouseLook) { this.controller.pointer(localX + this.rectWidth() * 0.35 + this.rectX(), touch.y + this.rectY(), 0, 0, false); }
@@ -444,26 +424,25 @@ export struct GameTouchControls {
     if (!this.canPlay()) { return; }
     this.traceTouch('background', event, 'received');
     // Child action targets stop propagation; only unused game surface reaches this fallback.
-    let leftDown: boolean = false; let rightDown: boolean = false;
+    let rightDown: boolean = false;
     if (event.type === TouchType.Down) {
-      const points: TouchObject[] = this.eventPoints(event);
-      for (let i = 0; i < points.length; i++) {
-        if (points[i].x < this.rectWidth() * 0.35) { leftDown = true; } else { rightDown = true; }
+      for (const touch of this.eventPoints(event)) {
+        if (touch.x >= this.rectWidth() * 0.35) { rightDown = true; }
       }
     }
-    const routeStick: boolean = this.stickPointer >= 0 || leftDown;
-    const routeLook: boolean = this.lookPointer >= 0 || rightDown;
-    if (routeStick && (this.axisX.length > 0 || this.axisY.length > 0 || this.directions.length > 0)) { this.stickTouch(event, true); }
-    if (routeLook) { this.lookTouch(event, this.rectWidth() * 0.35); }
+    // The left blank area has no movement handler or invisible direction target.
+    if (this.lookPointer >= 0 || rightDown) { this.lookTouch(event, this.rectWidth() * 0.35); }
   }
   private rawTouch(action: DrawerAction, event: TouchEvent): void {
     event.stopPropagation();
+    const prefix: string = `drawer:${action.control}:${action.rawKey}:`;
+    if (this.endActionPointers(prefix, event, true)) { return; }
     const points: TouchObject[] = this.eventPoints(event);
     for (let i = 0; i < points.length; i++) {
       const t: TouchObject = points[i];
       const owner: string = `drawer:${action.control}:${action.rawKey}:${t.id}`;
-      if (event.type === TouchType.Down && this.inputEnabled) {
-        if (this.findPointer(t.id)) { continue; }
+      if (event.type === TouchType.Down && this.active && this.visible && this.inputEnabled && this.drawerVisible) {
+        if (this.findPointer(t.id) || this.buttonTracker.contains(t.id)) { continue; }
         game.setInputFocus(true);
         if (action.rawKey.length > 0) { this.controller.pressRaw(owner, owner, action.rawKey); }
         else {
@@ -474,7 +453,7 @@ export struct GameTouchControls {
         this.pointers.push({ id: t.id, owner: owner, binding: owner, x: t.x, y: t.y, epoch: this.controller.getEpoch() });
       } else {
         const pointer: ControlPointer | undefined = this.findPointer(t.id);
-        if (!pointer || pointer.epoch !== this.controller.getEpoch()) { continue; }
+        if (!pointer || pointer.epoch !== this.controller.getEpoch() || pointer.owner.indexOf(prefix) !== 0) { continue; }
         if (event.type === TouchType.Move && this.mouseLook && (action.control.indexOf('WHEEL') >= 0 || action.control === 'INPUT_SELECT_WEAPON')) {
           this.controller.pointer(0, 0, (t.x - pointer.x) * this.lookSensitivity, (t.y - pointer.y) * this.lookSensitivity, true);
           pointer.x = t.x; pointer.y = t.y;
@@ -507,46 +486,31 @@ export struct GameTouchControls {
   }
   private taskTouch(widget: TaskWidget, event: TouchEvent): void {
     event.stopPropagation();
-    const points: TouchObject[] = this.eventPoints(event);
-    for (let i = 0; i < points.length; i++) {
-      const touch: TouchObject = points[i];
-      const owner: string = `script:${widget.id}:${touch.id}`;
-      if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-        this.controller.release(`${owner}:x`); this.controller.release(`${owner}:y`); this.controller.release(owner);
-        if (widget.kind === 'stick') {
-          const index: number = widget.id === 'left_stick' ? 0 : 1;
-          const xs: number[] = this.taskStickX.slice(); const ys: number[] = this.taskStickY.slice(); xs[index] = 0; ys[index] = 0;
-          this.taskStickX = xs; this.taskStickY = ys;
-        }
-        continue;
-      }
-      if (!this.inputEnabled || !this.taskVisible) { continue; }
-      // A Move from a previous epoch cannot start a new hold.
-      const existing: ControlPointer | undefined = this.findPointer(touch.id);
+    const target: string = `task:${widget.id}`;
+    this.endButtonContacts(target, event);
+    const declared: TaskWidget | undefined = TASK_WIDGETS.find((entry: TaskWidget): boolean => entry.id === widget.id);
+    // This fixed widget inventory is the SCRIPT channel allowlist. No raw-key fallback.
+    if (!declared || declared.channels.length !== 1 || declared.channels[0].indexOf('INPUT_SCRIPT_') !== 0) { return; }
+    if ((event.type !== TouchType.Down && event.type !== TouchType.Move) ||
+      !this.active || !this.visible || !this.inputEnabled || !this.taskVisible) {
+      this.updatePressed(); return;
+    }
+    for (const touch of this.eventPoints(event)) {
+      let contact: TouchButtonContact | undefined = this.buttonTracker.current(target, touch.id, this.controller.getEpoch());
       if (event.type === TouchType.Down) {
-        if (existing) { continue; }
-        let occupied: boolean = false;
-        for (let n = 0; n < this.pointers.length; n++) { if (this.pointers[n].owner.indexOf(`script:${widget.id}:`) === 0) { occupied = true; } }
-        if (occupied) { continue; }
-        game.setInputFocus(true);
-        this.pointers.push({ id: touch.id, owner: owner, binding: owner, x: touch.x, y: touch.y, epoch: this.controller.getEpoch() });
-      } else if (!existing || existing.epoch !== this.controller.getEpoch()) { continue; }
-      if (widget.kind === 'stick') {
-        const dx: number = touch.x - widget.width / 2; const dy: number = touch.y - widget.height / 2;
-        const value: TouchVector = taskJoystickVector(dx, dy);
-        this.controller.setControl(`${owner}:x`, owner, widget.channels[0], value.x, 2);
-        this.controller.setControl(`${owner}:y`, owner, widget.channels[1], value.y, 2);
-        const index: number = widget.id === 'left_stick' ? 0 : 1;
-        const xs: number[] = this.taskStickX.slice(); const ys: number[] = this.taskStickY.slice(); xs[index] = value.x * 36; ys[index] = value.y * 36;
-        this.taskStickX = xs; this.taskStickY = ys;
-      } else {
-        const value: number = widget.kind === 'continuous_trigger' ? clampTouch(1 - touch.y / widget.height, 0, 1) : 1;
-        if (!this.controller.setControl(owner, owner, widget.channels[0], value, 2)) { this.feedback = 'SCRIPT 输入通道暂不可用，请用全键盘'; }
+        if (this.findPointer(touch.id)) { continue; }
+        contact = this.buttonTracker.begin(target, touch.id, this.controller.getEpoch(), event.timestamp);
+        if (contact) { game.setInputFocus(true); }
+      }
+      if (!contact) { continue; }
+      if (event.type === TouchType.Move && declared.kind !== 'continuous_trigger') { continue; }
+      const value: number = declared.kind === 'axis_button' ? (declared.value || 0) :
+        (declared.kind === 'continuous_trigger' ? clampTouch(1 - touch.y / declared.height, 0, 1) : 1);
+      if (!this.controller.setControl(contact.owner, target, declared.channels[0], value, 2)) {
+        this.feedback = 'SCRIPT 输入通道暂不可用，请用全键盘';
       }
     }
-    if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      for (let i = 0; i < event.changedTouches.length; i++) { this.removePointer(event.changedTouches[i].id); }
-    }
+    this.updatePressed();
   }
 
   @Builder
@@ -602,16 +566,19 @@ export struct GameTouchControls {
   }
 
   @Builder
-  private stickVisual() {
-    Stack({ alignContent: Alignment.Center }) {
-      Circle().width(128).height(128).fill(this.stickActive ? '#38182C3C' : '#20182C3C').stroke('#65DEEBF2').strokeWidth(0.8)
-      Circle().width(86).height(86).fill(Color.Transparent).stroke('#2EDEEBF2').strokeWidth(0.6)
-      Circle().width(54).height(54).fill(this.stickActive ? '#AA7598A9' : '#586A8290').stroke('#B5E3F3FF').strokeWidth(1)
-        .translate({ x: this.knobX, y: this.knobY }).shadow({ radius: 9, color: '#30000000', offsetY: 2 })
-      Text(this.profileId.indexOf('VEHICLE_') === 0 ? '操纵' : '移动').fontSize(14).fontWeight(FontWeight.Bold).fontColor('#EAF4FC').translate({ y: -45 })
-      Text(this.joystickKeys()).fontSize(9).fontColor('#BBD0DD').translate({ y: 46 })
-    }.width(128).height(128).position({ x: (this.stickActive ? this.stickX : 96) - 64, y: (this.stickActive ? this.stickY : this.rectHeight() - 96) - 64 })
-      .hitTestBehavior(HitTestMode.None)
+  private directionButton(button: DirectionButton) {
+    Column({ space: 1 }) {
+      Text(button.label).fontSize(14).minFontSize(9).maxFontSize(14).maxLines(1).fontWeight(FontWeight.Bold).fontColor('#EEF7FF')
+      if (button.mouseAxis) { Text('鼠标').fontSize(8).fontColor('#A7B8C4') }
+    }.justifyContent(FlexAlign.Center).width(44).height(44).borderRadius(12)
+      .backgroundColor(this.pressed.indexOf(button.binding) >= 0 ? '#D34B8B70' : '#85152733')
+      .border({ width: 1, color: this.pressed.indexOf(button.binding) >= 0 ? '#C6FFE3' : '#80DEEBF2' })
+      .position({ x: this.directionFrame(button).x - 22, y: this.directionFrame(button).y - 22 })
+      .accessibilityText(`${button.direction}，${button.mapping ? button.mapping.label : '鼠标方向'}`)
+      .id(`touch-direction-${button.id}`)
+      .hitTestBehavior(HitTestMode.Block)
+      .onTouch((event: TouchEvent): void => { this.directionTouch(button, event); })
+      .onMouse((event: MouseEvent): void => { event.stopPropagation(); })
   }
 
   @Builder
@@ -673,7 +640,7 @@ export struct GameTouchControls {
               Button('保存此按键').height(44).fontColor('#DFF3FF').backgroundColor('#355E74').onClick((): void => { this.saveSlotEdit(); })
               Button('恢复默认布局').height(44).fontColor('#DFF3FF').backgroundColor('#294456').onClick((): void => { this.releaseTouches(); this.saveFamily(defaultTouchFamilySettings()); this.selectEditSlot(this.editSlot); })
             }
-            Text('保存前检测 44 vp 最小触点、安全边界、小地图、摇杆与预留任务槽，重叠时保留原布局。').fontSize(11).fontColor('#91A9B9').width('100%')
+            Text('保存前检测 44 vp 最小触点、安全边界、小地图、方向按键与预留任务槽，重叠时保留原布局。').fontSize(11).fontColor('#91A9B9').width('100%')
           } else if (this.drawerTab === '特殊') {
             Row({ space: 12 }) {
               Text('固定显示引爆按钮').fontSize(13).fontColor('#EAF9FF')
@@ -713,18 +680,14 @@ export struct GameTouchControls {
   @Builder
   private taskWidget(widget: TaskWidget) {
     Stack({ alignContent: Alignment.Center }) {
-      if (widget.kind === 'stick') {
-        Circle().width(128).height(128).fill('#6B203B4C').stroke('#608AAABF').strokeWidth(1)
-        Circle().width(54).height(54).fill('#A65C8198').stroke('#BCE3F5FF').strokeWidth(1)
-          .translate({ x: this.taskStickX[widget.id === 'left_stick' ? 0 : 1], y: this.taskStickY[widget.id === 'left_stick' ? 0 : 1] })
-      }
-      Text(widget.label).fontSize(widget.kind === 'stick' ? 16 : 13).fontWeight(FontWeight.Medium).fontColor('#E9F6FF')
+      Text(widget.label).fontSize(13).fontWeight(FontWeight.Medium).fontColor('#E9F6FF')
     }.width(widget.width).height(widget.height)
-      .backgroundColor(widget.kind === 'stick' ? Color.Transparent : '#83426378')
-      .borderRadius(widget.kind === 'continuous_trigger' ? 14 : widget.width / 2)
-      .border({ width: widget.kind === 'stick' ? 0 : 1, color: '#739DB7C9' })
+      .backgroundColor(this.pressed.indexOf(`task:${widget.id}`) >= 0 ? '#D34B8B70' : '#83426378')
+      .borderRadius(widget.kind === 'continuous_trigger' || widget.kind === 'axis_button' ? 12 : widget.width / 2)
+      .border({ width: 1, color: '#739DB7C9' })
       .position({ x: widget.x, y: widget.y })
       .accessibilityText(`原始 SCRIPT 通道 ${widget.label}`)
+      .id(`touch-task-${widget.id}`)
       .onTouch((event: TouchEvent): void => { this.taskTouch(widget, event); })
   }
 
@@ -734,12 +697,12 @@ export struct GameTouchControls {
       Stack({ alignContent: Alignment.TopStart }) {
         ForEach(TASK_WIDGETS, (widget: TaskWidget): void => { this.taskWidget(widget); }, (widget: TaskWidget): string => widget.id)
         Column({ space: 5 }) {
-          Text('SCRIPT 任务手柄').fontSize(17).fontWeight(FontWeight.Bold).fontColor('#ECF8FF')
-          Text('19 个原始通道 · 任务语义待验证').fontSize(10).fontColor('#9DB8C8')
+          Text('SCRIPT 任务按键').fontSize(17).fontWeight(FontWeight.Bold).fontColor('#ECF8FF')
+          Text('双方向键 · 19 原始通道 · 待验证').fontSize(10).fontColor('#9DB8C8')
           Button('全键盘').height(44).fontSize(12).fontColor('#CFECFB').backgroundColor('#29485B').onClick((): void => { this.openKeyboard(); })
         }.width(192).position({ x: 224, y: 106 })
         Button('×').width(44).height(44).fontSize(22).fontColor('#D8EDF9').backgroundColor('#29485B')
-          .position({ x: 584, y: 10 }).accessibilityText('关闭任务手柄').onClick((): void => { this.closePanels(); })
+          .position({ x: 584, y: 10 }).accessibilityText('关闭任务按键').onClick((): void => { this.closePanels(); })
       }.width(640).height(360).backgroundColor('#EE132533')
         .backgroundBlurStyle(BlurStyle.Thick, { colorMode: ThemeColorMode.DARK })
         .borderRadius(24).border({ width: 1, color: '#607799AB' })
@@ -748,7 +711,7 @@ export struct GameTouchControls {
     } else {
       Column({ space: 16 }) {
         Text('当前可用区域不足 640 × 360 vp').fontSize(17).fontColor('#EFF8FF')
-        Text('任务手柄在此屏幕规格尚未验收，请使用全键盘原始输入。').fontSize(13).fontColor('#A8C4D6').textAlign(TextAlign.Center)
+        Text('任务按键在此屏幕规格尚未验收，请使用全键盘原始输入。').fontSize(13).fontColor('#A8C4D6').textAlign(TextAlign.Center)
         Row({ space: 12 }) {
           Button('全键盘').height(44).onClick((): void => { this.openKeyboard(); })
           Button('关闭').height(44).onClick((): void => { this.closePanels(); })
@@ -766,11 +729,7 @@ export struct GameTouchControls {
             Rect().width(this.rectWidth() * 0.65).height(this.rectHeight()).fill(Color.Transparent)
               .position({ x: this.rectWidth() * 0.35, y: 0 }).hitTestBehavior(HitTestMode.Block)
               .onTouch((event: TouchEvent): void => { this.lookTouch(event); })
-            if (this.axisX.length > 0 || this.axisY.length > 0 || this.directions.length > 0) {
-              Rect().width(this.rectWidth() * 0.35).height(this.rectHeight()).fill(Color.Transparent)
-                .hitTestBehavior(HitTestMode.Block).onTouch((event: TouchEvent): void => { this.stickTouch(event); })
-              this.stickVisual()
-            }
+            ForEach(this.directionKeys(), (button: DirectionButton): void => { this.directionButton(button); }, (button: DirectionButton): string => `${button.id}:${button.binding}`)
             ForEach(this.actions, (action: TouchAction): void => { this.actionButton(action); }, (action: TouchAction): string => `${action.slot}:${this.binding(action)}`)
             if (this.profileId !== 'LOADING') { this.moreButton(); }
             if (this.profileId.indexOf('FOOT_') === 0) { this.runButton(); }
@@ -789,7 +748,7 @@ export struct GameTouchControls {
       .onAreaChange((_old: Area, next: Area): void => {
         const width: number = Number(next.width); const height: number = Number(next.height);
         if (Math.abs(width - this.widthVp) > 1 || Math.abs(height - this.heightVp) > 1) {
-          this.releaseTouches(); this.widthVp = width; this.heightVp = height; this.settingsFamily = ''; this.applySettingsFamily(); this.prewarmJoystick();
+          this.releaseTouches(); this.widthVp = width; this.heightVp = height; this.settingsFamily = ''; this.applySettingsFamily();
         }
       })
   }

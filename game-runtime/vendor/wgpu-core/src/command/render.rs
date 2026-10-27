@@ -2740,6 +2740,62 @@ pub(super) fn encode_render_pass(
     let encoder = &mut parent_state.raw_encoder;
     let tracker = &mut parent_state.tracker;
 
+    // OHOS Vulkan only; all pass validation, pass finish and render-CB close
+    // above remain at their original positions. OFF/noneligible keep the entire
+    // original prepass below without any tracker mutation by the proof.
+    #[cfg(all(target_env = "ohos", feature = "std"))]
+    {
+        use super::empty_render_prepass::{self, Facts, Settings};
+        let settings = Settings::requested();
+        let evaluation = empty_render_prepass::evaluate(settings, Facts {
+            ohos_vulkan: device.backend() == wgt::Backend::Vulkan,
+            discard_fixups_empty: pending_discard_init_fixups.is_empty(),
+            query_resets_empty: pending_query_resets.is_empty(),
+            // Some(validation) with an empty batcher is still a no-op: the
+            // original inject_validation_pass immediately returns Ok(()).
+            indirect_batches_empty: indirect_draw_validation_batcher.is_empty(),
+            pending_buffers_empty: tracker.buffers.pending_transitions_are_empty(),
+            pending_textures_empty: tracker.textures.pending_transitions_are_empty(),
+        }, || tracker.buffers.scope_proves_no_transitions(&scope.buffers)
+            && tracker.textures.scope_proves_no_transitions(&scope.textures));
+        empty_render_prepass::note(settings, evaluation);
+        if evaluation.skip {
+            // Identical CPU state adoption: preserve start/end states, strong
+            // resource ownership, subresources, resize and submit-time tracking.
+            tracker.buffers.set_from_usage_scope(&scope.buffers);
+            tracker.textures.set_from_usage_scope(&scope.textures);
+
+            // Keep both original drain methods, including any CPU bookkeeping.
+            let buffer_barriers = tracker.buffers
+                .drain_transitions(parent_state.snatch_guard).collect::<Vec<_>>();
+            let (transitions, textures) = tracker.textures
+                .drain_transitions(parent_state.snatch_guard);
+            let texture_barriers = transitions.into_iter().enumerate()
+                .map(|(i, pending)| pending.into_hal(textures[i].unwrap().raw()))
+                .collect::<Vec<_>>();
+            let empty = buffer_barriers.is_empty() && texture_barriers.is_empty();
+            empty_render_prepass::prepared(empty);
+            if empty {
+                // Vulkan empty transition methods emit no vkCmdPipelineBarrier;
+                // no fixup/reset/indirect work exists. The render CB is already
+                // closed and in-order, so no extra begin/end/swap is needed.
+                return Ok(());
+            }
+            // Defensive invariant backstop: never drop a real transition or
+            // re-merge updated states. Emit exactly the already-drained lists.
+            // This is not the normal nonempty path (that retains old code).
+            let transit = encoder.open_pass(hal_label(
+                Some("(wgpu internal) Pre Pass"), device.instance_flags,
+            )).map_pass_err(pass_scope)?;
+            unsafe {
+                transit.transition_buffers(&buffer_barriers);
+                transit.transition_textures(&texture_barriers);
+            }
+            encoder.close_and_swap().map_pass_err(pass_scope)?;
+            return Ok(());
+        }
+    }
+
     {
         let transit = encoder
             .open_pass(hal_label(

@@ -131,9 +131,11 @@ fn apply_with(name: &str, level: Option<i32>, api: impl FnOnce(i32) -> (i32, i32
 }
 
 pub(crate) fn apply(level: Option<i32>) {
-    if !ENABLED.load(Ordering::Relaxed) || level.is_none() { return; }
     let thread = std::thread::current();
     let name = thread.name().unwrap_or("unnamed");
+    // Thread identity is telemetry, independent of the optional scheduling hint.
+    crate::native_telemetry::register_current_thread(name);
+    if !ENABLED.load(Ordering::Relaxed) || level.is_none() { return; }
     #[cfg(target_env = "ohos")]
     apply_with(name, level, |level| {
         let set_result = unsafe { OH_QoS_SetThreadQoS(level) };

@@ -1,6 +1,11 @@
 #include "fg_interpolation_bridge.h"
 #include "fg_npu_rgb.h"
+#ifndef MUGUET_INTERPOLATION_HAS_RIFE
+#define MUGUET_INTERPOLATION_HAS_RIFE 1
+#endif
+#if MUGUET_INTERPOLATION_HAS_RIFE
 #include <harmony_rife_c.h>
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -12,6 +17,7 @@
 #include <mutex>
 #include <new>
 
+#if MUGUET_INTERPOLATION_HAS_RIFE
 static_assert(sizeof(MuguetInterpolationDeviceInfo) == sizeof(HarmonyRifeDeviceInfo), "Device info ABI size");
 static_assert(alignof(MuguetInterpolationDeviceInfo) == alignof(HarmonyRifeDeviceInfo), "Device info ABI alignment");
 #define MUGUET_CHECK_INFO_OFFSET(field) \
@@ -27,6 +33,7 @@ MUGUET_CHECK_INFO_OFFSET(supports_fp16_arithmetic);
 MUGUET_CHECK_INFO_OFFSET(supports_int8_storage);
 MUGUET_CHECK_INFO_OFFSET(device_name);
 #undef MUGUET_CHECK_INFO_OFFSET
+#endif
 
 namespace {
 enum class Backend { Rife, Npu };
@@ -44,7 +51,9 @@ void Error(char* output, size_t capacity, const char* message) noexcept
 
 struct MuguetInterpolationContext {
     Backend backend;
+#if MUGUET_INTERPOLATION_HAS_RIFE
     HarmonyRifeContext* rife = nullptr;
+#endif
     MuguetFgNpuRgbContext* npu = nullptr;
     uint64_t npu_process_calls = 0;
     std::mutex calls;
@@ -52,7 +61,9 @@ struct MuguetInterpolationContext {
     ~MuguetInterpolationContext()
     {
         if (npu) muguet_fg_npu_rgb_destroy(npu);
+#if MUGUET_INTERPOLATION_HAS_RIFE
         if (rife) harmony_rife_destroy(rife);
+#endif
     }
 };
 
@@ -119,6 +130,7 @@ extern "C" MuguetInterpolationContext* muguet_interpolation_create(const char* m
         }
         auto context = std::make_unique<MuguetInterpolationContext>(chosen);
         if (chosen == Backend::Rife) {
+#if MUGUET_INTERPOLATION_HAS_RIFE
             if (!model_directory || !*model_directory) {
                 Error(error, error_capacity, "RIFE requires a nonempty model directory"); return nullptr;
             }
@@ -131,6 +143,11 @@ extern "C" MuguetInterpolationContext* muguet_interpolation_create(const char* m
             const char* backendRevision = harmony_rife_build_revision();
             std::snprintf(revision, sizeof(revision), "muguet_interpolation_bridge/1;backend=rife;implementation=%s",
                 backendRevision ? backendRevision : "unknown RIFE SDK revision");
+#else
+            (void)model_directory; (void)gpu_index;
+            Error(error, error_capacity, "RIFE unavailable: this build contains NPU frame interpolation only");
+            return nullptr;
+#endif
         } else {
             const int32_t code = muguet_fg_npu_rgb_create(&context->npu);
             if (code != MUGUET_FG_NPU_RGB_OK || !context->npu) {
@@ -174,7 +191,11 @@ extern "C" int muguet_interpolation_process_rgb8(MuguetInterpolationContext* con
             }
             return code;
         }
+#if MUGUET_INTERPOLATION_HAS_RIFE
         return harmony_rife_process_rgb8(context->rife, rgb0, rgb1, width, height, output, buffer_bytes, timestep);
+#else
+        return kInternalError;
+#endif
     } catch (...) {
         return kInternalError;
     }
@@ -200,12 +221,16 @@ extern "C" int muguet_interpolation_get_device_info(MuguetInterpolationContext* 
     try {
         std::lock_guard<std::mutex> lock(context->calls);
         if (context->backend == Backend::Rife) {
+#if MUGUET_INTERPOLATION_HAS_RIFE
             HarmonyRifeDeviceInfo backendInfo{};
             const int code = harmony_rife_get_device_info(context->rife, &backendInfo);
             if (code != 0) return code;
             std::memcpy(info, &backendInfo, sizeof(*info));
             info->device_name[sizeof(info->device_name) - 1] = '\0';
             return 0;
+#else
+            return kInternalError;
+#endif
         }
         MuguetInterpolationDeviceInfo backendInfo{};
         backendInfo.gpu_index = -1;
@@ -226,4 +251,9 @@ extern "C" void muguet_interpolation_destroy(MuguetInterpolationContext* context
 extern "C" const char* muguet_interpolation_build_revision(void)
 {
     return revision;
+}
+
+extern "C" int muguet_interpolation_rife_available(void)
+{
+    return MUGUET_INTERPOLATION_HAS_RIFE;
 }

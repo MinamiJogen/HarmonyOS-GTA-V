@@ -163,6 +163,7 @@ for (const preset of ['low', 'medium', 'high']) {
       assert.equal(config.mute, true);
       assert.deepEqual(config.extra_args.slice(0, 2), original.extra_args);
       assert.equal(config.scale, 1);
+      assert.equal(config.fps_limit, 0, 'every preset and SR/FG combination must leave native source frames uncapped');
       assert.equal(config.spatial_upscale_native_short_edge, 800);
       assert.equal(config.spatial_upscale_output_short_edge, 1080);
       assert.equal(config.spatial_upscale_match_display, true);
@@ -206,6 +207,7 @@ test('one-time defaults followed by quality application retains persisted off sw
   fresh().saveGameQuality(dir, selection('low', false, false));
   const selected = plain(fresh().loadGameQuality(dir));
   fresh('GameDefaults').applyGameDefaults(dir);
+  assert.equal(read(dir).fps_limit, 0, 'new installation defaults must not reintroduce a source cap');
   fresh().applyGameQuality(dir, selected);
   assertPreset(read(dir), 'low');
   assert.deepEqual(plain(fresh().loadGameQuality(dir)), selected);
@@ -213,6 +215,25 @@ test('one-time defaults followed by quality application retains persisted off sw
   const before = fs.readFileSync(path.join(dir, 'config.json'));
   fresh('GameDefaults').applyGameDefaults(dir);
   assert.deepEqual(fs.readFileSync(path.join(dir, 'config.json')), before, 'repeat defaults must not reset choices');
+});
+
+test('launch replaces the former source cap without resetting current medium quality or unrelated preferences', () => {
+  const original = { playable_defaults_version: 1, fps_limit: 24, graphics_preset: 'medium',
+    spatial_upscale_enabled: true, frame_interpolation_enabled: true, frame_interpolation_output_fps: 40,
+    mouse_sensitivity: 2, start_mode: 2, custom: { save: 'kept' },
+    extra_args: ['-customFlag=keep'] };
+  const dir = app(original);
+  fresh().applyGameQuality(dir, fresh().loadGameQuality(dir));
+  const updated = read(dir);
+  assert.equal(updated.fps_limit, 0);
+  assert.equal(updated.graphics_preset, 'medium');
+  assert.equal(updated.spatial_upscale_enabled, true);
+  assert.equal(updated.frame_interpolation_enabled, true);
+  assert.equal(updated.frame_interpolation_output_fps, 40);
+  assert.equal(updated.mouse_sensitivity, 2);
+  assert.equal(updated.start_mode, 2);
+  assert.deepEqual(updated.custom, original.custom);
+  assertPreset(updated, 'medium');
 });
 
 for (const invalid of ['{ broken JSON', 'null', '[]', 'true', '3', '"text"']) {

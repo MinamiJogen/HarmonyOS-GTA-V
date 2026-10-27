@@ -6,11 +6,14 @@ import inputDevice from '@ohos.multimodalInput.inputDevice';
 import pointer from '@ohos.multimodalInput.pointer';
 import { systemDateTime } from '@kit.BasicServicesKit';
 import { uiMaterial, window, ThemeControl, LengthMetrics } from '@kit.ArkUI';
-import { GameTouchControls } from '../controls/GameTouchControls';
+import { FiveStarTouchControls } from '../controls/FiveStarTouchControls';
+import { FiveStarSnapshot } from '../controls/FiveStarInput';
 import { TouchSnapshot } from '../controls/TouchState';
 import { GameKeyboard } from '../components/GameKeyboard';
-import { gamePerformanceGameStarted } from '../entryability/GamePerformance';
+import { gamePerformanceGameStarted, gamePerformanceNativeSample, NativeGameSample } from '../entryability/GamePerformance';
 import { CpuSample, GpuSample, readCpuSample, readGpuSample } from '../telemetry/GameTelemetry';
+import { LatestStatusWriter } from '../telemetry/LatestStatusWriter';
+import { BenchmarkConditions, BenchmarkConditionsSnapshot, benchmarkMonitorEnabled } from '../telemetry/BenchmarkConditions';
 import { applyGameDefaults } from '../config/GameDefaults';
 import { GameQualitySelection, loadGameQuality, saveGameQuality, applyGameQuality, requireGameQualityCapabilities } from '../config/GameQuality';
 import { selectGamePackage, selectSavePackage } from '../resources/PublicGamePackages';
@@ -73,6 +76,8 @@ interface RuntimeStatus {
   message?: string;
   error?: string;
   presents?: number;
+  guestPresents?: number;
+  nativeTelemetry?: NativeGameSample;
   frameGenerationAvailable?: boolean;
   frameGenerationLive?: FrameGenerationLive;
   presentationPaused?: boolean;
@@ -104,8 +109,12 @@ interface PerformanceSnapshot {
 }
 
 interface UiGameStatus extends GameStatus {
+  uiStatusCallDurationMs?: number;
+  uiLinxSyscap?: boolean;
+  uiBenchmarkConditions?: BenchmarkConditionsSnapshot;
   uiPerformance?: PerformanceSnapshot;
   uiTouchState?: TouchSnapshot;
+  uiVirtualPadState?: FiveStarSnapshot;
   uiToolbarExpanded?: boolean;
   uiKeyboardVisible?: boolean;
   uiTouchControlsVisible?: boolean;
@@ -175,6 +184,9 @@ struct Index {
   @State private inputResetEpoch: number = 0;
   @State private closePanelsEpoch: number = 0;
   @State private touchStateJson: string = '{}';
+  @State private virtualPadStateJson: string = '{}';
+  @State private controllerConnected: boolean = false;
+  @State private controlsSettingsEpoch: number = 0;
   @State private touchStatusText: string = '状态未确认';
   @State private gameWidth: number = 800;
   @State private gameHeight: number = 360;
@@ -212,6 +224,9 @@ struct Index {
   private pollTimer: number = -1;
   private filesDirectory: string = '';
   private lastEvidence: string = '';
+  private evidenceWriter: LatestStatusWriter = new LatestStatusWriter();
+  private benchmarkConditions: BenchmarkConditions = new BenchmarkConditions();
+  private linxSyscap: boolean = canIUse('SystemCapability.Commonlibrary.Linx');
   private lastSaveLoadError: string = '';
   private previousPresents: number = -1;
   private previousSampleMs: number = 0;
@@ -253,6 +268,8 @@ struct Index {
   };
 
   aboutToAppear(): void {
+    this.evidenceWriter = new LatestStatusWriter();
+    this.lastEvidence = '';
     ThemeControl.setDefaultTheme(launcherTheme);
     this.pageActive = true;
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -307,6 +324,8 @@ struct Index {
 
   aboutToDisappear(): void {
     this.pageActive = false;
+    this.benchmarkConditions.stop();
+    this.evidenceWriter.stop();
     if (this.safeAreaWindow) {
       try { this.safeAreaWindow.off('avoidAreaChange', this.safeAreaListener); } catch (_) {}
       this.safeAreaWindow = undefined;
@@ -618,16 +637,22 @@ struct Index {
       applyGameQuality(this.filesDirectory, {
         preset: this.qualityPreset, superResolution: this.superResolution, frameGeneration: this.frameGeneration
       });
+      // Read this optional diagnostic flag once at game startup, never on the
+      // status/input polling paths. Missing flags keep the monitor off.
+      this.benchmarkConditions.configure(benchmarkMonitorEnabled(
+        fileIo.readTextSync(`${this.filesDirectory}/config.json`)));
       game.configureGame(this.filesDirectory, action, saveId, this.frameGeneration);
       this.closeSavePicker();
       inputDevice.on('change', this.inputListener);
       this.inputRegistered = true;
       this.gamePageVisible = true;
+      this.benchmarkConditions.setActive(this.pageActive && this.appForeground);
       this.readSafeArea();
       this.touchStateTimer = setInterval(() => { this.refreshTouchState(); }, 50);
       this.refreshStatus();
       this.pollTimer = setInterval(() => { this.refreshStatus(); }, 1000);
     } catch (error) {
+      this.benchmarkConditions.stop();
       if (this.inputRegistered) { inputDevice.off('change', this.inputListener); this.inputRegistered = false; }
       game.stopGame();
       this.resourceMessage = `游戏初始化失败：${String(error)}`;
@@ -663,6 +688,7 @@ struct Index {
 
   private onAppForegroundChanged(): void {
     if (!this.gamePageVisible) { return; }
+    this.benchmarkConditions.setActive(this.pageActive && this.appForeground);
     this.telemetryEpoch += 1;
     this.previousPresents = -1;
     this.previousSampleMs = 0;
@@ -702,6 +728,7 @@ struct Index {
       this.lastTelemetryMs = -1;
     }
     this.refreshStatus();
+    if (!this.diagnosticsVisible) { this.focusGame(); }
   }
 
   private samplePerformance(presents: number): number {
@@ -800,6 +827,8 @@ struct Index {
     let changedGeneration: boolean = false;
     try {
       this.touchStateJson = game.getTouchState();
+      this.virtualPadStateJson = game.virtualPadState();
+      this.controllerConnected = game.physicalControllerConnected();
       const state: TouchSnapshot = JSON.parse(this.touchStateJson) as TouchSnapshot;
       if (Number.isFinite(state.generation)) {
         changedGeneration = this.touchGeneration >= 0 && this.touchGeneration !== state.generation;
@@ -812,6 +841,10 @@ struct Index {
         ui.sampledAtMonoMs !== undefined && owner.sampledAtMonoMs !== undefined &&
         state.nowMonoMs - ui.sampledAtMonoMs <= 500 && state.nowMonoMs - owner.sampledAtMonoMs <= 500 &&
         ['pause', 'map', 'phone', 'phoneCamera', 'web', 'startup'].includes(ui.value || '');
+      const virtualState: FiveStarSnapshot = JSON.parse(this.virtualPadStateJson) as FiveStarSnapshot;
+      if (virtualState.hookReady === true && (virtualState.ageMs || 0) <= 1500) {
+        cursor = cursor || virtualState.pauseMenu || (virtualState.status & 2) !== 0 || virtualState.hints?.phoneBrowser === true;
+      }
     } catch (_) { this.touchStateJson = '{}'; }
     if (cursor !== this.uiCursorOwned || changedGeneration) {
       this.resetInput(); this.uiCursorOwned = cursor; this.showPointer(!this.effectiveMouseLook());
@@ -852,6 +885,9 @@ struct Index {
       return false;
     }
     if (event.type !== KeyType.Down && event.type !== KeyType.Up) { return false; }
+    // GameControllerKit already publishes these events as one native ioPad
+    // sample. Do not also send its compatibility D-pad keys as PC arrows.
+    if (event.keySource === KeySource.JOYSTICK && this.controllerConnected) { return true; }
     // F8 toggles camera look and the visible menu cursor without changing Escape's game action.
     if (event.keyCode === 2097) {
       if (event.type === KeyType.Up) { this.toggleMouseLook(); }
@@ -970,8 +1006,12 @@ struct Index {
 
   private refreshStatus(): void {
     try {
+      const statusBegin: number = systemDateTime.getUptime(systemDateTime.TimeType.STARTUP, false);
       const status: UiGameStatus = game.gameStatus() as UiGameStatus;
+      status.uiStatusCallDurationMs = systemDateTime.getUptime(systemDateTime.TimeType.STARTUP, false) - statusBegin;
+      status.uiLinxSyscap = this.linxSyscap;
       status.uiTouchState = JSON.parse(this.touchStateJson) as TouchSnapshot;
+      status.uiVirtualPadState = JSON.parse(this.virtualPadStateJson) as FiveStarSnapshot;
       status.uiToolbarExpanded = this.toolbarExpanded;
       status.uiKeyboardVisible = this.keyboardVisible;
       status.uiTouchControlsVisible = this.controlsVisible;
@@ -988,6 +1028,9 @@ struct Index {
       const runtime: RuntimeStatus = JSON.parse(status.runtimeJson) as RuntimeStatus;
       // Only read this process's native status. Never open a prior FG status file.
       const processingNow: number = systemDateTime.getUptime(systemDateTime.TimeType.STARTUP, false);
+      this.benchmarkConditions.setActive(this.pageActive && this.appForeground && this.gamePageVisible &&
+        !runtime.error && runtime.status !== 'stopped' && runtime.stage !== 'stopped');
+      status.uiBenchmarkConditions = this.benchmarkConditions.snapshot(processingNow);
       const srFrames: number = runtime.spatialUpscale?.nativeRecordedFrames ?? 0;
       if (srFrames > this.lastSpatialFrames && srFrames > 0) { this.lastSpatialProgressMs = processingNow; }
       this.lastSpatialFrames = srFrames;
@@ -1011,7 +1054,7 @@ struct Index {
       }
       this.gameRunning = runtime.worldPlayerObserved === true && (runtime.presents || 0) > 0 && !runtime.error && !runtime.saveLoadPending && !runtime.saveLoadError;
       if (this.sessionRestartFailure || runtime.sessionRestartError) { this.gameRunning = false; }
-      const sampleMs: number = this.samplePerformance(runtime.presents || 0);
+      const sampleMs: number = this.samplePerformance(runtime.guestPresents || 0);
       this.memoryText = runtime.rssMB && runtime.rssMB > 0 ? `${runtime.rssMB.toFixed(0)} MB` : '—';
       const renderSize: number[] = runtime.spatialUpscale?.activeGameRenderSize || runtime.renderSize || [];
       const outputSize: number[] = runtime.spatialUpscale?.activeOutputSize || renderSize;
@@ -1025,6 +1068,10 @@ struct Index {
       };
       if (runtime.worldPlayerObserved && (runtime.presents || 0) > 0 && !runtime.error) {
         gamePerformanceGameStarted();
+        if (runtime.nativeTelemetry) {
+          gamePerformanceNativeSample(runtime.nativeTelemetry,
+            runtime.nativeTelemetry.sourceTargetFps, runtime.nativeTelemetry.sourceTargetFps);
+        }
       }
       if (!status.runtimeLinked) {
         this.statusText = '游戏运行时尚未链接';
@@ -1062,13 +1109,7 @@ struct Index {
       const evidence: string = JSON.stringify(status);
       if (evidence !== this.lastEvidence) {
         this.lastEvidence = evidence;
-        const file = fileIo.openSync(`${this.filesDirectory}/game-status.json`,
-          fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-        try {
-          fileIo.writeSync(file.fd, evidence);
-        } finally {
-          fileIo.closeSync(file);
-        }
+        this.evidenceWriter.enqueue(this.filesDirectory, evidence);
       }
       this.continueOriginalSession(runtime);
     } catch (error) {
@@ -1114,6 +1155,9 @@ struct Index {
           this.toolbarItem('退出游戏', false, () => { this.returnToLauncher(); })
           this.toolbarItem(this.mouseLook ? '鼠标：视角' : '鼠标：光标', false, () => { this.toggleMouseLook(); })
           this.toolbarItem('全键盘按键', this.keyboardVisible, () => { this.toggleKeyboard(); })
+          this.toolbarItem('触控设置', false, () => {
+            this.toolbarExpanded = false; this.controlsVisible = true; this.controlsSettingsEpoch += 1;
+          })
           this.toolbarItem(this.controlsVisible ? '收起按键' : '显示按键', !this.controlsVisible, () => {
             this.resetInput(); this.closePanelsEpoch += 1; this.controlsVisible = !this.controlsVisible;
           })
@@ -1162,7 +1206,7 @@ struct Index {
                 Text(this.fpsText).fontSize(40).fontWeight(FontWeight.Bold).fontColor('#B5EAD3')
                 Text('FPS').fontSize(12).fontColor('#A6BBB2').margin({ top: 18 })
               }
-              Text('游戏呈现帧率').fontSize(10).fontColor('#A6BBB2')
+              Text('游戏原生帧率').fontSize(10).fontColor('#A6BBB2')
             }.alignItems(HorizontalAlign.Start).layoutWeight(1)
             Column({ space: 5 }) {
               Text('平均帧间隔').fontSize(10).fontColor('#A6BBB2')
@@ -1178,7 +1222,7 @@ struct Index {
             Text(`超分  ${this.superResolutionStateText}`).fontSize(11).fontColor('#CCDAD3')
             Text(`补帧  ${this.frameGenerationStateText}`).fontSize(11).fontColor('#CCDAD3')
             Text('GPU 为系统 1–10 级负载，非百分比；占用每 2 秒采样。').fontSize(10).fontColor('#8BA69A')
-            Text('FPS 按游戏呈现计数计算，非屏幕最终合成帧率。').fontSize(10).fontColor('#8BA69A')
+            Text('FPS 不计 AI 补帧和重复帧；平均间隔并非 GPU 渲染耗时。').fontSize(10).fontColor('#8BA69A')
           }.width('100%').alignItems(HorizontalAlign.Start).padding({ top: 4, bottom: 4 })
         }.width('100%')
       }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
@@ -1348,12 +1392,16 @@ struct Index {
           this.resetInput(); this.gameWidth = Number(area.width); this.gameHeight = Number(area.height); this.readSafeArea();
         })
 
-      GameTouchControls({
+      FiveStarTouchControls({
         visible: this.controlsVisible && !this.keyboardVisible && !this.diagnosticsVisible && !this.exitConfirmVisible,
         inputEnabled: this.appForeground && !this.exitConfirmVisible,
-        stateJson: this.touchStateJson, resetEpoch: this.inputResetEpoch,
+        stateJson: this.virtualPadStateJson, resetEpoch: this.inputResetEpoch,
+        controlsSettingsEpoch: this.controlsSettingsEpoch, controllerConnected: this.controllerConnected,
+        safeLeft: this.safeLeft, safeRight: this.safeRight, safeTop: this.safeTop, safeBottom: this.safeBottom,
         closePanelsEpoch: this.closePanelsEpoch, mouseLook: this.effectiveMouseLook(), gameAspect: this.gameAspect,
         onOpenKeyboard: () => { this.toolbarExpanded = true; this.toggleKeyboard(); },
+        onOpenSettings: () => { this.resetInput(); this.toolbarExpanded = true; },
+        onSettingsChanged: (json: string) => { AppStorage.setOrCreate<string>('gameFiveStarSettings', json); },
         onStatusChanged: (status: string) => {
           if (this.touchStatusText !== status) { this.touchStatusText = status; }
         },
@@ -1361,9 +1409,9 @@ struct Index {
           if (open || this.childPanelOpen) { this.resetInput(); }
           if (open) { this.toolbarExpanded = false; }
           this.childPanelOpen = open;
+          if (!open && !this.keyboardVisible && !this.diagnosticsVisible && !this.exitConfirmVisible) { this.focusGame(); }
         }
       }).width('100%').height('100%')
-        .padding({ left: this.safeLeft, right: this.safeRight, top: this.safeTop, bottom: this.safeBottom })
 
       if (this.keyboardVisible || this.diagnosticsVisible || this.exitConfirmVisible) {
         Column().width('100%').height('100%').hitTestBehavior(HitTestMode.Block)

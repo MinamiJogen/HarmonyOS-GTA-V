@@ -64,7 +64,7 @@ bash tools/build_game.sh --wasm /absolute/path/game.wasm --signed
 | `--zip PATH` | 先校验并提取用户自备 ZIP 到本地 `resources/game/`，再选择唯一的 `b/*/game.wasm` |
 | `--wasm PATH` | 直接编译给定的兼容 WebAssembly 游戏程序；外置数据仍需另行准备 |
 | `--check` | 只检查环境，可与 `--aot-only` 组合 |
-| `--aot-only` | 只生成 `game-runtime/artifacts/game-ohos.cwasm` 及本地补丁 Wasm |
+| `--aot-only` | 在 `game-runtime/artifacts/aot-candidates/` 的新目录中生成 AOT、元数据和本地补丁 Wasm |
 | `--signed` | 用已在 DevEco 镜像中配置的本地签名构建 HAP |
 | `--offline` | 禁止 Cargo 下载依赖；需要提前缓存 AOT 工具与运行时依赖 |
 | `--help` | 显示完整帮助 |
@@ -119,10 +119,11 @@ python3 tools/prepare_game_resources.py \
 以下是统一工具内部使用的分阶段命令，适用于需要单独排查某一步的开发者。将路径替换为自己的 `game.wasm`：
 
 ```sh
-bash game-runtime/scripts/compile-aot.sh /absolute/path/game.wasm
+mkdir -p /private/tmp/my-game-aot
+bash game-runtime/scripts/compile-aot.sh /absolute/path/game.wasm /private/tmp/my-game-aot/game-ohos.cwasm
 bash game-runtime/scripts/build-ohos.sh
-bash game-runtime/scripts/embed-game.sh
-HARMONY_SHELL_ONLY=0 HARMONY_ENABLE_SIGNING=false HARMONY_BUILD_MODE=release ./harmony/build_unsigned.sh
+python3 game-runtime/scripts/embed-aot-candidate.py /private/tmp/my-game-aot/game-ohos.cwasm /private/tmp/my-game-aot/game-ohos.metadata.json /private/tmp/my-game-aot/game-embedded.o
+HARMONY_GAME_AOT_OBJECT=/private/tmp/my-game-aot/game-embedded.o HARMONY_SHELL_ONLY=0 HARMONY_ENABLE_SIGNING=false HARMONY_BUILD_MODE=release ./harmony/build_unsigned.sh
 ```
 
 AOT 编译器与运行时固定使用 Wasmtime `49.0.0` 和各自的 `Cargo.lock`。首次构建会下载依赖；已缓存依赖后可用 `MG_AOT_OFFLINE=1` 禁止 AOT 工具联网。CMake 会自动链接生成的运行时静态库和 `game-embedded.o`。
@@ -141,6 +142,7 @@ harmony/entry/build/default/outputs/default/entry-default-unsigned.hap
 python3 harmony/verify_game_hap.py --unsigned \
   --hap /absolute/path/entry-default-unsigned.hap \
   --elf /absolute/path/obj/arm64-v8a/libharmony_probe.so \
+  --aot /private/tmp/my-game-aot/game-ohos.cwasm \
   --report /absolute/path/game-aot-verification.json
 ```
 

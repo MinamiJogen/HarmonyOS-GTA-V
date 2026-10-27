@@ -54,6 +54,8 @@ void muguet_interpolation_destroy(MuguetInterpolationContext* context);
 // Includes the chosen backend and RIFE's real build revision when applicable.
 // Before creation (or after failed creation), identifies an uninitialized bridge.
 const char* muguet_interpolation_build_revision(void);
+// Reports whether this build contains the RIFE backend, independently of NPU.
+int muguet_interpolation_rife_available(void);
 
 #ifdef __cplusplus
 }

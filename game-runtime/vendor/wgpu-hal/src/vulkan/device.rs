@@ -15,6 +15,58 @@ use parking_lot::{Mutex, RwLock};
 use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
+// Pure policy kept beside the allocation and invalidation paths for host tests.
+mod cached_readback_policy {
+    use ash::vk;
+    pub(super) fn plan(
+        requirements: vk::MemoryRequirements, valid: u32, types: &[vk::MemoryType], atom: u64,
+    ) -> Option<vk::MemoryRequirements> {
+        if requirements.size == 0 || !atom.is_power_of_two() || !requirements.alignment.is_power_of_two() { return None; }
+        let required = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED;
+        let invalid = vk::MemoryPropertyFlags::PROTECTED | vk::MemoryPropertyFlags::LAZILY_ALLOCATED;
+        let allowed = requirements.memory_type_bits & valid;
+        let mut cached_noncoherent = 0;
+        for (index, ty) in types.iter().take(32).enumerate() {
+            if allowed & (1u32 << index) == 0 || ty.property_flags.intersects(invalid) || !ty.property_flags.contains(required) { continue; }
+            // Preserve the allocator's existing coherent+cached preference.
+            if ty.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT) { return None; }
+            cached_noncoherent |= 1u32 << index;
+        }
+        if cached_noncoherent == 0 { return None; }
+        Some(vk::MemoryRequirements {
+            size: requirements.size.checked_add(atom - 1)? & !(atom - 1),
+            alignment: requirements.alignment.max(atom), memory_type_bits: cached_noncoherent,
+        })
+    }
+    pub(super) fn atom_range(offset: u64, start: u64, end: u64, mask: u64) -> Option<(u64, u64)> {
+        if start >= end { return None; }
+        let aligned_start = offset.checked_add(start)? & !mask;
+        let aligned_end = offset.checked_add(end)?.checked_add(mask)? & !mask;
+        Some((aligned_start, aligned_end.checked_sub(aligned_start)?))
+    }
+    pub(super) fn fallback_type(mask: u32, types: &[vk::MemoryType]) -> Option<u32> {
+        // gpu-allocator 0.28 GpuToCpu uses exactly these two searches, with no
+        // retry to a different type after an allocation error.
+        let visible_coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        [visible_coherent | vk::MemoryPropertyFlags::HOST_CACHED, visible_coherent].into_iter().find_map(|flags| {
+            types.iter().take(32).enumerate().find(|(index, ty)| mask & (1u32 << index) != 0 && ty.property_flags.contains(flags))
+                .map(|(index, _)| index as u32)
+        })
+    }
+}
+
+#[cfg(target_env = "ohos")]
+fn cached_readback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MUGUET_CACHED_READBACK").is_ok_and(|value| value == "1"))
+}
+#[cfg(target_env = "ohos")]
+fn cached_readback_log(message: impl FnOnce() -> alloc::string::String) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LOGS: AtomicU64 = AtomicU64::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 64 { std::eprintln!("[cached-readback] {}", message()); }
+}
+
 #[cfg(target_env = "ohos")]
 #[path = "spirv_layout_sanitizer.rs"]
 mod spirv_layout_sanitizer;
@@ -299,11 +351,16 @@ impl super::DeviceShared {
         };
         let allocation = allocation.lock();
         let mask = self.private_caps.non_coherent_map_mask;
-        Some(ranges.map(move |range| {
-            vk::MappedMemoryRange::default()
+        Some(ranges.filter_map(move |range| {
+            if range.is_empty() { return None; }
+            // Round both ends, not only the length: an unaligned start can
+            // otherwise leave the final atom stale (128..384 with atom=256).
+            let (offset, size) = cached_readback_policy::atom_range(allocation.offset(), range.start, range.end, mask)
+                .expect("validated mapped range must fit Vulkan device address space");
+            Some(vk::MappedMemoryRange::default()
                 .memory(allocation.memory())
-                .offset((allocation.offset() + range.start) & !mask)
-                .size((range.end - range.start + mask) & !mask)
+                .offset(offset)
+                .size(size))
         }))
     }
 }
@@ -956,6 +1013,49 @@ impl super::Device {
         })
     }
 
+    #[cfg(target_env = "ohos")]
+    fn try_cached_readback_allocation(
+        &self, name: &str, requirements: vk::MemoryRequirements,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme,
+    ) -> Option<gpu_allocator::vulkan::Allocation> {
+        if !cached_readback_enabled() { return None; }
+        let properties = unsafe { self.shared.instance.raw.get_physical_device_memory_properties(self.shared.physical_device) };
+        let atom = self.shared.private_caps.non_coherent_map_mask.checked_add(1)?;
+        let Some(mut planned) = cached_readback_policy::plan(requirements, self.valid_ash_memory_types, properties.memory_types_as_slice(), atom) else {
+            cached_readback_log(|| format!("status=original-policy name={name} reason=coherent-cached-preferred-or-no-eligible-cached-type-or-invalid-padding atom={atom}"));
+            return None;
+        };
+        // Allocation has no public type-index accessor. A one-bit mask makes
+        // its actual index unambiguous without changing gpu-allocator itself.
+        let type_index = planned.memory_type_bits.trailing_zeros();
+        planned.memory_type_bits = 1u32 << type_index;
+        // Unknown does not add a coherence requirement. The explicit mask
+        // permits only visible+cached noncoherent types; allocator 0.28 maps
+        // HOST_VISIBLE blocks regardless of MemoryLocation.
+        let result = self.error_if_would_oom_on_resource_allocation(gpu_allocator::MemoryLocation::Unknown, &planned)
+            .and_then(|()| self.mem_allocator.lock().allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                name, requirements: planned, location: gpu_allocator::MemoryLocation::Unknown,
+                linear: true, allocation_scheme,
+            }).map_err(crate::DeviceError::from));
+        match result {
+            Ok(allocation) => {
+                let flags = allocation.memory_properties();
+                let valid = flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED)
+                    && !flags.intersects(vk::MemoryPropertyFlags::PROTECTED | vk::MemoryPropertyFlags::LAZILY_ALLOCATED | vk::MemoryPropertyFlags::HOST_COHERENT)
+                    && allocation.mapped_ptr().is_some()
+                    && allocation.offset() % atom == 0 && allocation.size() % atom == 0;
+                if !valid {
+                    cached_readback_log(|| format!("status=fallback name={name} reason=invalid-mapping-or-atom-isolation flags={flags:?} typeIndex={type_index} allocationSize={} atom={atom}", allocation.size()));
+                    if let Err(error) = self.mem_allocator.lock().free(allocation) { log::warn!("Failed to free rejected cached readback: {error}"); }
+                    return None;
+                }
+                cached_readback_log(|| format!("status=selected name={name} flags={flags:?} typeIndex={type_index} offset={} allocationSize={} requested={} atom={atom} typeMask={:#x}", allocation.offset(), allocation.size(), requirements.size, planned.memory_type_bits));
+                Some(allocation)
+            }
+            Err(error) => { cached_readback_log(|| format!("status=fallback name={name} reason={error} attemptedTypeIndex={type_index} allocationSize={} atom={atom}", planned.size)); None }
+        }
+    }
+
     /// Returns the queue family index of the device's internal queue.
     ///
     /// This is useful for constructing memory barriers needed for queue family ownership transfer when
@@ -1158,11 +1258,6 @@ impl crate::Device for super::Device {
             (false, false) => gpu_allocator::MemoryLocation::GpuOnly,
         };
 
-        self.error_if_would_oom_on_resource_allocation(location, &requirements)
-            .inspect_err(|_| {
-                unsafe { self.shared.raw.destroy_buffer(raw, None) };
-            })?;
-
         let name = desc.label.unwrap_or("Unlabeled buffer");
 
         let allocation_scheme = gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged;
@@ -1181,22 +1276,30 @@ impl crate::Device for super::Device {
                 .max(self.shared.private_caps.scratch_buffer_alignment as u64);
         }
 
-        let allocation = self
-            .mem_allocator
-            .lock()
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name,
-                requirements: vk::MemoryRequirements {
-                    memory_type_bits: requirements.memory_type_bits & self.valid_ash_memory_types,
-                    ..requirements
-                },
-                location,
-                linear: true, // Buffers are always linear
-                allocation_scheme,
-            })
-            .inspect_err(|_| {
-                unsafe { self.shared.raw.destroy_buffer(raw, None) };
-            })?;
+        requirements.memory_type_bits &= self.valid_ash_memory_types;
+        let cached_allocation = None;
+        #[cfg(target_env = "ohos")]
+        let cached_allocation = if is_cpu_read && !is_cpu_write {
+            self.try_cached_readback_allocation(name, requirements, allocation_scheme)
+        } else { cached_allocation };
+        let allocation = if let Some(allocation) = cached_allocation { allocation } else {
+            // Failed experimental allocation and ineligible buffers retain the
+            // original allocator policy, including its original requirements.
+            self.error_if_would_oom_on_resource_allocation(location, &requirements)
+                .inspect_err(|_| { unsafe { self.shared.raw.destroy_buffer(raw, None) }; })?;
+            self.mem_allocator.lock().allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                name, requirements, location, linear: true, allocation_scheme,
+            }).inspect_err(|_| { unsafe { self.shared.raw.destroy_buffer(raw, None) }; })?
+        };
+        #[cfg(target_env = "ohos")]
+        if is_cpu_read && !is_cpu_write && cached_readback_enabled()
+            && allocation.memory_properties().contains(vk::MemoryPropertyFlags::HOST_COHERENT) {
+            cached_readback_log(|| {
+                let properties = unsafe { self.shared.instance.raw.get_physical_device_memory_properties(self.shared.physical_device) };
+                let type_index = cached_readback_policy::fallback_type(requirements.memory_type_bits, properties.memory_types_as_slice());
+                format!("status=original-allocation name={name} flags={:?} typeIndexByAllocator028Policy={type_index:?} offset={} allocationSize={} atom={}", allocation.memory_properties(), allocation.offset(), allocation.size(), self.shared.private_caps.non_coherent_map_mask + 1)
+            });
+        }
 
         #[cfg(target_env = "ohos")]
         if allocation_scheme != gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged {

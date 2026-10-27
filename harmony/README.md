@@ -182,9 +182,9 @@ shell and the system FG surface experiment:
 
 ```sh
 bash game-runtime/scripts/build-ohos.sh
-HARMONY_BUILD_STAGE=/private/tmp/harmony-fg30-20261019 \
-HARMONY_GAME_EXPERIMENT_BUNDLE=com.minami.harmonyruntimeprobe \
-HARMONY_RIFE_SDK=/private/tmp/harmony-rife-20261019/sdk \
+HARMONY_BUILD_STAGE=/private/tmp/harmony-fg-build \
+HARMONY_GAME_EXPERIMENT_BUNDLE=com.example.harmonyruntimeprobe \
+HARMONY_RIFE_SDK=/absolute/path/to/rife-sdk \
 HARMONY_SHELL_ONLY=0 HARMONY_COPY_BUILD_OUTPUT=0 HARMONY_WITH_VVL=0 \
 zsh harmony/build_signed_local.sh
 ```
@@ -200,6 +200,13 @@ the exact runtime archive hash and checks the constant-return capability ABI plu
 real implementation markers before linking and again inside the HAP. A stale
 archive manifest or a feature-off packaged library fails the build. Public shells
 and the independent FG surface probe remain runtime-free.
+
+If the optional RIFE SDK is unavailable, set `HARMONY_FG_NPU_ONLY=1` for an
+explicit NPU-only full-game build and leave `HARMONY_RIFE_SDK` unset. This still
+includes NPU interpolation and spatial upscaling; an explicit RIFE request fails
+with an unavailable-backend error and retains original presentation. Device
+support and initialization of the stock model remain required. The default
+full-game build continues to require the RIFE SDK.
 
 Inside this experiment's files directory, `frame-interpolation-npu.request`
 selects the public stock-model NNRT/CANN path with GPU reconstruction;

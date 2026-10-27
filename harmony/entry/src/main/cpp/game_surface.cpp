@@ -2,10 +2,12 @@
 #include "game_resource_import.h"
 #include "game_save_import_core.h"
 #include "game_save_import.h"
+#include "fivestar_gamepad.h"
 #include <ace/xcomponent/native_interface_xcomponent.h>
 #include <hilog/log.h>
 #include <native_window/external_window.h>
 #include <cstdint>
+#include <cmath>
 #include <mutex>
 #include <string>
 
@@ -301,6 +303,86 @@ napi_value NamedControl(napi_env env, napi_callback_info info) {
 #endif
     napi_value result=nullptr; napi_get_boolean(env,accepted,&result); return result;
 }
+napi_value VirtualPad(napi_env env, napi_callback_info info) {
+    size_t count=8; napi_value args[8]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+    bool accepted=false,active=false; uint32_t buttons=0; double axes[6]{};
+    bool valid=count==8 && napi_get_value_uint32(env,args[0],&buttons)==napi_ok &&
+        napi_get_value_bool(env,args[7],&active)==napi_ok;
+    for (size_t i=0; valid && i<6; ++i) valid=napi_get_value_double(env,args[i+1],&axes[i])==napi_ok && std::isfinite(axes[i]);
+    if (valid) accepted=fivestar_gamepad::update_touch(buttons,axes[0],axes[1],axes[2],axes[3],axes[4],axes[5],active);
+    napi_value result=nullptr; napi_get_boolean(env,accepted,&result); return result;
+}
+napi_value VirtualPadState(napi_env env, napi_callback_info) {
+    napi_value value=nullptr;
+#if MG_HAS_GAME_RUNTIME
+    const char *json=mg_game_virtual_pad_state_json();
+    napi_create_string_utf8(env,json?json:"{}",NAPI_AUTO_LENGTH,&value);
+#else
+    napi_create_string_utf8(env,"{}",NAPI_AUTO_LENGTH,&value);
+#endif
+    return value;
+}
+napi_value PhysicalControllerConnected(napi_env env, napi_callback_info) {
+    napi_value value=nullptr; napi_get_boolean(env,fivestar_gamepad::connected(),&value); return value;
+}
+napi_value ReleaseVirtualPad(napi_env env, napi_callback_info) {
+    fivestar_gamepad::release_touch(); return Undefined(env);
+}
+napi_value VirtualRadio(napi_env env, napi_callback_info info) {
+    size_t count=3; napi_value args[3]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+#if MG_HAS_GAME_RUNTIME
+    double x=0,y=0; bool active=false;
+    if(count==3 && napi_get_value_double(env,args[0],&x)==napi_ok && napi_get_value_double(env,args[1],&y)==napi_ok &&
+        napi_get_value_bool(env,args[2],&active)==napi_ok && std::isfinite(x) && std::isfinite(y)) mg_game_virtual_radio(x,y,active);
+#endif
+    return Undefined(env);
+}
+napi_value VirtualCameraSwipe(napi_env env, napi_callback_info info) {
+    size_t count=2; napi_value args[2]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+#if MG_HAS_GAME_RUNTIME
+    double x=0,y=0;
+    if(count==2 && napi_get_value_double(env,args[0],&x)==napi_ok && napi_get_value_double(env,args[1],&y)==napi_ok &&
+        std::isfinite(x) && std::isfinite(y)) mg_game_camera_swipe(x,y);
+#endif
+    return Undefined(env);
+}
+napi_value RelativeMouse(napi_env env, napi_callback_info info) {
+    size_t count=2; napi_value args[2]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+#if MG_HAS_GAME_RUNTIME
+    double x=0,y=0;
+    if(count==2 && napi_get_value_double(env,args[0],&x)==napi_ok && napi_get_value_double(env,args[1],&y)==napi_ok &&
+        std::isfinite(x) && std::isfinite(y)) mg_game_mouse_delta(x,y);
+#endif
+    return Undefined(env);
+}
+napi_value VirtualMouseMode(napi_env env, napi_callback_info info) {
+    size_t count=1; napi_value args[1]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+#if MG_HAS_GAME_RUNTIME
+    bool active=false;
+    if(count==1 && napi_get_value_bool(env,args[0],&active)==napi_ok) mg_game_virtual_mouse_mode(active);
+#endif
+    return Undefined(env);
+}
+napi_value VirtualPause(napi_env env, napi_callback_info) {
+#if MG_HAS_GAME_RUNTIME
+    mg_game_virtual_pause();
+#endif
+    return Undefined(env);
+}
+napi_value NextAircraftWeapon(napi_env env, napi_callback_info) {
+#if MG_HAS_GAME_RUNTIME
+    mg_game_next_aircraft_weapon();
+#endif
+    return Undefined(env);
+}
+napi_value VirtualTargetingMode(napi_env env, napi_callback_info info) {
+    size_t count=1; napi_value args[1]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+#if MG_HAS_GAME_RUNTIME
+    int32_t mode=-1;
+    if(count==1 && napi_get_value_int32(env,args[0],&mode)==napi_ok) mg_game_virtual_targeting_mode(mode);
+#endif
+    return Undefined(env);
+}
 napi_value RawKey(napi_env env, napi_callback_info info) {
     size_t count=3; napi_value args[3]{}; napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
     bool accepted=false;
@@ -390,7 +472,25 @@ napi_value InputFocus(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
 #if MG_HAS_GAME_RUNTIME
     bool focused = false;
-    if (count == 1 && napi_get_value_bool(env, args[0], &focused) == napi_ok) mg_game_focus(focused);
+    if (count == 1 && napi_get_value_bool(env, args[0], &focused) == napi_ok) {
+        fivestar_gamepad::set_focus(focused); mg_game_focus(focused);
+    }
+#endif
+    return Undefined(env);
+}
+napi_value AppForeground(napi_env env, napi_callback_info info) {
+    size_t count = 1;
+    napi_value args[1]{};
+    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
+    bool foreground = false;
+    if (count != 1 || napi_get_value_bool(env, args[0], &foreground) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "App foreground state must be a boolean.");
+        return nullptr;
+    }
+#if MG_HAS_GAME_RUNTIME
+    // Visibility must reach Rust even before configure/start dispatch. Input
+    // focus is independent: opening a menu must not pause presentation.
+    mg_game_app_foreground(foreground);
 #endif
     return Undefined(env);
 }
@@ -435,6 +535,7 @@ void RegisterGameSurface(napi_env env, napi_value exports) {
     }
 }
 void ExportGameMethods(napi_env env, napi_value exports) {
+    fivestar_gamepad::initialize();
     SetGameResourceImportGate(ResourceImportGate);
     SetGameSaveImportGate(ResourceImportGate);
     napi_property_descriptor methods[] = {
@@ -444,6 +545,17 @@ void ExportGameMethods(napi_env env, napi_value exports) {
         {"gameStatus", nullptr, Status, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"gameCapabilities", nullptr, Capabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getTouchState", nullptr, TouchState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendVirtualPad", nullptr, VirtualPad, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"virtualPadState", nullptr, VirtualPadState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"physicalControllerConnected", nullptr, PhysicalControllerConnected, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"releaseVirtualPad", nullptr, ReleaseVirtualPad, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setVirtualRadio", nullptr, VirtualRadio, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"queueVirtualCameraSwipe", nullptr, VirtualCameraSwipe, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendMouseDelta", nullptr, RelativeMouse, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setVirtualMouseMode", nullptr, VirtualMouseMode, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"requestVirtualPause", nullptr, VirtualPause, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"nextVirtualAircraftWeapon", nullptr, NextAircraftWeapon, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setVirtualTargetingMode", nullptr, VirtualTargetingMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendControl", nullptr, NamedControl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendRawKey", nullptr, RawKey, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseAllInputs", nullptr, ReleaseInputs, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -453,6 +565,7 @@ void ExportGameMethods(napi_env env, napi_value exports) {
         {"sendMouseButton", nullptr, MouseButton, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendKeyEvent", nullptr, KeyEvent, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setInputFocus", nullptr, InputFocus, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setAppForeground", nullptr, AppForeground, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendPointer", nullptr, Pointer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendWheel", nullptr, Wheel, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

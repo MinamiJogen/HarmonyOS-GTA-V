@@ -193,6 +193,13 @@ mod qos {
  pub static ENABLED: std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
  pub fn configure(value:bool){ENABLED.store(value,std::sync::atomic::Ordering::Relaxed);}
 }
+#[path=ENGINE_ARGS_PATH]
+mod engine_args;
+mod spatial_upscale {
+ pub fn configure(_: &serde_json::Value){}
+ pub fn render_size_override()->Option<(u32,u32)>{None}
+ pub fn status()->serde_json::Value{serde_json::json!({})}
+}
 mod actual_config {
  include!(CONFIG_PATH);
  #[cfg(test)] mod strict_flags {
@@ -203,13 +210,22 @@ mod actual_config {
    std::env::set_var("MUGUET_SUPPORT",&dir);
    for key in ["MUGUET_RES","MUGUET_SCALE","MUGUET_FPS"]{std::env::remove_var(key);}
    let defaults:serde_json::Value=serde_json::from_str(DEFAULT_CONFIG).unwrap();
-   for key in ["skip_empty_init_transition","readback_pool","luminance_no_zero"]{assert_eq!(defaults[key],false);}
+   for key in ["skip_empty_init_transition","readback_pool","luminance_no_zero","native_render_fastpath","io_handle_lru","pipeline_cache_read_only","inline_upload_borrow","native_command_fastpath","native_benchmark_monitor","skip_empty_render_prepass","render_prepass_diagnostics"]{assert_eq!(defaults[key],false);}
    for key in ["thread_qos","depth_reduce_opt","depth_reduce_no_zero"]{assert_eq!(defaults[key],true);}
-   assert_eq!(defaults["scale"],0.4);assert_eq!(defaults["fps_limit"],30);
+   assert_eq!(defaults["scale"],0.4);assert_eq!(defaults["fps_limit"],0);
    for (key,envkey,otherenv) in [
     ("skip_empty_init_transition","MUGUET_SKIP_EMPTY_INIT_TRANSITION","MUGUET_READBACK_POOL"),
     ("readback_pool","MUGUET_READBACK_POOL","MUGUET_SKIP_EMPTY_INIT_TRANSITION"),
-    ("luminance_no_zero","MUGUET_LUMINANCE_NO_ZERO","MUGUET_READBACK_POOL")
+    ("luminance_no_zero","MUGUET_LUMINANCE_NO_ZERO","MUGUET_READBACK_POOL"),
+    ("native_render_fastpath","MUGUET_NATIVE_RENDER_FASTPATH","MUGUET_IO_HANDLE_LRU"),
+    ("io_handle_lru","MUGUET_IO_HANDLE_LRU","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("pipeline_cache_read_only","MUGUET_PIPELINE_CACHE_READ_ONLY","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("pso_warmup_read_only","MUGUET_PSO_WARMUP_READ_ONLY","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("inline_upload_borrow","MUGUET_INLINE_UPLOAD_BORROW","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("native_command_fastpath","MUGUET_NATIVE_COMMAND_FASTPATH","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("native_benchmark_monitor","MUGUET_NATIVE_BENCHMARK_MONITOR","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("skip_empty_render_prepass","MUGUET_SKIP_EMPTY_RENDER_PREPASS","MUGUET_NATIVE_RENDER_FASTPATH"),
+    ("render_prepass_diagnostics","MUGUET_RENDER_PREPASS_DIAGNOSTICS","MUGUET_NATIVE_RENDER_FASTPATH")
    ]{
     let values:Vec<Option<serde_json::Value>>=vec![None,Some(false.into()),Some(true.into()),Some("true".into()),Some(1.into()),Some(serde_json::Value::Null),Some(serde_json::json!([])),Some(serde_json::json!({})),Some(true.into()),Some(false.into()),None];
     for (i,value) in values.into_iter().enumerate(){
@@ -228,9 +244,18 @@ mod actual_config {
      assert!(args.iter().any(|a|a=="-frameLimit=1"));
     }
    }
-   std::fs::write(&path,DEFAULT_CONFIG).unwrap();settings(&path);
-   assert_eq!(render_size(3000,2000),(1202,800));assert_eq!(fps_target(),30.0);
-   for k in ["MUGUET_SKIP_EMPTY_INIT_TRANSITION","MUGUET_READBACK_POOL","MUGUET_LUMINANCE_NO_ZERO"]{assert!(std::env::var_os(k).is_none());}
+   assert_eq!(defaults["pso_warmup"],true);assert_eq!(defaults["pso_warmup_read_only"],false);
+   for value in [None,Some(false.into()),Some(true.into()),Some("true".into()),Some(1.into()),Some(serde_json::Value::Null)] {
+    let mut cfg=serde_json::json!({});if let Some(v)=value.clone(){cfg["pso_warmup"]=v;}
+    std::env::set_var("MUGUET_PSO_WARMUP","stale");
+    std::fs::write(&path,serde_json::to_string(&cfg).unwrap()).unwrap();settings(&path);
+    let off=value.as_ref().is_some_and(|v|v.as_bool()!=Some(true));
+    assert_eq!(std::env::var("MUGUET_PSO_WARMUP").ok().as_deref(),if off{Some("0")}else{None});
+   }
+   std::fs::write(&path,DEFAULT_CONFIG).unwrap();let unlimited_args=settings(&path);
+   assert!(unlimited_args.iter().any(|a|a=="-frameLimit=0"));
+   assert_eq!(render_size(3000,2000),(1202,800));assert_eq!(fps_target(),0.0);
+   for k in ["MUGUET_SKIP_EMPTY_INIT_TRANSITION","MUGUET_READBACK_POOL","MUGUET_LUMINANCE_NO_ZERO","MUGUET_NATIVE_RENDER_FASTPATH","MUGUET_IO_HANDLE_LRU","MUGUET_PIPELINE_CACHE_READ_ONLY"]{assert!(std::env::var_os(k).is_none());}
    std::fs::remove_dir_all(dir).unwrap();
   }
  }
@@ -258,7 +283,7 @@ def main():
     buffer_text = BUFFER.read_text()
     buffer_text = buffer_text[buffer_text.index("#[derive(Debug, Clone)]"):buffer_text.index("impl BufferInitTracker")]
     helper_path = json.dumps(str(HELPER), ensure_ascii=False)
-    config_test = CONFIG_TEST.replace("CONFIG_PATH", json.dumps(str(CONFIG), ensure_ascii=False))
+    config_test = CONFIG_TEST.replace("CONFIG_PATH", json.dumps(str(CONFIG), ensure_ascii=False)).replace("ENGINE_ARGS_PATH", json.dumps(str(ROOT / "game-runtime/src/engine_args.rs"), ensure_ascii=False))
     rust = PRELUDE + init_text + buffer_text
     rust += f'\n#[path = {helper_path}]\nmod empty_init_transition;\n'
     rust += "\nimpl BakedCommands {\n" + actual.replace(CFG, "") + "\n" + reference + "\n}\n"
@@ -308,11 +333,11 @@ serde_json = "1"
         "scope": "Complete actual initialize_buffer_memory function, actual generic InitTracker and actual helper; host mocks only for HAL/device state/resource handle. Complete actual config.rs compiled with unrelated runtime stubs.",
         "transformationsForHost": ["Remove the single OHOS/std cfg attribute to exercise the OHOS branch on macOS.", "Reference function removes only the new branch and renames function; all old collection, range merge, validation, transition and clear code is unchanged."],
         "matrixRuns": runs, "bufferCaseExecutions": 104,
-        "configChecks": {"newFlags": ["skip_empty_init_transition", "readback_pool", "luminance_no_zero"], "casesPerFlag": 11, "missingFalseInvalidClearStaleEnv": True, "onlyBooleanTrueEnables": True, "qualifiedThreeTrueDefaultsPreserved": True, "default1202x800At30AndExplicit60Preserved": True},
+        "configChecks": {"newFlags": ["skip_empty_init_transition", "readback_pool", "luminance_no_zero", "native_render_fastpath", "io_handle_lru", "pipeline_cache_read_only", "pso_warmup_read_only", "inline_upload_borrow", "native_command_fastpath", "native_benchmark_monitor", "skip_empty_render_prepass", "render_prepass_diagnostics"], "casesPerFlag": 11, "missingFalseInvalidClearStaleEnv": True, "onlyBooleanTrueEnables": True, "qualifiedThreeTrueDefaultsPreserved": True, "psoWarmupDefaultOnStrictConfigCases": 6, "default1202x800UnlimitedAndExplicit60Preserved": True},
         "validationBoundary": "Host call-sequence and initialization-range equivalence; does not validate actual Vulkan synchronization or device performance. Real tracker source reviewed separately; no game/HAP build, HDC or device operations.",
     }
     (OUT / "actual-source-tests.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"status": "pass", "bufferCaseExecutions": 104, "configFlagCases": 33, "report": str(OUT / "actual-source-tests.json")}))
+    print(json.dumps({"status": "pass", "bufferCaseExecutions": 104, "configFlagCases": len(report["configChecks"]["newFlags"]) * report["configChecks"]["casesPerFlag"], "report": str(OUT / "actual-source-tests.json")}))
 
 
 if __name__ == "__main__":

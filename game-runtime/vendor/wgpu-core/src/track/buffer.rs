@@ -337,6 +337,22 @@ impl BufferTracker {
         self.metadata.contains(buffer.tracker_index().as_usize())
     }
 
+    #[cfg(all(target_env = "ohos", feature = "std"))]
+    pub(crate) fn pending_transitions_are_empty(&self) -> bool { self.temp.is_empty() }
+
+    /// Read-only sufficient proof only. Complex/unknown cases keep the old path.
+    #[cfg(all(target_env = "ohos", feature = "std"))]
+    pub(crate) fn scope_proves_no_transitions(&self, scope: &BufferUsageScope) -> bool {
+        self.temp.is_empty() && scope.metadata.owned_indices().all(|index| {
+            crate::command::empty_render_prepass::resource_proves_no_transition(
+                self.metadata.contains(index),
+                self.end.get(index).map(|usage| u64::from(usage.bits())),
+                scope.state.get(index).map(|usage| u64::from(usage.bits())),
+                u64::from(self.ordered_uses_mask.bits()),
+            )
+        })
+    }
+
     /// Returns a list of all buffers tracked.
     pub fn used_resources(&self) -> impl Iterator<Item = &Arc<Buffer>> + '_ {
         self.metadata.owned_resources()

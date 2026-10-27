@@ -5,6 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::{CommandBuffer, CommandEncoder, Device, Queue, Texture};
 
+#[cfg(any(feature = "frame-interpolation", test))]
+#[path = "frame_readback_rows.rs"]
+mod readback_rows;
+
 // Process-local UI observations; never infer a live backend from a status file
 // left by another process. State 2 requires a successfully presented NEW AI frame.
 static LIVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -141,6 +145,47 @@ mod pairing {
             true_midpoint_monotonic_ns,scheduled_due_monotonic_ns,gap_ns,midpoint_elapsed_ns,midpoint_clock_error_ns,
             newer_elapsed_ns:b.elapsed_ns,due_elapsed_ns:due_elapsed,newer_due_slot:new_output,window_end_elapsed_ns})
     }
+    // Unlimited native cadence uses capture timestamps, never output-clock buckets.
+    pub(super) const MAX_NATIVE_HOLD_NS:u64=50_000_000;
+    pub(super) fn select_variable(a:Endpoint,b:Endpoint,deadline_ns:u64)->Result<Pair,Skip> {
+        if a.epoch!=b.epoch||a.presentation_generation!=b.presentation_generation||a.sequence>=b.sequence||a.slot>=b.slot||a.elapsed_ns>=b.elapsed_ns||deadline_ns<=b.elapsed_ns {return Err(Skip::Invalid);}
+        if a.ordinal.checked_add(1)!=Some(b.ordinal) {return Err(Skip::Discontinuity);}
+        let gap_ns=b.elapsed_ns-a.elapsed_ns;
+        if gap_ns>MAX_GAP_NS {return Err(Skip::Gap);}
+        let midpoint_elapsed_ns=a.elapsed_ns+gap_ns/2;
+        if midpoint_elapsed_ns<=a.elapsed_ns {return Err(Skip::Invalid);}
+        let due_elapsed_ns=b.elapsed_ns+(deadline_ns-b.elapsed_ns)/2;
+        let true_midpoint_monotonic_ns=match(a.monotonic_ns,b.monotonic_ns) {
+            (Some(old),Some(new)) if new>old=>Some(old+(new-old)/2),
+            (Some(_),Some(_))=>return Err(Skip::Invalid),_=>None,
+        };
+        Ok(Pair {epoch:a.epoch,presentation_generation:a.presentation_generation,older_sequence:a.sequence,newer_sequence:b.sequence,
+            older_slot:a.slot,newer_slot:b.slot,midpoint_slot:midpoint_elapsed_ns,older_monotonic_ns:a.monotonic_ns,newer_monotonic_ns:b.monotonic_ns,
+            true_midpoint_monotonic_ns,scheduled_due_monotonic_ns:b.monotonic_ns.and_then(|n|n.checked_add(due_elapsed_ns-b.elapsed_ns)),
+            gap_ns,midpoint_elapsed_ns,midpoint_clock_error_ns:0,newer_elapsed_ns:b.elapsed_ns,due_elapsed_ns,
+            newer_due_slot:b.elapsed_ns,window_end_elapsed_ns:deadline_ns})
+    }
+    /// At most two owned native snapshots. A new arrival releases the previous
+    /// pending source immediately; a stalled producer drains within 50 ms.
+    /// Optional AI work and the configured AI output budget never gate take().
+    pub(super) struct NativePacer<T> {ready:Option<T>,pending:Option<(T,u64)>,last_capture:Option<u64>}
+    impl<T> Default for NativePacer<T> {fn default()->Self {Self {ready:None,pending:None,last_capture:None}}}
+    impl<T> NativePacer<T> {
+        pub(super) fn offer(&mut self,value:T,captured:u64)->(u64,bool) {
+            let gap=self.last_capture.map(|last|captured.saturating_sub(last));self.last_capture=Some(captured);
+            let deadline=captured.saturating_add(gap.unwrap_or(0).clamp(1_000_000,MAX_NATIVE_HOLD_NS));
+            let replaced=if gap.is_none() {self.ready.replace(value).is_some()}else {
+                let old=self.pending.replace((value,deadline));old.is_some_and(|(old,_)|self.ready.replace(old).is_some())
+            };
+            (deadline,replaced)
+        }
+        pub(super) fn urgent(&self,now:u64)->bool {self.ready.is_some()||self.pending.as_ref().is_some_and(|(_,due)|now>=*due)}
+        pub(super) fn busy(&self)->bool {self.ready.is_some()||self.pending.is_some()}
+        pub(super) fn take(&mut self,now:u64)->Option<T> {
+            self.ready.take().or_else(||if self.pending.as_ref().is_some_and(|(_,due)|now>=*due){self.pending.take().map(|(v,_)|v)}else{None})
+        }
+        pub(super) fn retry(&mut self,value:T) {if self.ready.is_none(){self.ready=Some(value);}}
+    }
     pub(super) fn can_start(pair:Pair,now_elapsed_ns:u64)->bool {
         now_elapsed_ns>=pair.newer_elapsed_ns&&now_elapsed_ns<pair.window_end_elapsed_ns
     }
@@ -171,6 +216,75 @@ mod pairing {
         fn endpoint(slot:u64,sequence:u64,ordinal:u64,period:u64,offset:u64)->Endpoint {
             let elapsed_ns=slot*period*2+offset;
             Endpoint {epoch:7,presentation_generation:4,sequence,slot,ordinal,elapsed_ns,monotonic_ns:Some(1_000_000_000+elapsed_ns)}
+        }
+        fn variable_endpoint(sequence:u64,elapsed_ns:u64)->Endpoint {
+            Endpoint {epoch:7,presentation_generation:4,sequence,slot:sequence,ordinal:sequence,elapsed_ns,monotonic_ns:Some(1_000_000_000+elapsed_ns)}
+        }
+        #[test]
+        fn unlimited_native_80_120_240hz_has_no_source_or_output_bucket() {
+            for hz in [80,120,240] {
+                let gap=1_000_000_000/hz;let mut pacer=NativePacer::default();let mut presented=Vec::new();
+                for n in 0..240u64 {
+                    let capture=n*gap;let (deadline,replaced)=pacer.offer(n,capture);
+                    assert!(!replaced);assert!(deadline<=capture+MAX_NATIVE_HOLD_NS);
+                    if let Some(source)=pacer.take(capture) {presented.push(source);}
+                    if n>0 {let pair=select_variable(variable_endpoint(n,capture-gap),variable_endpoint(n+1,capture),deadline).unwrap();
+                        assert_eq!(pair.midpoint_slot,capture-gap+gap/2);assert_eq!(pair.midpoint_clock_error_ns,0);
+                        assert_eq!(pair.newer_slot,n+1);assert!(pair.due_elapsed_ns<pair.window_end_elapsed_ns);}
+                }
+                presented.push(pacer.take(240*gap+MAX_NATIVE_HOLD_NS).unwrap());
+                assert_eq!(presented,(0..240u64).collect::<Vec<_>>());
+                assert!(!pacer.busy());assert!(!pacer.urgent(u64::MAX));
+            }
+        }
+        #[test]
+        fn variable_native_stalls_drain_within_50ms_without_accumulating_delay() {
+            let mut pacer=NativePacer::default();pacer.offer(1,0);assert_eq!(pacer.take(0),Some(1));
+            for (value,capture) in [(2,300_000_000),(3,2_000_000_000),(4,3_000_000_000)] {
+                let (deadline,replaced)=pacer.offer(value,capture);assert!(!replaced);
+                assert!(deadline>capture&&deadline<=capture+MAX_NATIVE_HOLD_NS);
+                assert_eq!(pacer.take(deadline-1),None);assert_eq!(pacer.take(deadline),Some(value));
+                assert!(!pacer.busy());
+            }
+        }
+        #[test]
+        fn irregular_native_arrivals_preserve_all_sources_without_catch_up_bursts() {
+            let arrivals=[0,8_000_000,19_000_000,21_000_000,100_000_000,102_000_000,900_000_000];
+            let mut pacer=NativePacer::default();let mut shown=Vec::new();
+            for (index,capture) in arrivals.into_iter().enumerate() {
+                if let Some(due)=pacer.pending.as_ref().map(|(_,due)|*due).filter(|due|*due<capture) {
+                    shown.push((pacer.take(due).unwrap(),due));
+                }
+                assert!(!pacer.offer(index,capture).1);
+                if let Some(source)=pacer.take(capture) {shown.push((source,capture));}
+            }
+            let due=pacer.pending.as_ref().unwrap().1;shown.push((pacer.take(due).unwrap(),due));
+            assert_eq!(shown.iter().map(|(index,_)|*index).collect::<Vec<_>>(),(0..arrivals.len()).collect::<Vec<_>>());
+            for (index,shown_ns) in shown {assert!(shown_ns>=arrivals[index]);assert!(shown_ns-arrivals[index]<=MAX_NATIVE_HOLD_NS);}
+            assert!(!pacer.busy());
+        }
+        #[test]
+        fn variable_source_backpressure_is_bounded_and_retry_keeps_owned_source() {
+            let mut pacer=NativePacer::default();assert!(!pacer.offer(1,0).1);
+            assert!(!pacer.offer(2,10_000_000).1);
+            assert!(pacer.offer(3,20_000_000).1); // superseded unconsumed source1, fixed two slots
+            assert_eq!(pacer.take(20_000_000),Some(2));pacer.retry(2);
+            assert_eq!(pacer.take(20_000_000),Some(2));assert_eq!(pacer.take(30_000_000),Some(3));
+            assert!(!pacer.busy());
+            pacer.offer(4,40_000_000);pacer=NativePacer::default(); // same operation as lifecycle reset
+            assert_eq!(pacer.take(u64::MAX),None);assert!(!pacer.busy());
+        }
+        #[test]
+        fn variable_pair_skips_sample_holes_and_never_rewinds_after_native_newer() {
+            let a=variable_endpoint(1,0);let b=variable_endpoint(2,10_000_000);
+            let p=select_variable(a,b,20_000_000).unwrap();
+            assert!(can_start(p,10_000_000));assert!(!can_start(p,20_000_000));
+            assert_eq!(p.true_midpoint_monotonic_ns,Some(1_005_000_000));assert_eq!(p.scheduled_due_monotonic_ns,Some(1_015_000_000));
+            assert_eq!(admit(p.midpoint_slot,p.midpoint_slot,None,Some(b.elapsed_ns),false),Admission::Stale);
+            assert_eq!(select_variable(a,variable_endpoint(3,12_000_000),24_000_000),Err(Skip::Discontinuity));
+            assert_eq!(select_variable(a,Endpoint {epoch:8,..b},20_000_000),Err(Skip::Invalid));
+            assert_eq!(select_variable(a,b,b.elapsed_ns),Err(Skip::Invalid));
+            assert_eq!(select_variable(a,variable_endpoint(2,MAX_GAP_NS+1),MAX_GAP_NS+2),Err(Skip::Gap));
         }
         #[test]
         fn adjacent_pairs_keep_the_original_slot_at_every_supported_clock() {
@@ -466,6 +580,13 @@ mod status_writer {
     use std::{io::Write,path::{Path,PathBuf},sync::{Arc,atomic::{AtomicBool,AtomicU64,Ordering},mpsc::{self,SyncSender,TrySendError}}};
     use std::os::unix::fs::{OpenOptionsExt,PermissionsExt};
     const MAX_BYTES:usize=4*1024*1024;
+    fn mode_for_monitor_flag(value:Option<&std::ffi::OsStr>)->u32 {
+        if value==Some(std::ffi::OsStr::new("1")){0o660}else{0o600}
+    }
+    fn startup_file_mode()->u32 {
+        static MODE:std::sync::OnceLock<u32>=std::sync::OnceLock::new();
+        *MODE.get_or_init(||mode_for_monitor_flag(std::env::var_os("MUGUET_NATIVE_BENCHMARK_MONITOR").as_deref()))
+    }
     #[derive(Default)]
     struct Stats {
         generated:AtomicU64,enqueued:AtomicU64,full_drops:AtomicU64,disconnected_drops:AtomicU64,
@@ -479,7 +600,8 @@ mod status_writer {
     impl Drop for Liveness {fn drop(&mut self){self.0.running.store(false,Ordering::Release);self.0.exited.store(true,Ordering::Release);}}
     impl Writer {
         pub(super) fn new(root:PathBuf)->Self {
-            Self::with_sink(move|snapshot,stats|publish(&root,snapshot,stats))
+            let mode=startup_file_mode();
+            Self::with_sink(move|snapshot,stats|publish(&root,snapshot,stats,mode))
         }
         fn with_sink(mut sink:impl FnMut(Snapshot,&Stats)+Send+'static)->Self {
             let stats=Arc::new(Stats::default());let (sender,receiver)=mpsc::sync_channel(1);let worker_stats=stats.clone();
@@ -510,7 +632,7 @@ mod status_writer {
             2=>stats.oversize_drops.fetch_add(1,Ordering::Relaxed)+1,_=>stats.io_errors.fetch_add(1,Ordering::Relaxed)+1};
         if count<=3||count.is_power_of_two(){eprintln!("[frame-interpolation] state writer error code={code} count={count}: {error}");}
     }
-    fn publish(root:&Path,mut snapshot:Snapshot,stats:&Stats) {
+    fn publish(root:&Path,mut snapshot:Snapshot,stats:&Stats,mode:u32) {
         let started_ns=super::monotonic_ns();
         let Some(object)=snapshot.value.as_object_mut() else{report_error(stats,1,"snapshot is not an object");return;};
         object.insert("statusSnapshotSequence".into(),json!(snapshot.sequence));
@@ -533,8 +655,8 @@ mod status_writer {
         let tmp=root.join(format!(".frame-interpolation-status-{}.json.tmp",std::process::id()));
         let write=||->std::io::Result<()> {
             let mut file=std::fs::OpenOptions::new().create(true).truncate(true).write(true)
-                .custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).mode(0o600).open(&tmp)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                .custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).mode(mode).open(&tmp)?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
             // One contiguous write_all, not serde Display's per-token File writes.
             file.write_all(&bytes)?;drop(file);
             std::fs::rename(&tmp,root.join("frame-interpolation-status.json"))
@@ -561,12 +683,14 @@ mod implementation {
         }
         pub(crate) fn cache_epoch(&self)->u64 {0}
         pub(crate) fn active(&self) -> bool { false }
+        pub(crate) fn unlimited_native(&self)->bool {false}
         pub(crate) fn context(&mut self, _: bool, _: (u32,u32)) {}
         pub(crate) fn record(&mut self, _: &Device, _: &Texture, _: u64) -> Option<CommandBuffer> { None }
         pub(crate) fn tick(&mut self, _: &Device) -> Option<Display> { None }
         pub(crate) fn prepare_output(&mut self, _: &Device, _: &Queue, _: &Display, _: &mut CommandEncoder) -> Option<Texture> { None }
         pub(crate) fn presented(&mut self, _: &Display, _: bool, _: Option<u64>, _: Option<u64>) {}
         pub(crate) fn output_skipped(&mut self, _: &str) {}
+        pub(crate) fn output_failed(&mut self,_:String) {}
         pub(crate) fn output_size(&mut self, _: (u32,u32), _: bool) {}
         pub(crate) fn validate_adapter(&mut self, _: &wgpu::Adapter) {}
         pub(crate) fn note_output_capture(&mut self, _: &str, _: &Display) {}
@@ -676,6 +800,7 @@ mod implementation {
         fn muguet_interpolation_get_device_info(ctx:*mut c_void,info:*mut DeviceInfo)->i32;
         fn muguet_interpolation_destroy(ctx:*mut c_void);
         fn muguet_interpolation_build_revision()->*const c_char;
+        fn muguet_interpolation_rife_available()->i32;
         fn muguet_fg_npu_flow_create(context:*mut *mut c_void)->i32;
         fn muguet_fg_npu_flow_process_rgba8(context:*mut c_void,input0:*const u8,bytes0:usize,input1:*const u8,bytes1:usize,
             half:*mut u16,half_capacity:usize,logits:*mut f32,logit_capacity:usize)->i32;
@@ -687,7 +812,7 @@ mod implementation {
     struct Context(*mut c_void,bool);
     impl Drop for Context { fn drop(&mut self) { unsafe {if self.1 {muguet_fg_npu_flow_destroy(self.0)}else{muguet_interpolation_destroy(self.0)}} } }
     #[derive(Clone)]
-    struct Source { endpoint:super::pairing::Endpoint,origin:Instant,period_ns:u64,rgb:Arc<Vec<u8>> }
+    struct Source { endpoint:super::pairing::Endpoint,origin:Instant,period_ns:u64,native_deadline_ns:Option<u64>,rgb:Arc<Vec<u8>> }
     enum WorkerResult {
         Started(Value),
         Mid { pair:super::pairing::Pair,rgb:Arc<Vec<u8>>,milliseconds:f64,different_pixels:usize },
@@ -764,6 +889,9 @@ mod implementation {
                     "hardwarePlacementIndependentlyVerified":false,"cpuWarpEnabled":false,"gpuWarpEnabled":true,
                     "contextOwnership":"public_NNRT_CANN_rawflow_worker_context"})));
             }
+            if mode=="rife" && unsafe {muguet_interpolation_rife_available()}==0 {
+                return Err("RIFE unavailable: this build contains NPU frame interpolation only".into());
+            }
             if mode=="rife" { model_hash(&model.join("flownet.param"),"724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c")?;
             model_hash(&model.join("flownet.bin"),"f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958")?; }
             let model=CString::new(model.as_os_str().as_encoded_bytes()).map_err(|e|format!("model path: {e}"))?;
@@ -797,7 +925,8 @@ mod implementation {
                 previous.endpoint.epoch!=source.endpoint.epoch) {previous=None;}
             if let Some(a)=previous.as_ref() {
                 stats.pair_candidates.fetch_add(1,Ordering::Relaxed);
-                let pair=match super::pairing::select(a.endpoint,source.endpoint,source.period_ns) {
+                let selection=match source.native_deadline_ns {Some(deadline)=>super::pairing::select_variable(a.endpoint,source.endpoint,deadline),None=>super::pairing::select(a.endpoint,source.endpoint,source.period_ns)};
+                let pair=match selection {
                     Ok(pair) if a.origin==source.origin&&a.period_ns==source.period_ns=>pair,
                     result=>{
                         let counter=match result {
@@ -920,7 +1049,7 @@ mod implementation {
         ready:Receiver<Result<(),String>>,began:Instant,
         width:u32,height:u32,pitch:usize,bytes:usize,
         monotonic_ns:Option<u64>,
-        origin:Instant,elapsed_ns:u64,period_ns:u64,
+        origin:Instant,elapsed_ns:u64,period_ns:u64,native_deadline_ns:Option<u64>,
     }
     #[derive(Clone)]
     struct Ready { rgb:Arc<Vec<u8>>,sequence:u64,source_slot:u64,content_slot:u64,kind:&'static str,gpu:Option<GpuFrame>,
@@ -944,10 +1073,10 @@ mod implementation {
         acquire_failures:u64,resets:u64,event_drops:u64,
         orphan_flows:u64,orphan_mids:u64,pair_collisions:u64,output_skips:u64,gpu_warps:u64,
         late_ai_presented:u64,ai_window_expired:u64,ai_not_forward:u64,source_not_forward:u64,
-        retired_readbacks:u64,retired_worker_results:u64,
+        retired_readbacks:u64,retired_worker_results:u64,native_superseded:u64,
     }
     pub(crate) struct Interpolator {
-        mode:&'static str, began:Instant, origin:Option<Instant>, next_source_slot:u64,next_slot:u64,
+        mode:&'static str,unlimited_native:bool,native_pacer:super::pairing::NativePacer<Ready>,native_offered:Option<Ready>,native_retry_after:Option<Instant>,last_ai_emit:Option<Instant>, began:Instant, origin:Option<Instant>, next_source_slot:u64,next_slot:u64,
         status_writer:super::status_writer::Writer,
         classifier_policy:&'static str,
         output_fps:u32,period_ns:u64,source_ns:u64,
@@ -963,7 +1092,7 @@ mod implementation {
         info:Option<Value>,counts:Counts,inference_ms:VecDeque<f64>,trace:VecDeque<Value>,last_present:Option<Instant>,
         rejections:VecDeque<Value>,
     }
-    impl Drop for Interpolator { fn drop(&mut self) {note_live(0);self.stop.store(true,Ordering::Release);self.epoch.fetch_add(1,Ordering::AcqRel);} }
+    impl Drop for Interpolator { fn drop(&mut self) {note_live(0);crate::native_telemetry::set_source_target(None);self.stop.store(true,Ordering::Release);self.epoch.fetch_add(1,Ordering::AcqRel);} }
     impl Interpolator {
         pub(crate) fn from_env()->Option<Self> {
             note_live(0);
@@ -987,7 +1116,7 @@ mod implementation {
                 std::thread::Builder::new().name("game-frame-ai".into()).stack_size(8<<20).spawn(move||worker(model,mode,classifier_policy,rx,tx,e,s,stats))
                     .map_err(|e|format!("spawn interpolation worker: {e}"))?;
                 let now=Instant::now();
-                Ok(Self {status_writer:super::status_writer::Writer::new(root),mode,classifier_policy,began:now,origin:None,next_source_slot:0,next_slot:0,next_poll:now,next_report:now,
+                Ok(Self {status_writer:super::status_writer::Writer::new(root),mode,unlimited_native:crate::config::fps_target()<=0.0,native_pacer:Default::default(),native_offered:None,native_retry_after:None,last_ai_emit:None,classifier_policy,began:now,origin:None,next_source_slot:0,next_slot:0,next_poll:now,next_report:now,
                     output_fps,period_ns,source_ns:period_ns*2,
                     visible:crate::ffi::app_presentation_allowed(),presentation_generation:crate::ffi::app_presentation_generation(),
                     physical:crate::ffi::physical_size(),source_desc:None,epoch,stop,jobs,results,worker_stats,
@@ -997,10 +1126,12 @@ mod implementation {
                     output_capture:None,output_capture_rows:Vec::new(),
                     failed:None,info:None,counts:Counts::default(),inference_ms:VecDeque::new(),trace:VecDeque::new(),last_present:None,rejections:VecDeque::new()})
             };
-            match setup() {Ok(mut v)=>{eprintln!("[frame-interpolation] enabled: backend {}; original GPU resolution; 200ms delay, {}Hz source / {}Hz output deadlines; classifier_policy={}",v.mode,v.output_fps/2,v.output_fps,v.classifier_policy);v.report();Some(v)},
+            match setup() {Ok(mut v)=>{crate::native_telemetry::set_source_target(if v.unlimited_native{None}else{Some(v.output_fps as f64 / 2.0)});eprintln!("[frame-interpolation] native cadence={} maxNativeHoldMs={}",if v.unlimited_native{"unlimited_capture_timestamps"}else{"legacy_half_output"},if v.unlimited_native{50}else{200});eprintln!("[frame-interpolation] enabled: backend {}; original GPU resolution; nativeHz={:?}; AI budget={}Hz; classifier_policy={}",v.mode,if v.unlimited_native{None}else{Some(v.output_fps/2)},v.output_fps,v.classifier_policy);v.report();Some(v)},
                 Err(e)=>{note_live(3);eprintln!("[frame-interpolation] rejected; original presentation retained: {e}");None}}
         }
         pub(crate) fn active(&self)->bool { self.failed.is_none() }
+        pub(crate) fn unlimited_native(&self)->bool {self.unlimited_native}
+        pub(crate) fn output_failed(&mut self,error:String) {self.fail(error);}
         pub(crate) fn cache_epoch(&self)->u64 {self.epoch.load(Ordering::Acquire)}
         pub(crate) fn update_slow_trace_context(&self) {
             if super::slow_trace::enabled(){super::slow_trace::source(self.epoch.load(Ordering::Relaxed),self.counts.guest_sources,
@@ -1027,9 +1158,9 @@ mod implementation {
                 "sourceSequence":display.source_sequence,"sourceSlot":display.source_slot,
                 "newerSourceSequence":display.newer_source_sequence,"newerSourceSlot":display.newer_source_slot}));}
         }
-        pub(crate) fn wait(&self)->Duration {if self.active(){Duration::from_millis(1)}else{Duration::from_millis(100)}}
+        pub(crate) fn wait(&self)->Duration {if self.active()&&self.visible&&(!self.unlimited_native||self.native_pacer.busy()||!self.pending.is_empty()||!self.events.is_empty()){Duration::from_millis(1)}else{Duration::from_millis(100)}}
         pub(crate) fn source_wait(&self)->Duration {
-            if !self.active()||!self.visible||!presentation_current(self.presentation_generation,self.epoch.load(Ordering::Acquire),&self.epoch,&self.stop) {return Duration::ZERO;}
+            if self.unlimited_native||!self.active()||!self.visible||!presentation_current(self.presentation_generation,self.epoch.load(Ordering::Acquire),&self.epoch,&self.stop) {return Duration::ZERO;}
             self.origin.map(|origin|(origin+Duration::from_nanos(self.next_source_slot.saturating_mul(self.source_ns)))
                 .saturating_duration_since(Instant::now())).unwrap_or(Duration::ZERO)
         }
@@ -1044,12 +1175,13 @@ mod implementation {
         fn reset(&mut self,reason:&str) {
             note_live(if self.failed.is_some(){3}else{1});
             self.epoch.fetch_add(1,Ordering::AcqRel);self.origin=None;self.next_source_slot=0;self.next_slot=0;
-            self.events.clear();self.history.clear();self.source_times.clear();self.last=None;self.last_present=None;self.counts.resets+=1;
+            self.events.clear();self.history.clear();self.source_times.clear();self.native_pacer=Default::default();self.native_offered=None;self.native_retry_after=None;self.last_ai_emit=None;self.last=None;self.last_present=None;self.counts.resets+=1;
             // Pending maps retain their buffers until callbacks complete. Their
             // epoch is discarded rather than accessing stale image contents.
             eprintln!("[frame-interpolation] history cleared: {reason}");
         }
         fn fail(&mut self,error:String) {
+            crate::native_telemetry::set_source_target(None);
             eprintln!("[frame-interpolation] disabled; original presentation restored: {error}");
             self.failed=Some(error);self.stop.store(true,Ordering::Release);self.reset("error");self.report();
         }
@@ -1064,6 +1196,7 @@ mod implementation {
             if self.source_desc.is_some_and(|old|old!=desc) {self.reset("guest_source_extent_or_format_changed");}
             self.source_desc=Some(desc);
             let now=Instant::now();let origin=*self.origin.get_or_insert(now);
+            if self.unlimited_native {return self.record_unlimited(device,source,sequence,origin,now);}
             let source_slot=(now.duration_since(origin).as_nanos()/self.source_ns as u128).min(u64::MAX as u128) as u64;
             if source_slot<self.next_source_slot {self.counts.throttled_sources+=1;return None;}
             let Some(next)=source_slot.checked_add(1) else {self.fail("source clock overflow".into());return None;};
@@ -1073,6 +1206,53 @@ mod implementation {
                 Ok((command,pending))=>{self.counts.selected_sources+=1;self.pending.push_back(pending);Some(command)},
                 Err(error)=>{self.fail(error);None}
             }
+        }
+        fn record_unlimited(&mut self,device:&Device,source:&Texture,sequence:u64,origin:Instant,now:Instant)->Option<CommandBuffer> {
+            let elapsed_ns=u64::try_from(now.duration_since(origin).as_nanos()).ok()?;
+            // CPU readback capacity controls optional inference only. Every real
+            // source still gets an immutable full-resolution GPU snapshot.
+            let (command,snapshot,mut pending,mono)=if self.pending.len()<PENDING_LIMIT {
+                match self.encode(device,source,sequence,sequence,origin,now) {
+                    Ok((command,pending))=>{let snapshot=pending._snapshot.clone();let mono=pending.monotonic_ns;(command,snapshot,Some(pending),mono)},
+                    Err(error)=>{self.fail(error);return None;}
+                }
+            }else {
+                self.counts.readback_drops+=1;
+                match self.encode_native_snapshot(device,source) {
+                    Ok((command,snapshot))=>(command,snapshot,None,super::monotonic_ns()),
+                    Err(error)=>{self.fail(error);return None;}
+                }
+            };
+            let ready=Ready {rgb:Arc::new(Vec::new()),sequence,source_slot:sequence,content_slot:elapsed_ns,kind:"source",gpu:Some(GpuFrame::Source(snapshot)),
+                content_key:OutputContentKey {epoch:self.epoch.load(Ordering::Acquire),class:"source",older_sequence:sequence,older_slot:sequence,newer_sequence:None,newer_slot:None},
+                pair:None,source_monotonic_ns:mono};
+            let (deadline,replaced)=self.native_pacer.offer(ready,elapsed_ns);
+            if replaced {self.counts.native_superseded+=1;}
+            if let Some(mut sample)=pending.take() {sample.native_deadline_ns=Some(deadline);self.pending.push_back(sample);}
+            self.counts.selected_sources+=1;Some(command)
+        }
+        fn encode_native_snapshot(&mut self,device:&Device,source:&Texture)->Result<(CommandBuffer,Texture),String> {
+            let linear=source.format().remove_srgb_suffix();
+            if !matches!(linear,TextureFormat::Rgba8Unorm|TextureFormat::Bgra8Unorm)||source.dimension()!=TextureDimension::D2||source.sample_count()!=1||
+                !source.usage().contains(TextureUsages::TEXTURE_BINDING)||source.width()==0||source.height()==0||source.width() as u64*source.height() as u64*4>16*1024*1024 {
+                return Err("unsupported/bounded unlimited native source".into());
+            }
+            let validation=device.push_error_scope(ErrorFilter::Validation);let oom=device.push_error_scope(ErrorFilter::OutOfMemory);
+            let encoded=(||->Result<(CommandBuffer,Texture),String>{
+                if self.snapshot_pipeline.is_none(){self.snapshot_pipeline=Some(crate::spatial_upscale::blit_pipeline(device,TextureFormat::Rgba8Unorm));}
+                let pipeline=self.snapshot_pipeline.as_ref().ok_or("native snapshot pipeline missing")?;
+                let snapshot=texture(device,"unlimited-native-owned-source",source.width(),source.height(),TextureFormat::Rgba8Unorm,
+                    TextureUsages::RENDER_ATTACHMENT|TextureUsages::TEXTURE_BINDING|TextureUsages::COPY_SRC);
+                let view=source.create_view(&TextureViewDescriptor {format:Some(linear),dimension:Some(TextureViewDimension::D2),mip_level_count:Some(1),array_layer_count:Some(1),..Default::default()});
+                let binding=device.create_bind_group(&BindGroupDescriptor {label:Some("unlimited-native-snapshot-binding"),layout:&pipeline.get_bind_group_layout(0),entries:&[BindGroupEntry {binding:0,resource:BindingResource::TextureView(&view)}]});
+                let mut encoder=device.create_command_encoder(&CommandEncoderDescriptor {label:Some("unlimited-native-snapshot")});
+                draw(&mut encoder,"unlimited-native-copy",pipeline,&binding,&snapshot.create_view(&Default::default()));
+                Ok((encoder.finish(),snapshot))
+            })();
+            let allocation_error=pollster::block_on(oom.pop());let validation_error=pollster::block_on(validation.pop());
+            if let Some(error)=allocation_error {return Err(format!("native snapshot allocation: {error}"));}
+            if let Some(error)=validation_error {return Err(format!("native snapshot validation: {error}"));}
+            encoded
         }
         fn encode(&mut self,device:&Device,source:&Texture,sequence:u64,slot:u64,origin:Instant,captured:Instant)->Result<(CommandBuffer,Pending),String> {
             let monotonic_ns=super::monotonic_ns();
@@ -1094,12 +1274,12 @@ mod implementation {
                     self.pipeline=Some(rgba_pipeline(device,"game-interpolation-model-downsample",&source,&[TextureFormat::Rgba8Unorm]));
                 }
                 let pipeline=self.pipeline.as_ref().ok_or("downsample pipeline missing")?;
-                let (snapshot_width,snapshot_height)=if raw{(source.width(),source.height())}else{(width,height)};
+                let (snapshot_width,snapshot_height)=if raw||self.unlimited_native{(source.width(),source.height())}else{(width,height)};
                 let snapshot=texture(device,"game-interpolation-private-history",snapshot_width,snapshot_height,TextureFormat::Rgba8Unorm,
                     TextureUsages::RENDER_ATTACHMENT|TextureUsages::TEXTURE_BINDING|TextureUsages::COPY_SRC);
                 let source_view=source.create_view(&TextureViewDescriptor {format:Some(linear),dimension:Some(TextureViewDimension::D2),
                     mip_level_count:Some(1),array_layer_count:Some(1),..Default::default()});
-                let input_texture=if raw {texture(device,"game-npu-448x208-input",width,height,TextureFormat::Rgba8Unorm,
+                let input_texture=if raw||self.unlimited_native {texture(device,"game-npu-448x208-input",width,height,TextureFormat::Rgba8Unorm,
                     TextureUsages::RENDER_ATTACHMENT|TextureUsages::COPY_SRC)}else{snapshot.clone()};
                 let input_view=input_texture.create_view(&TextureViewDescriptor::default());
                 let binding=device.create_bind_group(&BindGroupDescriptor {label:Some("game-model-downsample-source"),layout:&pipeline.get_bind_group_layout(0),
@@ -1109,7 +1289,7 @@ mod implementation {
                 {let mut view=buffer.slice(..).get_mapped_range_mut().map_err(|e|format!("initial readback map: {e:?}"))?;view.slice(..).fill(SENTINEL);}
                 buffer.unmap();
                 let mut enc=device.create_command_encoder(&CommandEncoderDescriptor {label:Some("game-model-isolated-source-copy")});
-                if raw {
+                if raw||self.unlimited_native {
                     if self.snapshot_pipeline.is_none(){self.snapshot_pipeline=Some(crate::spatial_upscale::blit_pipeline(device,TextureFormat::Rgba8Unorm));}
                     let copy=self.snapshot_pipeline.as_ref().ok_or("history copy pipeline missing")?;
                     let binding=device.create_bind_group(&BindGroupDescriptor {label:Some("game-private-history-binding"),layout:&copy.get_bind_group_layout(0),
@@ -1123,7 +1303,7 @@ mod implementation {
                     Extent3d {width,height,depth_or_array_layers:1});
                 let (tx,ready)=mpsc::channel();enc.map_buffer_on_submit(&buffer,MapMode::Read,..,move|r|{let _=tx.send(r.map_err(|e|e.to_string()));});
                 Ok((enc.finish(),Pending {epoch:self.epoch.load(Ordering::Acquire),presentation_generation:self.presentation_generation,sequence,slot,buffer,_snapshot:snapshot,ready,began:Instant::now(),width,height,pitch,bytes,monotonic_ns,
-                    origin,elapsed_ns,period_ns:self.period_ns}))
+                    origin,elapsed_ns,period_ns:self.period_ns,native_deadline_ns:None}))
             })();
             let allocation_error=pollster::block_on(oom.pop());let validation_error=pollster::block_on(validation.pop());
             if let Some(e)=allocation_error {return Err(format!("downsample allocation: {e}"));}
@@ -1132,15 +1312,7 @@ mod implementation {
         }
         fn read(p:&Pending,raw:bool)->Result<Arc<Vec<u8>>,String> {
             let view=p.buffer.slice(..).get_mapped_range().map_err(|e|format!("readback mapped range: {e:?}"))?;
-            if view.len()!=p.bytes||!view[..GUARD].iter().chain(&view[p.bytes-GUARD..]).all(|&v|v==SENTINEL) {
-                return Err("readback length or prefix/suffix guards changed".into());
-            }
-            let mut rgb=Vec::with_capacity(p.width as usize*p.height as usize*if raw{4}else{3});
-            for row in 0..p.height as usize {
-                let at=GUARD+row*p.pitch;
-                for rgba in view[at..at+p.width as usize*4].chunks_exact(4) {rgb.extend_from_slice(if raw{rgba}else{&rgba[..3]});}
-                if !view[at+p.width as usize*4..at+p.pitch].iter().all(|&v|v==SENTINEL) {return Err("readback row padding guard changed".into());}
-            }
+            let rgb=super::readback_rows::copy_guarded_rgba(&view,p.width,p.height,p.pitch,p.bytes,GUARD,SENTINEL,raw)?;
             drop(view);Ok(Arc::new(rgb))
         }
         fn collect(&mut self,device:&Device) {
@@ -1172,12 +1344,14 @@ mod implementation {
                     while self.history.len()>8 {self.history.pop_first();}
                     Some(GpuFrame::Source(p._snapshot.clone()))
                 }else{None};
+                if !self.unlimited_native {
                 let Some(output_slot)=p.slot.checked_mul(2) else {self.fail("source output clock overflow".into());break;};
                 self.insert(output_slot,Ready {rgb:if gpu.is_some(){Arc::new(Vec::new())}else{rgb.clone()},sequence:p.sequence,source_slot:p.slot,content_slot:output_slot,kind:"source",gpu,
                     content_key:OutputContentKey {epoch:p.epoch,class:"source",older_sequence:p.sequence,older_slot:p.slot,newer_sequence:None,newer_slot:None},
                     pair:None,source_monotonic_ns:p.monotonic_ns});
+                }
                 match self.jobs.try_send(Source {endpoint:super::pairing::Endpoint {epoch:p.epoch,presentation_generation:p.presentation_generation,sequence:p.sequence,slot:p.slot,
-                    ordinal:self.counts.mapped_sources,elapsed_ns:p.elapsed_ns,monotonic_ns:p.monotonic_ns},origin:p.origin,period_ns:p.period_ns,rgb}) {
+                    ordinal:if self.unlimited_native{p.sequence}else{self.counts.mapped_sources},elapsed_ns:p.elapsed_ns,monotonic_ns:p.monotonic_ns},origin:p.origin,period_ns:p.period_ns,native_deadline_ns:p.native_deadline_ns,rgb}) {
                     Ok(())=>{},Err(TrySendError::Full(_))=>self.counts.worker_drops+=1,
                     Err(TrySendError::Disconnected(_))=>{self.fail("interpolation worker input disconnected".into());break;}
                 }
@@ -1204,8 +1378,8 @@ mod implementation {
                         self.counts.completed_ai+=1;if self.inference_ms.len()==TRACE_LIMIT {self.inference_ms.pop_front();}self.inference_ms.push_back(milliseconds);
                         if !self.pair_can_queue(pair) {continue;}
                         if !self.pair_endpoints_available(pair) {self.counts.orphan_mids+=1;continue;}
-                        if self.events.contains_key(&pair.midpoint_slot) {self.counts.pair_collisions+=1;continue;}
-                        self.insert(pair.midpoint_slot,Ready::midpoint(pair,rgb,None));
+                        if self.events.contains_key(&if self.unlimited_native{pair.due_elapsed_ns}else{pair.midpoint_slot}) {self.counts.pair_collisions+=1;continue;}
+                        self.insert(if self.unlimited_native{pair.due_elapsed_ns}else{pair.midpoint_slot},Ready::midpoint(pair,rgb,None));
                         if self.counts.completed_ai<=3 {eprintln!("[frame-interpolation] real pair AI: sources={}/{} slots={}/{} midpoint={} inferenceMs={milliseconds:.3} differentFromPreviousPixels={different_pixels}",
                             pair.older_sequence,pair.newer_sequence,pair.older_slot,pair.newer_slot,pair.midpoint_slot);}
                     },
@@ -1214,9 +1388,9 @@ mod implementation {
                         self.counts.completed_ai+=1;if self.inference_ms.len()==TRACE_LIMIT{self.inference_ms.pop_front();}self.inference_ms.push_back(milliseconds);
                         if !self.pair_can_queue(pair) {continue;}
                         if !self.pair_endpoints_available(pair) {self.counts.orphan_flows+=1;continue;}
-                        if self.events.contains_key(&pair.midpoint_slot) {self.counts.pair_collisions+=1;continue;}
+                        if self.events.contains_key(&if self.unlimited_native{pair.due_elapsed_ns}else{pair.midpoint_slot}) {self.counts.pair_collisions+=1;continue;}
                         match (self.history.get(&pair.older_slot),self.history.get(&pair.newer_slot)) {
-                            (Some(older),Some(newer))=>self.insert(pair.midpoint_slot,Ready::midpoint(pair,Arc::new(Vec::new()),
+                            (Some(older),Some(newer))=>self.insert(if self.unlimited_native{pair.due_elapsed_ns}else{pair.midpoint_slot},Ready::midpoint(pair,Arc::new(Vec::new()),
                                 Some(GpuFrame::Flow{older:older.clone(),newer:newer.clone(),half}))),
                             _=>self.counts.orphan_flows+=1,
                         }
@@ -1231,6 +1405,14 @@ mod implementation {
                 self.source_times.get(&pair.newer_slot)==Some(&(pair.newer_sequence,pair.newer_monotonic_ns))
         }
         fn pair_can_queue(&mut self,pair:super::pairing::Pair)->bool {
+            if self.unlimited_native {
+                let now=self.origin.map(|origin|origin.elapsed().as_nanos().min(u64::MAX as u128) as u64).unwrap_or(u64::MAX);
+                if now>=pair.window_end_elapsed_ns {self.counts.late_ai+=1;self.counts.ai_window_expired+=1;return false;}
+                if self.last.as_ref().is_some_and(|ready|ready.content_slot>=pair.midpoint_elapsed_ns) {
+                    self.counts.late_ai+=1;self.counts.ai_not_forward+=1;return false;
+                }
+                return true;
+            }
             let previous=self.last.as_ref();
             match super::pairing::admit(pair.midpoint_slot,self.next_slot,Some(pair.newer_due_slot),
                 previous.map(|ready|ready.content_slot),previous.is_some_and(|ready|ready.content_key==Ready::midpoint_key(pair))) {
@@ -1240,6 +1422,7 @@ mod implementation {
             }
         }
         pub(crate) fn tick(&mut self,device:&Device)->Option<Display> {
+            if self.unlimited_native {return self.tick_unlimited(device);}
             let now=Instant::now();if now<self.next_poll {return None;}self.next_poll=now+Duration::from_millis(1);
             {let _slow=super::slow_trace::span("output_collect_readback_and_results","");self.collect(device);}
             if now>=self.next_report {self.next_report=now+Duration::from_secs(1);
@@ -1280,6 +1463,40 @@ mod implementation {
                 true_midpoint_monotonic_ns:ready.pair.and_then(|p|p.true_midpoint_monotonic_ns),
                 scheduled_due_monotonic_ns:ready.pair.and_then(|p|p.scheduled_due_monotonic_ns),
                 midpoint_clock_error_ns:ready.pair.map(|p|p.midpoint_clock_error_ns)})
+        }
+        fn tick_unlimited(&mut self,device:&Device)->Option<Display> {
+            if !self.active()||!self.visible||!presentation_current(self.presentation_generation,self.epoch.load(Ordering::Acquire),&self.epoch,&self.stop) {return None;}
+            if self.native_retry_after.is_some_and(|at|Instant::now()<at) {return None;}
+            self.native_retry_after=None;
+            // A caller that could not acquire/encode must not commit source
+            // identity. Retry the owned source; normal completion clears it.
+            if let Some(ready)=self.native_offered.take() {if ready.kind=="source"{self.native_pacer.retry(ready);}}
+            let now=Instant::now();
+            let mut elapsed=self.origin.map(|origin|now.duration_since(origin).as_nanos().min(u64::MAX as u128) as u64).unwrap_or(0);
+            if !self.native_pacer.urgent(elapsed) {
+                if now<self.next_poll {return None;}self.next_poll=now+Duration::from_millis(1);
+                {let _slow=super::slow_trace::span("output_collect_readback_and_results","");self.collect(device);}
+                if now>=self.next_report {self.next_report=now+Duration::from_secs(1);self.report();}
+                if !self.active(){return None;}
+                elapsed=self.origin.map(|origin|origin.elapsed().as_nanos().min(u64::MAX as u128) as u64).unwrap_or(0);
+            }
+            let mut ready=self.native_pacer.take(elapsed);
+            if ready.is_none()&&self.last_ai_emit.is_none_or(|last|last.elapsed()>=Duration::from_nanos(self.period_ns)) {
+                while self.events.first_key_value().is_some_and(|(&due,_)|due<=elapsed) {
+                    let (_,candidate)=self.events.pop_first()?;
+                    if candidate.pair.is_some_and(|pair|self.pair_can_queue(pair)) {ready=Some(candidate);}
+                }
+            }
+            let ready=ready?;
+            if self.last.as_ref().is_some_and(|last|ready.content_slot<=last.content_slot) {
+                if ready.kind=="source"{self.counts.source_not_forward+=1;}else{self.counts.ai_not_forward+=1;}return None;
+            }
+            let due=self.origin?+Duration::from_nanos(ready.pair.map(|p|p.due_elapsed_ns).unwrap_or(elapsed));
+            let display=Display {rgb:ready.rgb.clone(),slot:elapsed,source_sequence:ready.sequence,source_slot:ready.source_slot,kind:ready.kind,due,gpu:ready.gpu.clone(),
+                content_key:ready.content_key,nominal_content_slot:ready.content_slot,newer_source_slot:ready.pair.map(|p|p.newer_slot),source_monotonic_ns:ready.source_monotonic_ns,
+                newer_source_monotonic_ns:ready.pair.and_then(|p|p.newer_monotonic_ns),newer_source_sequence:ready.pair.map(|p|p.newer_sequence),
+                true_midpoint_monotonic_ns:ready.pair.and_then(|p|p.true_midpoint_monotonic_ns),scheduled_due_monotonic_ns:ready.pair.and_then(|p|p.scheduled_due_monotonic_ns),midpoint_clock_error_ns:ready.pair.map(|p|p.midpoint_clock_error_ns)};
+            self.native_offered=Some(ready);Some(display)
         }
         pub(crate) fn prepare_output(&mut self,device:&Device,queue:&Queue,display:&Display,encoder:&mut CommandEncoder)->Option<Texture> {
             if let Some(gpu)=display.gpu.as_ref() {
@@ -1346,22 +1563,28 @@ mod implementation {
         }
         pub(crate) fn presented(&mut self,display:&Display,success:bool,present_begin_ns:Option<u64>,present_complete_ns:Option<u64>) {
             let now=Instant::now();
+            if self.unlimited_native {
+                if let Some(ready)=self.native_offered.take() {
+                    if success {self.last=Some(ready);if display.kind=="ai" {self.last_ai_emit=Some(now);}}
+                    else if ready.kind=="source" {self.native_pacer.retry(ready);self.native_retry_after=Some(now+Duration::from_millis(1));}
+                }
+            }
             if success&&display.kind=="ai" {
                 publish_live(2,present_complete_ns.or_else(super::monotonic_ns).unwrap_or(0),self.presentation_generation);
             }
             if success {match display.kind {"source"=>self.counts.source_presents+=1,"ai"=>self.counts.ai_presents+=1,_=>self.counts.repeats+=1}}
             else {self.counts.acquire_failures+=1;}
-            if super::pairing::is_late_ai_present(success,display.kind=="ai",display.nominal_content_slot,display.slot) {
-                self.counts.late_ai_presented+=1;
-            }
+            let late_ai=if self.unlimited_native {success&&display.kind=="ai"&&now>display.due}else{super::pairing::is_late_ai_present(success,display.kind=="ai",display.nominal_content_slot,display.slot)};
+            if late_ai {self.counts.late_ai_presented+=1;}
             let interval=self.last_present.map(|at|now.duration_since(at).as_secs_f64()*1000.0);
             if self.trace.len()==TRACE_LIMIT {self.trace.pop_front();}
             self.trace.push_back(json!({"slot":display.slot,"kind":display.kind,"sourceSequence":display.source_sequence,"sourceSlot":display.source_slot,
                 "contentEpoch":display.content_key.epoch,"contentKind":display.content_key.class,
                 "scheduledContentSlot":display.nominal_content_slot,"actualPresentationSlot":display.slot,
                 "scheduledMidpointSlot":if display.content_key.class=="ai"{Some(display.nominal_content_slot)}else{None},
-                "newerSourceDueSlot":display.newer_source_slot.and_then(|slot|slot.checked_mul(2)),
-                "lateAiPresentation":super::pairing::is_late_ai_present(success,display.kind=="ai",display.nominal_content_slot,display.slot),
+                "newerSourceDueSlot":if self.unlimited_native{None}else{display.newer_source_slot.and_then(|slot|slot.checked_mul(2))},
+                "coordinateUnits":if self.unlimited_native{"elapsed_ns_not_fixed_output_slots"}else{"fixed_output_slots"},
+                "lateAiPresentation":late_ai,
                 "contentSlotAge":display.slot.saturating_sub(display.nominal_content_slot),
                 "nativePresentCalled":success,"hostElapsedMs":now.duration_since(self.began).as_secs_f64()*1000.0,
                 "latenessMs":now.saturating_duration_since(display.due).as_secs_f64()*1000.0,"intervalMs":interval,
@@ -1395,14 +1618,14 @@ mod implementation {
             let mut times:Vec<_>=self.inference_ms.iter().copied().collect();times.sort_by(f64::total_cmp);
             let percentile=|p:f64|->Option<f64> {if times.is_empty(){None}else{times.get(((times.len() as f64*p).ceil() as usize).saturating_sub(1)).copied()}};
             let mut value=json!({"status":if self.failed.is_some(){"disabled_error_original_presentation_restored"}else if self.info.is_none(){"initializing"}else{"active_experimental_game_interpolation"},
-                "pid":std::process::id(),"mode":self.mode,"targetSourceHz":self.output_fps/2,"targetPresentationHz":self.output_fps,"bufferedDelayMs":200,
+                "pid":std::process::id(),"mode":self.mode,"targetSourceHz":if self.unlimited_native{None}else{Some(self.output_fps/2)},"targetPresentationHz":if self.unlimited_native{None}else{Some(self.output_fps)},"bufferedDelayMs":if self.unlimited_native{None}else{Some(200)},"unlimitedNativeCadence":self.unlimited_native,"maxNativeHoldMs":if self.unlimited_native{Some(50)}else{None},"aiOutputBudgetHz":self.output_fps,
                 "inferenceWidth":if self.mode=="npu"{448}else{WIDTH},"inferenceHeight":if self.mode=="npu"{208}else{HEIGHT},
                 "modelReadbackWidth":if self.mode=="npu"{MODEL_WIDTH}else{WIDTH},"modelReadbackHeight":if self.mode=="npu"{MODEL_HEIGHT}else{HEIGHT},
                 "nativeBufferWidth":self.native_output.0,"nativeBufferHeight":self.native_output.1,
                 "backendImagePath":if self.mode=="npu"{"original_resolution_RGBA8_GPU_history_plus_RGBA8_448x208_public_NNRT_raw_half6planes_then_original_resolution_GPU_warp"}else{"RGB8_320x192_RIFE_Vulkan_interpolation_RGB8_320x192"},
                 "guestFinalSource":self.source_desc.map(|(w,h,f)|json!({"width":w,"height":h,"actualFormat":format!("{f:?}")})),
                 "sourceBoundary":"actual_guest_opcode_7_final_texture_including_already_composited_game_HUD",
-                "sourcePacing":"GPU_guest_present_boundary_capped_at_half_configured_output_rate_while_continuing_output_ticks_and_map_callbacks; late_sources_do_not_catch_up",
+                "sourcePacing":if self.unlimited_native{"every_guest_source_owned_GPU_snapshot_no_output_clock_gate_no_CPU_readback_gate_one_pending_native_max50ms_AI_best_effort"}else{"GPU_guest_present_boundary_capped_at_half_configured_output_rate_while_continuing_output_ticks_and_map_callbacks; late_sources_do_not_catch_up"},
                 "normalization":if self.mode=="npu"{"full_resolution_UNORM_logical_RGBA_private_history; bilinear_RGBA8_448x208_only_for_model; no_depth_camera_inputs"}else{"bilinear_encoded_UNORM_RGBA_to_320x192_RGB8_debug_backend"},
                 "spatialUpscaling":self.sr_enabled,
                 "visible":self.visible,"physicalWindow":self.physical,"worldPlayerTaskObserved":crate::ffi::world_player_observed(),
@@ -1420,7 +1643,7 @@ mod implementation {
                 "workerResultBackpressureDrops":self.worker_stats.result_drops.load(Ordering::Relaxed),
                 "workerStaleInferenceResults":self.worker_stats.stale_results.load(Ordering::Relaxed),
                 "workerPresentationGateDrops":self.worker_stats.presentation_gate_drops.load(Ordering::Relaxed),
-                "retiredReadbackCompletions":c.retired_readbacks,"retiredWorkerResults":c.retired_worker_results,
+                "nativeSnapshotSupersededBeforePresent":c.native_superseded,"retiredReadbackCompletions":c.retired_readbacks,"retiredWorkerResults":c.retired_worker_results,
                 "actualSourcePairCandidates":self.worker_stats.pair_candidates.load(Ordering::Relaxed),
                 "nonAdjacentClockPairsRun":self.worker_stats.nonadjacent_pairs.load(Ordering::Relaxed),
                 "sourcePairGapSkips":self.worker_stats.pair_gap_skips.load(Ordering::Relaxed),
@@ -1443,7 +1666,7 @@ mod implementation {
                 "classifierSecondProbabilityThreshold":0.99,"classifierHighScorePairs":self.worker_stats.high_score_pairs.load(Ordering::Relaxed),
                 "lastFiniteClassifier":last_classifier,
                 "recentClassifierObservations":recent_classifier,"classifierObservationLimit":TRACE_LIMIT,
-                "configuredOutputFps":self.output_fps,"outputPeriodNs":self.period_ns,"sourcePeriodNs":self.source_ns,
+                "configuredOutputFps":self.output_fps,"outputPeriodNs":self.period_ns,"sourcePeriodNs":if self.unlimited_native{None}else{Some(self.source_ns)},"contentCoordinateUnits":if self.unlimited_native{"capture_elapsed_nanoseconds_sourceSlot_is_unique_guest_sequence"}else{"configured_output_clock_slots"},
                 "clockConfiguration":"MUGUET_SUPPORT/config.json frame_interpolation_output_fps read_once_at_interpolator_creation; default_30",
                 "pairingPolicy":"consecutive_mapped_source_ordinals_in_same_epoch_with_explicit_actual_endpoints; checked_olderClockSlot_plus_newerClockSlot; model_t_0_5; no_intermediate_source_event_overwrite; no_clock_adjacent_requirement",
                 "lateAiPolicy":"nominal_midpoint_slot_lte_actual_output_slot_lt_actual_newer_source_due_slot; strictly_forward_content_slots; same_content_key_only_repeat; chronological_latest_eligible_event_wins; count_late_only_after_successful_native_present",
@@ -1464,6 +1687,16 @@ mod implementation {
                 "outputCaptureDirectory":self.output_capture,"outputCaptureFrames":self.output_capture_rows
             });
             if let (Some(value),Some(graph))=(value.as_object_mut(),graph.as_object()){value.extend(graph.clone());}
+            if self.unlimited_native {
+                if let Some(value)=value.as_object_mut() {
+                    value.insert("pairingPolicy".into(),json!("consecutive_real_guest_source_sequences_same_epoch; true_capture_midpoint_ns; no_clock_bucket_snap; skipped_AI_samples_break_pair_chain"));
+                    value.insert("lateAiPolicy".into(),json!("actual_now_before_newer_native_bounded_deadline_and_content_strictly_after_last_successful_present; native_ready_or_due_always_wins; no_repeat_tick"));
+                    value.insert("pairingTimingScope".into(),json!("Native sources are not paced by AI output budget. At most one pending source is released by the next arrival or clamped previous capture gap (1..50ms). First native source presents immediately. AI may be skipped if capture/readback/inference misses this window; source timestamps are CPU capture samples, not GPU completion or display time."));
+                    value.insert("scope".into(),json!("Host native queue.present calls do not prove compositor/display FPS. Unlimited mode has no fixed source or output presentation clock; AI alone has a configured best-effort rate budget. Native GPU snapshots do not await model readback. SR retains its real submission-fence backpressure. Two native snapshot slots bound overload; supersession is counted. No extrapolation, no repeated-content clock, no backwards midpoint."));
+                    value.insert("nativePendingSnapshots".into(),json!(self.native_pacer.busy()));
+                    value.insert("nativeSnapshotLimit".into(),json!(2));
+                }
+            }
             self.status_writer.submit(value,snapshot_began_ns,super::monotonic_ns());
         }
     }

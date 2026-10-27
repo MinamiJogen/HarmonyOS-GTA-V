@@ -11,7 +11,7 @@ const PLAYABLE_PROFILE: string = `{
   "scale": 0.4,
   "mouse_sensitivity": 2.0,
   "fullscreen": true,
-  "fps_limit": 60,
+  "fps_limit": 0,
   "start_mode": 2,
   "mute": false,
   "multiplayer": false,

@@ -71,6 +71,19 @@ export interface GameCapabilities {
 export const gameCapabilities: () => GameCapabilities;
 /** Cached script-safe-point snapshot; native monotonic now/age accompany unchanged field timestamps. */
 export const getTouchState: () => string;
+/** Complete engine ioPad snapshots; not keyboard emulation. */
+export const sendVirtualPad: (buttons: number, leftX: number, leftY: number, rightX: number, rightY: number,
+  leftTrigger: number, rightTrigger: number, active: boolean) => boolean;
+export const virtualPadState: () => string;
+export const physicalControllerConnected: () => boolean;
+export const releaseVirtualPad: () => void;
+export const setVirtualRadio: (x: number, y: number, active: boolean) => void;
+export const queueVirtualCameraSwipe: (x: number, y: number) => void;
+export const sendMouseDelta: (dx: number, dy: number) => void;
+export const setVirtualMouseMode: (active: boolean) => void;
+export const requestVirtualPause: () => void;
+export const nextVirtualAircraftWeapon: () => void;
+export const setVirtualTargetingMode: (mode: number) => void;
 export const sendControl: (controlName: string, value: number, group?: number) => boolean;
 export const sendRawKey: (keyName: string, pressed: boolean, source?: string) => boolean;
 export const releaseAllInputs: () => void;
@@ -86,6 +99,8 @@ export const sendKeyCode: (keyCode: number, pressed: boolean) => void;
 export const sendMouseButton: (button: number, pressed: boolean, source?: string) => void;
 export const sendKeyEvent: (keyCode: number, pressed: boolean, unicode: number, suppressText: boolean) => boolean;
 export const setInputFocus: (focused: boolean) => void;
+/** App visibility gates native presentation independently from input focus. */
+export const setAppForeground: (foreground: boolean) => void;
 export const sendPointer: (x: number, y: number, dx: number, dy: number, look: boolean) => void;
 export const sendWheel: (notches: number) => void;
 

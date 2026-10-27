@@ -138,6 +138,18 @@ pub fn derive(original: &[u8]) -> Result<Vec<u8>, String> {
     Ok(text.into_bytes())
 }
 
+/// Return the minimap's actual normalized rectangle from the active frontend
+/// bytes. Touch hit testing must follow the same resource view as rendering.
+pub fn minimap_rect(frontend: &[u8]) -> Result<[f64; 4], String> {
+    let text=std::str::from_utf8(frontend).map_err(|_| "frontend is not UTF-8")?;
+    let tag=&text[find_tag(text,"minimap","data",Some("minimap"))?];
+    if &tag[attribute(tag,"alignX")?] != "L" {return Err("unsupported minimap horizontal anchor".into());}
+    let (x,y,width,height)=(number(tag,"posX")?,number(tag,"posY")?,number(tag,"sizeX")?,number(tag,"sizeY")?);
+    let top=match &tag[attribute(tag,"alignY")?] {"T"=>y,"B"=>1.0+y-height,_=>return Err("unsupported minimap vertical anchor".into())};
+    if width<=0.0 || height<=0.0 {return Err("invalid minimap size".into());}
+    Ok([x,top,width,height])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

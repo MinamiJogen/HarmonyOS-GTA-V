@@ -120,7 +120,7 @@ if [[ "$task_aot_only" != 1 ]]; then
   task_hms_root="$OHOS_SDK_NATIVE/../../hms/native/sysroot/usr"
   require_file "$task_hms_root/include/xengine/xeg_vulkan_extension.h" '请安装包含 HMS native XEngine 的 HarmonyOS SDK。'
   require_file "$task_hms_root/lib/aarch64-linux-ohos/libframegeneration.so" '请安装包含 HMS native FrameGeneration 的 HarmonyOS SDK。'
-  for task_script in build-ohos.sh embed-game.sh; do
+  for task_script in build-ohos.sh embed-aot-candidate.py; do
     require_file "$task_repo_dir/game-runtime/scripts/$task_script" '请使用完整源码仓库。'
   done
   if [[ "$task_signed" == 1 ]]; then
@@ -220,10 +220,15 @@ fi
 
 task_phase='2/5 AOT 编译'
 progress '从用户提供的 WebAssembly 生成可信 ARM64 AOT；此步骤可能需要较长时间。'
-bash "$task_repo_dir/game-runtime/scripts/compile-aot.sh" "$task_wasm"
-require_file "$task_repo_dir/game-runtime/artifacts/game-ohos.cwasm" 'AOT 工具未生成预期输出，请检查上方日志。'
+mkdir -p "$task_repo_dir/game-runtime/artifacts/aot-candidates"
+task_aot_dir="$(mktemp -d "$task_repo_dir/game-runtime/artifacts/aot-candidates/build-game.XXXXXX")"
+task_aot="$task_aot_dir/game-ohos.cwasm"
+task_aot_metadata="$task_aot_dir/game-ohos.metadata.json"
+bash "$task_repo_dir/game-runtime/scripts/compile-aot.sh" "$task_wasm" "$task_aot" "$task_aot_dir/game-patched.wasm"
+require_file "$task_aot" 'AOT 工具未生成预期输出，请检查上方日志。'
+require_file "$task_aot_metadata" 'AOT 工具未生成元数据，请检查上方日志。'
 if [[ "$task_aot_only" == 1 ]]; then
-  printf '\nAOT 编译完成：%s\n' "$task_repo_dir/game-runtime/artifacts/game-ohos.cwasm"
+  printf '\nAOT 编译完成：%s\n' "$task_aot"
   exit 0
 fi
 
@@ -232,7 +237,9 @@ progress '构建 OHOS ARM64 Rust 运行时。'
 bash "$task_repo_dir/game-runtime/scripts/build-ohos.sh"
 task_phase='4/5 嵌入 AOT'
 progress '生成待链接到签名原生库的 AOT 对象。'
-bash "$task_repo_dir/game-runtime/scripts/embed-game.sh"
+task_object_dir="$(mktemp -d /private/tmp/harmony-game-aot.XXXXXX)"
+export HARMONY_GAME_AOT_OBJECT="$task_object_dir/game-embedded.o"
+python3 "$task_repo_dir/game-runtime/scripts/embed-aot-candidate.py" "$task_aot" "$task_aot_metadata" "$HARMONY_GAME_AOT_OBJECT"
 task_phase='5/5 HAP 构建'
 export HARMONY_BUILD_MODE="${HARMONY_BUILD_MODE:-release}"
 if [[ "$task_signed" == 1 ]]; then
@@ -246,5 +253,10 @@ else
   task_output='entry-default-unsigned.hap'
 fi
 require_file "$task_repo_dir/harmony/entry/build/default/outputs/default/$task_output" 'HAP 构建未生成预期输出，请检查上方日志。'
+if [[ "$task_signed" != 1 ]]; then
+  python3 "$task_repo_dir/harmony/verify_game_hap.py" --unsigned \
+    --hap "$task_repo_dir/harmony/entry/build/default/outputs/default/$task_output" \
+    --aot "$task_aot" --report "$task_aot_dir/game-hap-verification.json"
+fi
 printf '\n构建完成：%s/harmony/entry/build/default/outputs/default/%s\n' "$task_repo_dir" "$task_output"
 printf '本地完整包含用户游戏 AOT；请勿作为不含游戏文件的公开安装包上传。\n'

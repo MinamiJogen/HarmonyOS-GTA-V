@@ -5,8 +5,10 @@ if(DEFINED PACKAGE_FIND_FILE)
 endif()
 
 add_library(harmony_probe SHARED harmony_probe.cpp game_surface.cpp game_resource_import.cpp game_resource_import_core.cpp game_save_import.cpp game_save_import_core.cpp vulkan_buffer_diagnostics.cpp graphics_accel_diagnostics.cpp graphics_spatial_diagnostics.cpp graphics_frame_diagnostics.cpp xengine_spatial_bridge.cpp)
+target_sources(harmony_probe PRIVATE fivestar_gamepad.cpp)
 target_compile_features(harmony_probe PRIVATE cxx_std_17)
 target_link_libraries(harmony_probe PUBLIC libace_napi.z.so libace_ndk.z.so libnative_window.so libhilog_ndk.z.so libdeviceinfo_ndk.z.so libz.so)
+target_link_libraries(harmony_probe PRIVATE libohgame_controller.z.so)
 find_path(MUGUET_HMS_NATIVE_INCLUDE xengine/xeg_vulkan_extension.h
   HINTS "${CMAKE_SYSROOT}/../../../hms/native/sysroot/usr/include"
         "/Applications/DevEco-Studio.app/Contents/sdk/default/hms/native/sysroot/usr/include")
@@ -43,6 +45,10 @@ target_sources(graphics_frame_surface PRIVATE "${PROJECT_ROOT}/native-diagnostic
 target_sources(graphics_frame_surface PRIVATE "${PROJECT_ROOT}/native-diagnostics/src/fg_rife_stream.cpp" "${PROJECT_ROOT}/native-diagnostics/src/fg_rife_surface.cpp")
 target_include_directories(graphics_frame_surface PRIVATE "${PROJECT_ROOT}/native-diagnostics/src")
 set(MUGUET_RIFE_SDK "" CACHE PATH "Optional independent OHOS RIFE diagnostic SDK")
+option(MUGUET_FG_NPU_ONLY "Build game frame interpolation with NPU only; RIFE is unavailable" OFF)
+if(MUGUET_FG_NPU_ONLY AND MUGUET_RIFE_SDK)
+  message(FATAL_ERROR "NPU-only mode cannot be combined with the RIFE SDK")
+endif()
 if(MUGUET_RIFE_SDK)
   if(NOT EXISTS "${MUGUET_RIFE_SDK}/lib/libharmony_rife_full.a" OR
      NOT EXISTS "${MUGUET_RIFE_SDK}/include/harmony_rife_c.h")
@@ -64,25 +70,31 @@ if(NOT MUGUET_SHELL_ONLY AND EXISTS "${GAME_RUNTIME_LIBRARY}")
   set_target_properties(muguet_game_runtime PROPERTIES IMPORTED_LOCATION "${GAME_RUNTIME_LIBRARY}")
   target_include_directories(harmony_probe PRIVATE "${PROJECT_ROOT}/game-runtime/include")
   target_link_libraries(harmony_probe PRIVATE muguet_game_runtime libvulkan.so libohaudio.so libqos.so dl m)
-  if(MUGUET_RIFE_SDK)
+  if(MUGUET_RIFE_SDK OR MUGUET_FG_NPU_ONLY)
     target_sources(harmony_probe PRIVATE
       "${PROJECT_ROOT}/native-diagnostics/src/fg_npu_flow.cpp"
       "${PROJECT_ROOT}/native-diagnostics/src/fg_npu_rgb.cpp"
       "${PROJECT_ROOT}/native-platform/src/fg_interpolation_bridge.cpp")
     target_include_directories(harmony_probe PRIVATE
       "${PROJECT_ROOT}/native-diagnostics/src"
-      "${PROJECT_ROOT}/native-platform/include"
-      "${MUGUET_RIFE_SDK}/include")
+      "${PROJECT_ROOT}/native-platform/include")
     set_source_files_properties(
       "${PROJECT_ROOT}/native-diagnostics/src/fg_npu_flow.cpp"
       "${PROJECT_ROOT}/native-diagnostics/src/fg_npu_rgb.cpp"
       "${PROJECT_ROOT}/native-platform/src/fg_interpolation_bridge.cpp"
       PROPERTIES COMPILE_OPTIONS "-O3")
-    target_link_libraries(harmony_probe PRIVATE "${MUGUET_RIFE_SDK}/lib/libharmony_rife_full.a")
+    if(MUGUET_RIFE_SDK)
+      target_include_directories(harmony_probe PRIVATE "${MUGUET_RIFE_SDK}/include")
+      target_compile_definitions(harmony_probe PRIVATE MUGUET_INTERPOLATION_HAS_RIFE=1)
+      target_link_libraries(harmony_probe PRIVATE "${MUGUET_RIFE_SDK}/lib/libharmony_rife_full.a")
+    else()
+      target_compile_definitions(harmony_probe PRIVATE MUGUET_INTERPOLATION_HAS_RIFE=0)
+      message(STATUS "Game interpolation: NPU only; RIFE requests will fail explicitly")
+    endif()
   endif()
   set_property(TARGET harmony_probe APPEND PROPERTY LINK_DEPENDS "${GAME_RUNTIME_LIBRARY}")
   target_compile_definitions(harmony_probe PRIVATE MG_HAS_GAME_RUNTIME=1)
-  set(GAME_AOT_OBJECT "${PROJECT_ROOT}/game-runtime/artifacts/game-embedded.o")
+  set(GAME_AOT_OBJECT "${PROJECT_ROOT}/game-runtime/artifacts/game-embedded.o" CACHE FILEPATH "Selected trusted signed game AOT object")
   if(NOT EXISTS "${GAME_AOT_OBJECT}")
     message(FATAL_ERROR "Game runtime exists but its signed game AOT object is missing")
   endif()

@@ -1,8 +1,14 @@
 // Literal SCRIPT channels only; game/mission meanings are unverified.
-export interface TaskWidget { id: string; kind: string; label: string; x: number; y: number; width: number; height: number; channels: string[]; }
+export interface TaskWidget { id: string; kind: string; label: string; x: number; y: number; width: number; height: number; channels: string[]; value?: number; }
 export const TASK_WIDGETS: TaskWidget[] = [
-  {"id": "left_stick", "kind": "stick", "label": "L", "x": 32.0, "y": 200.0, "width": 128, "height": 128, "channels": ["INPUT_SCRIPT_LEFT_AXIS_X", "INPUT_SCRIPT_LEFT_AXIS_Y"]},
-  {"id": "right_stick", "kind": "stick", "label": "R", "x": 352.0, "y": 200.0, "width": 128, "height": 128, "channels": ["INPUT_SCRIPT_RIGHT_AXIS_X", "INPUT_SCRIPT_RIGHT_AXIS_Y"]},
+  {"id": "left_axis_up", "kind": "axis_button", "label": "L↑", "x": 62, "y": 204, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_LEFT_AXIS_Y"], "value": -1},
+  {"id": "left_axis_down", "kind": "axis_button", "label": "L↓", "x": 62, "y": 308, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_LEFT_AXIS_Y"], "value": 1},
+  {"id": "left_axis_left", "kind": "axis_button", "label": "L←", "x": 10, "y": 256, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_LEFT_AXIS_X"], "value": -1},
+  {"id": "left_axis_right", "kind": "axis_button", "label": "L→", "x": 114, "y": 256, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_LEFT_AXIS_X"], "value": 1},
+  {"id": "right_axis_up", "kind": "axis_button", "label": "R↑", "x": 378, "y": 204, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RIGHT_AXIS_Y"], "value": -1},
+  {"id": "right_axis_down", "kind": "axis_button", "label": "R↓", "x": 378, "y": 308, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RIGHT_AXIS_Y"], "value": 1},
+  {"id": "right_axis_left", "kind": "axis_button", "label": "R←", "x": 326, "y": 256, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RIGHT_AXIS_X"], "value": -1},
+  {"id": "right_axis_right", "kind": "axis_button", "label": "R→", "x": 430, "y": 256, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RIGHT_AXIS_X"], "value": 1},
   {"id": "face_up", "kind": "button", "label": "Y", "x": 538.0, "y": 102.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RUP"]},
   {"id": "face_down", "kind": "button", "label": "A", "x": 538.0, "y": 198.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RDOWN"]},
   {"id": "face_left", "kind": "button", "label": "X", "x": 490.0, "y": 150.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RLEFT"]},
@@ -12,7 +18,7 @@ export const TASK_WIDGETS: TaskWidget[] = [
   {"id": "left_trigger", "kind": "continuous_trigger", "label": "LT", "x": 122.0, "y": 12.0, "width": 44, "height": 80, "channels": ["INPUT_SCRIPT_LT"]},
   {"id": "right_trigger", "kind": "continuous_trigger", "label": "RT", "x": 474.0, "y": 12.0, "width": 44, "height": 80, "channels": ["INPUT_SCRIPT_RT"]},
   {"id": "left_stick_click", "kind": "button", "label": "LS", "x": 202.0, "y": 242.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_LS"]},
-  {"id": "right_stick_click", "kind": "button", "label": "RS", "x": 298.0, "y": 242.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RS"]},
+  {"id": "right_stick_click", "kind": "button", "label": "RS", "x": 272.0, "y": 242.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_RS"]},
   {"id": "dpad_up", "kind": "button", "label": "↑", "x": 58.0, "y": 54.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_UP"]},
   {"id": "dpad_down", "kind": "button", "label": "↓", "x": 58.0, "y": 150.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_DOWN"]},
   {"id": "dpad_left", "kind": "button", "label": "←", "x": 10.0, "y": 102.0, "width": 44, "height": 44, "channels": ["INPUT_SCRIPT_PAD_LEFT"]},

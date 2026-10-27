@@ -23,6 +23,7 @@ enum Arg {
     OpusFrame,
 
     ResourceMap,
+    VirtualPad,
 }
 
 const HOOKS: &[(&str, &str, &[Arg])] = &[
@@ -35,12 +36,38 @@ const HOOKS: &[(&str, &str, &[Arg])] = &[
     ("muguet_cash", "stats_commands::CommandStatSetInt(int, int, bool)", &[Arg::CashWrite, Arg::CashWrite]),
     ("muguet_opus_frame", "opus_decode_frame", &[Arg::OpusFrame; 6]),
     ("muguet_resource_map", "rage::datResourceInfo::GenerateMap(rage::datResourceMap&) const", &[Arg::ResourceMap]),
+    ("muguet_virtual_pad", "rage::ioPad::Update(bool)", &[Arg::VirtualPad]),
 ];
+
+// Five Star Port's prepare_control_trace.py. The shared imports preserve every
+// original result and distinguish layout polls from direct script-wrapper reads.
+const TRACE_IMPORTS: &[(&str, usize)] = &[("muguet_control_read", 4), ("muguet_control_script_read", 3)];
+const CONTROL_READS: &[(&str, i64, bool)] = &[
+    ("pad_commands::CommandIsControlPressed(int, int)",0,false),
+    ("pad_commands::CommandGetControlValue(int, int)",1,false),
+    ("pad_commands::CommandGetControlNormal(int, int)",2,true),
+    ("pad_commands::CommandIsDisabledControlPressed(int, int)",3,false),
+    ("pad_commands::CommandGetDisabledControlNormal(int, int)",4,true),
+    ("pad_commands::CommandGetControlUnboundNormal(int, int)",2,true),
+    ("pad_commands::CommandGetDisabledControlUnboundNormal(int, int)",4,true),
+    ("pad_commands::CommandIsControlJustPressed(int, int)",0,false),
+    ("pad_commands::CommandIsControlJustReleased(int, int)",0,false),
+    ("pad_commands::CommandIsDisabledControlJustPressed(int, int)",3,false),
+    ("pad_commands::CommandIsDisabledControlJustReleased(int, int)",3,false),
+];
+const SCRIPT_READS: &[(&str, i64, bool)] = &[
+    ("IS_CONTROL_PRESSED",0,false),("IS_CONTROL_JUST_PRESSED",0,false),
+    ("IS_CONTROL_JUST_RELEASED",0,false),("IS_CONTROL_RELEASED",0,false),
+    ("GET_CONTROL_VALUE",1,false),("GET_CONTROL_UNBOUND_NORMAL",2,true),
+    ("GET_DISABLED_CONTROL_UNBOUND_NORMAL",4,true),
+];
+const PAD_DEBUG: &str = "rage::ioPad::UpdateDebug()";
+const INPUT_EXCLUSIVE: &str = "CControl::DisableInputsByActiveSources(rage::atFixedArray<rage::ioSource, 192> const&, rage::ioValue::DisableOptions const&)";
 
 const SCENARIO_CHECK: &str = "CScenarioManager::PerformCollisionChecksForScenarioPoint(CScenarioManager::CollisionCheckParams const&)";
 const MOVIE_PRELOAD: &str = "CMovieMgr::PreloadMovie(char const*, bool)";
 
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 fn returns(args: &[Arg]) -> bool {
     args.contains(&Arg::Local1Replaced) || args.contains(&Arg::MissingText) || args.contains(&Arg::TxdLoaded) || args.contains(&Arg::PoolGrow) || args.contains(&Arg::CashWrite) || args.contains(&Arg::OpusFrame)
@@ -57,11 +84,15 @@ struct Patcher {
     pool_size: Option<u32>,
     exports: Vec<(String, u32)>,
     next_func: u32,
+    pad_debug: u32,
+    input_exclusive: u32,
+    control_reads: HashMap<u32, (i64, bool)>,
+    script_reads: HashMap<u32, (i64, bool)>,
 }
 
 impl Patcher {
     fn shift(&self) -> u32 {
-        HOOKS.len() as u32
+        (HOOKS.len() + TRACE_IMPORTS.len()) as u32
     }
 }
 
@@ -78,6 +109,7 @@ impl Reencode for Patcher {
         for (_, _, args) in HOOKS {
             types.ty().function(vec![I64; args.len()], if returns(args) { vec![I64] } else { vec![] });
         }
+        for (_, count) in TRACE_IMPORTS { types.ty().function(vec![I64; *count], []); }
         Ok(())
     }
 
@@ -85,6 +117,9 @@ impl Reencode for Patcher {
         utils::parse_import_section(self, imports, section)?;
         for (k, (name, _, _)) in HOOKS.iter().enumerate() {
             imports.import("env", name, wasm_encoder::EntityType::Function(self.types + k as u32));
+        }
+        for (k, (name, _)) in TRACE_IMPORTS.iter().enumerate() {
+            imports.import("env", name, wasm_encoder::EntityType::Function(self.types + HOOKS.len() as u32 + k as u32));
         }
         Ok(())
     }
@@ -100,6 +135,70 @@ impl Reencode for Patcher {
     fn parse_function_body(&mut self, code: &mut wasm_encoder::CodeSection, func: wasmparser::FunctionBody<'_>) -> Result<(), Error<Self::Error>> {
         let index = self.next_func;
         self.next_func += 1;
+        if let Some(&(kind, float)) = self.control_reads.get(&index) {
+            use wasm_encoder::Instruction as I;
+            let mut locals = Vec::new(); let mut result_local = 2;
+            for local in func.get_locals_reader()? { let (count, ty) = local?; result_local += count; locals.push((count, self.val_type(ty)?)); }
+            locals.push((1, if float { wasm_encoder::ValType::F32 } else { wasm_encoder::ValType::I32 }));
+            let mut f = wasm_encoder::Function::new(locals);
+            let mut reader=func.get_operators_reader()?; let mut body=Vec::new();
+            while !reader.eof() { body.push(self.parse_instruction(&mut reader)?); }
+            let last=body.len().saturating_sub(1);
+            for (position,instruction) in body.iter().enumerate() {
+                if matches!(instruction,I::Return) || position==last {
+                    f.instruction(&I::LocalTee(result_local)).instruction(&I::I64Const(kind));
+                    f.instruction(&I::LocalGet(0)).instruction(&I::I64ExtendI32U);
+                    f.instruction(&I::LocalGet(1)).instruction(&I::I64ExtendI32U);
+                    f.instruction(&I::LocalGet(result_local));
+                    if !float { f.instruction(&I::F32ConvertI32S); }
+                    f.instruction(&I::I32ReinterpretF32).instruction(&I::I64ExtendI32U);
+                    f.instruction(&I::Call(self.imported_funcs+HOOKS.len() as u32));
+                }
+                f.instruction(instruction);
+            }
+            code.function(&f); return Ok(());
+        }
+        if let Some(&(kind,float))=self.script_reads.get(&index) {
+            use wasm_encoder::Instruction as I;
+            let mut f=self.new_function_with_parsed_locals(&func)?;
+            let mut reader=func.get_operators_reader()?;let mut body=Vec::new();
+            while !reader.eof(){body.push(self.parse_instruction(&mut reader)?);}
+            let last=body.len().saturating_sub(1);
+            for(position,instruction)in body.iter().enumerate(){
+                if matches!(instruction,I::Return)||position==last {
+                    f.instruction(&I::I64Const(kind)).instruction(&I::LocalGet(0)).instruction(&I::I64Const(float as i64));
+                    f.instruction(&I::Call(self.imported_funcs+HOOKS.len() as u32+1));
+                }
+                f.instruction(instruction);
+            }
+            code.function(&f);return Ok(());
+        }
+        if index==self.input_exclusive {
+            use wasm_encoder::Instruction as I;
+            let mut f=self.new_function_with_parsed_locals(&func)?;
+            let mut reader=func.get_operators_reader()?;let mut body=Vec::new();
+            while !reader.eof(){body.push(self.parse_instruction(&mut reader)?);}
+            let mut changed=false;
+            for(position,instruction)in body.iter().enumerate(){
+                f.instruction(instruction);
+                // Upstream GTA-98 changes the first active-source loop only:
+                // (index == -4 || device == IOMS_KEYBOARD) && key == KEY_NULL.
+                // This avoids treating every unbound keyboard slot as sharing
+                // one key while retaining exclusivity of real keys/pad buttons.
+                if !changed && position>=3 && matches!(instruction,I::I32Eq) {
+                    if let (I::LocalGet(local),I::I32Load(memarg),I::I32Const(-4),Some(I::If(_)),Some(I::LocalGet(next)),Some(I::I32Load(key)),Some(I::I32Eqz))=
+                        (&body[position-3],&body[position-2],&body[position-1],body.get(position+1),body.get(position+2),body.get(position+3),body.get(position+4)) {
+                        if local==next&&memarg.offset==8&&key.offset==4&&memarg.memory_index==0&&key.memory_index==0 {
+                            let mut device=*memarg;device.offset=0;
+                            f.instruction(&I::LocalGet(*local)).instruction(&I::I32Load(device)).instruction(&I::I32Eqz).instruction(&I::I32Or);
+                            changed=true;
+                        }
+                    }
+                }
+            }
+            if !changed{return Err(Error::UserError(anyhow::anyhow!("pinned input-exclusive unbound-key pattern changed")));}
+            code.function(&f);return Ok(());
+        }
         if Some(index) == self.scenario_check {
             use wasm_encoder::Instruction as I;
             let mut f = self.new_function_with_parsed_locals(&func)?;
@@ -128,6 +227,18 @@ impl Reencode for Patcher {
         let mut f = self.new_function_with_parsed_locals(&func)?;
         use wasm_encoder::Instruction as I;
         let call = I::Call(self.imported_funcs + hook as u32);
+        if HOOKS[hook].2==[Arg::VirtualPad] {
+            let mut reader=func.get_operators_reader()?;let mut found=0;
+            while !reader.eof(){
+                let instruction=self.parse_instruction(&mut reader)?;
+                if matches!(instruction,I::Call(function) if function==self.pad_debug+self.shift()) {
+                    f.instruction(&I::LocalGet(0)).instruction(&call);found+=1;
+                }
+                f.instruction(&instruction);
+            }
+            if found!=1{return Err(Error::UserError(anyhow::anyhow!("pinned ioPad::UpdateDebug call count changed: {found}")));}
+            code.function(&f);return Ok(());
+        }
         if HOOKS[hook].2 == [Arg::ResourceMap] {
             let mut reader = func.get_operators_reader()?;
             let mut body = Vec::new();
@@ -195,7 +306,7 @@ impl Reencode for Patcher {
                     Arg::Local0 => f.instruction(&I::LocalGet(0)),
                     Arg::TlsBase => f.instruction(&I::GlobalGet(self.tls_global)),
                     Arg::Local1Replaced => f.instruction(&I::LocalGet(1)).instruction(&I::I64ExtendI32U),
-                    Arg::MissingText | Arg::TxdLoaded | Arg::PoolGrow | Arg::CashWrite | Arg::OpusFrame | Arg::ResourceMap => unreachable!(),
+                    Arg::MissingText | Arg::TxdLoaded | Arg::PoolGrow | Arg::CashWrite | Arg::OpusFrame | Arg::ResourceMap | Arg::VirtualPad => unreachable!(),
                 };
             }
             f.instruction(&call);
@@ -220,7 +331,25 @@ pub fn is_patched(wasm: &[u8]) -> bool {
     })
 }
 
+pub fn has_fivestar_hooks(wasm: &[u8]) -> bool {
+    let mut found=[false;3];
+    for payload in Parser::new(0).parse_all(wasm) {
+        if let Ok(Payload::ImportSection(imports))=payload {
+            for import in imports.into_imports().flatten() {
+                if import.module!="env" {continue;}
+                for(index,name)in ["muguet_virtual_pad","muguet_control_read","muguet_control_script_read"].iter().enumerate() {
+                    if import.name==*name {found[index]=true;}
+                }
+            }
+        }
+    }
+    found.into_iter().all(|found|found)
+}
+
 pub fn patch(wasm: &[u8], wanted: &[(&str, &str)]) -> Result<Vec<u8>> {
+    // Import names are authoritative. Newly injected imports need not have
+    // entries in the optional Wasm name section.
+    if is_patched(wasm) { bail!("game.wasm is already patched; use the original pinned game.wasm"); }
     let (mut imported_funcs, mut types, mut tls_global) = (0u32, 0u32, None);
     let mut by_name: HashMap<String, u32> = HashMap::new();
     for payload in Parser::new(0).parse_all(wasm) {
@@ -267,6 +396,14 @@ pub fn patch(wasm: &[u8], wanted: &[(&str, &str)]) -> Result<Vec<u8>> {
         targets.insert(f, k);
     }
     let mut exports = Vec::new();
+    let required = |name:&str| by_name.get(name).copied().with_context(||format!("required Five Star input symbol missing: {name}"));
+    let mut control_reads=HashMap::new();
+    for (name,kind,float)in CONTROL_READS {control_reads.insert(required(name)?,(*kind,*float));}
+    let mut script_reads=HashMap::new();
+    for (name,kind,float)in SCRIPT_READS {
+        script_reads.insert(required(&format!("pad_commands::SetupScriptCommands()::scrWrapped_{name}::Call(rage::scrThread::Info&)"))?,(*kind,*float));
+    }
+    let pad_debug=required(PAD_DEBUG)?;let input_exclusive=required(INPUT_EXCLUSIVE)?;
     if let Some(&malloc) = by_name.get("emscripten_builtin_malloc") {
         exports.push(("muguet:malloc".to_string(), malloc));
     }
@@ -289,8 +426,77 @@ pub fn patch(wasm: &[u8], wanted: &[(&str, &str)]) -> Result<Vec<u8>> {
         pool_size: by_name.get("rage::sysMemGrowBuddyAllocator::GetHeapSize() const").copied(),
         exports,
         next_func: imported_funcs,
+        pad_debug,input_exclusive,control_reads,script_reads,
     };
     let mut module = wasm_encoder::Module::new();
     p.parse_core_module(&mut module, Parser::new(0), wasm).map_err(|e| anyhow::anyhow!("patch game.wasm: {e:?}"))?;
     Ok(module.finish())
+}
+
+#[cfg(test)]
+mod fivestar_tests {
+    use super::*;
+    fn pinned_wasm()->Option<Vec<u8>> {
+        let path=std::env::var_os("MG_PINNED_GAME_WASM")?;
+        Some(std::fs::read(path).expect("MG_PINNED_GAME_WASM must be readable"))
+    }
+    fn names(wasm:&[u8])->HashMap<String,u32>{
+        let mut names=HashMap::new();
+        for payload in Parser::new(0).parse_all(wasm){
+            if let Payload::CustomSection(c)=payload.unwrap(){
+                if let KnownCustom::Name(map)=c.as_known(){
+                    for item in map{if let Name::Function(map)=item.unwrap(){
+                        for item in map{let item=item.unwrap();names.insert(item.name.into(),item.index);}
+                    }}
+                }
+            }
+        }
+        names
+    }
+    #[test]
+    fn pinned_wasm_all_input_hooks_validate_and_preserve_typed_returns(){
+        let Some(original)=pinned_wasm()else{return};
+        let patched=patch(&original,&[]).unwrap();
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&patched).expect("all rewritten function types, branches and indices must validate");
+        let names=names(&patched);let pad=names["rage::ioPad::Update(bool)"];
+        let mut imports=HashMap::new();let mut count=0;
+        for payload in Parser::new(0).parse_all(&patched){if let Payload::ImportSection(s)=payload.unwrap(){
+            for import in s.into_imports(){let import=import.unwrap();if matches!(import.ty,TypeRef::Func(_)){
+                imports.insert(import.name.to_owned(),count);count+=1;
+            }}
+        }}
+        for name in ["muguet_virtual_pad","muguet_control_read","muguet_control_script_read"]{assert!(imports.contains_key(name));}
+        let mut io_hook=0;let mut exclusive_or=0;let mut traced=0;
+        for payload in Parser::new(0).parse_all(&patched){if let Payload::CodeSectionEntry(body)=payload.unwrap(){
+            let mut operators=body.get_operators_reader().unwrap();let mut calls=Vec::new();
+            while !operators.eof(){match operators.read().unwrap(){
+                wasmparser::Operator::Call{function_index}=>calls.push(function_index),
+                wasmparser::Operator::I32Or if count==names[INPUT_EXCLUSIVE]=>exclusive_or+=1,
+                _=>{}
+            }}
+            if count==pad{
+                io_hook=calls.iter().filter(|f|**f==imports["muguet_virtual_pad"]).count();
+                let hook=calls.iter().position(|f|*f==imports["muguet_virtual_pad"]).unwrap();
+                assert_eq!(calls[hook+1],names[PAD_DEBUG],"pad sample is applied before UpdateDebug");
+            }
+            if CONTROL_READS.iter().any(|(name,_,_)|names[*name]==count){
+                assert!(calls.contains(&imports["muguet_control_read"]));traced+=1;
+            }
+            if SCRIPT_READS.iter().any(|(name,_,_)|names[&format!("pad_commands::SetupScriptCommands()::scrWrapped_{name}::Call(rage::scrThread::Info&)")]==count){
+                assert!(calls.contains(&imports["muguet_control_script_read"]));traced+=1;
+            }
+            count+=1;
+        }}
+        assert_eq!(io_hook,1);assert!(exclusive_or>=1);assert_eq!(traced,18);
+        assert!(is_patched(&patched));assert!(patch(&patched,&[]).is_err());
+    }
+    #[test]
+    fn pinned_wasm_missing_io_pad_symbol_fails_closed(){
+        let Some(mut original)=pinned_wasm()else{return};
+        let name=b"rage::ioPad::Update(bool)";
+        let at=original.windows(name.len()).position(|part|part==name).unwrap();
+        original[at+9]=b'X';
+        assert!(format!("{:#}",patch(&original,&[]).unwrap_err()).contains("ioPad::Update"));
+    }
 }

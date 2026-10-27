@@ -18,6 +18,8 @@ mod mouse;
 mod mp;
 mod opus;
 mod pad;
+mod virtual_pad;
+mod fivestar_state;
 #[cfg(feature = "jit")]
 mod patch;
 mod proto;

@@ -7,9 +7,13 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from verify_app_icon import verify_app_icon
 
 
 def sha256(path):
@@ -25,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hap", type=Path, help="HAP to verify; defaults to the local signed game package")
     parser.add_argument("--elf", type=Path, help="Matching unstripped libharmony_probe.so")
+    parser.add_argument("--aot", type=Path, help="Exact compiler artifact expected in this package; defaults to generic game-ohos.cwasm")
     parser.add_argument("--report", type=Path, help="JSON report output path")
     parser.add_argument("--unsigned", action="store_true", help="Require an unsigned game HAP and verify its application metadata")
     args = parser.parse_args()
@@ -48,19 +53,16 @@ def main():
         assert package.testzip() is None, "HAP ZIP CRC failure"
         member = next(name for name in package.namelist() if name.endswith("/libharmony_probe.so"))
         native = package.read(member)
+        package_metadata.update(verify_app_icon(package, root))
         if args.unsigned:
             app = json.loads(package.read("module.json"))["app"]
             bundle_name = app["bundleName"]
             assert bundle_name == "com.shuyuan.harmonyosgtav", "Unexpected application bundle name"
             pack_info = json.loads(package.read("pack.info"))
             assert pack_info["summary"]["app"]["bundleName"] == bundle_name, "Package metadata bundle name differs from module.json"
-            icon = package.read("resources/base/media/app_icon_gta5.png")
-            assert icon == (root / "harmony/AppScope/resources/base/media/app_icon_gta5.png").read_bytes(), "Packaged app icon differs from the selected source icon"
-            assert icon == (root / "harmony/entry/src/main/resources/base/media/app_icon_gta5.png").read_bytes(), "Entry and AppScope app icons differ"
-            package_metadata = dict(
+            package_metadata.update(
                 bundleName=bundle_name, packInfoBundleNameMatches=True,
-                versionName=app["versionName"], versionCode=app["versionCode"],
-                selectedAppIconMatches=True, appIconSha256=hashlib.sha256(icon).hexdigest())
+                versionName=app["versionName"], versionCode=app["versionCode"])
     if args.unsigned:
         assert build_id is not None, "Unstripped native ELF has no Build ID"
         with tempfile.TemporaryDirectory(prefix="game-hap-native-") as temporary:
@@ -83,7 +85,9 @@ def main():
     assert segment and segment["flags"] & 1, "Game AOT is not within an executable LOAD segment"
     code_offset = start - segment["vaddr"] + segment["offset"]
     packaged_hash = hashlib.sha256(memoryview(native)[code_offset:code_offset + end - start]).hexdigest()
-    aot_hash = sha256(root / "game-runtime/artifacts/game-ohos.cwasm")
+    aot_artifact = (args.aot or root / "game-runtime/artifacts/game-ohos.cwasm").resolve()
+    aot_hash = sha256(aot_artifact)
+    assert end - start == aot_artifact.stat().st_size, "Packaged game AOT length differs from the selected compiler output"
     assert packaged_hash == aot_hash, "Packaged game AOT differs from the compiler output"
     signature_metadata = {}
     if args.unsigned:
@@ -109,7 +113,7 @@ def main():
         nativeDebugFile=str(elf),
         runtimeArchiveSha256=sha256(root / "game-runtime/artifacts/libmuguet_game_runtime.a"),
         gameAotStart=hex(start), gameAotEnd=hex(end), gameAotBytes=end - start,
-        gameAotSha256=aot_hash, packagedAotBytesMatch=True, executableSegment=segment,
+        gameAotSha256=aot_hash, gameAotArtifact=str(aot_artifact), packagedAotBytesMatch=True, executableSegment=segment,
         scope="Static " + ("unsigned" if args.unsigned else "signed") + "-package verification; device gameplay is not established by this report",
         **package_metadata, **signature_metadata)
     if not args.unsigned:

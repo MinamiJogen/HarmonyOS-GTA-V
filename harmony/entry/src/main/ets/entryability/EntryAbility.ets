@@ -212,15 +212,20 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    game.setAppForeground(true);
     AppStorage.setOrCreate<boolean>('gameAppForeground', true);
     gamePerformanceForeground();
     game.setInputFocus(true);
   }
 
   onBackground(): void {
+    game.setAppForeground(false);
     AppStorage.setOrCreate<boolean>('gameAppForeground', false);
     gamePerformanceBackground();
     game.setInputFocus(false);
+    // The engine consumes Start for three actual ioPad samples. This explicit
+    // pause request survives the UI's asynchronous background input releases.
+    game.requestVirtualPause();
     try { pointer.setPointerVisibleSync(true); } catch (error) {
       hilog.warn(0x4100, 'GameInput', 'BACKGROUND_POINTER_RESET %{public}s', String(error));
     }

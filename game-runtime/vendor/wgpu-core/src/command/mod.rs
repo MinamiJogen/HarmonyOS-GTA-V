@@ -8,6 +8,9 @@
 //! should be nested within some other container that provides additional
 //! state tracking, like [`InnerCommandEncoder`].
 
+#[cfg(all(target_env = "ohos", feature = "std"))]
+pub(crate) mod empty_render_prepass;
+
 mod allocator;
 mod bind;
 mod bundle;

@@ -3,7 +3,7 @@
 
 use crate::mem_base_len;
 use regex::Regex;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use wgpu::util::DeviceExt;
 use crate::cpu_profile::{self, Metric as CpuMetric};
 use crate::frame_interpolation::slow_trace;
 use wgpu::*;
+use crate::pso_warmup::{self, Recipe as PsoRecipe, Shader as PsoShader};
 
 #[path = "gpu_memory.rs"]
 mod memory_checks;
@@ -27,8 +28,20 @@ mod gpu_profile;
 pub(crate) mod depth_downsample;
 #[path = "readback_pool.rs"]
 mod readback_pool;
+#[path = "occlusion_pool.rs"]
+mod occlusion_pool;
+#[path = "proxy_subresources.rs"]
+mod proxy_subresources;
 #[path = "luminance_init.rs"]
 mod luminance_init;
+#[path = "native_render_fastpath.rs"]
+mod native_render_fastpath;
+#[path = "inline_upload.rs"]
+mod inline_upload;
+#[path = "native_command_fastpath.rs"]
+mod native_command_fastpath;
+
+type ProxySampledViewKey = native_render_fastpath::ProxyViewKey<Texture, TextureFormat, TextureViewDimension, TextureAspect>;
 
 const COMPACT_VERTEX_BINDINGS: bool = cfg!(target_env = "ohos");
 
@@ -55,13 +68,82 @@ fn guest_span(mem: &SharedMemory, addr: u64, size: u64, alignment: u64, context:
     checked_value(memory_checks::span(mem.data_size(), addr, size, alignment), context)
 }
 
-fn read_word(base: *mut u8, len: usize, p: u64, relative: u64, context: &str) -> u32 {
-    let address = memory_checks::word(p, relative).unwrap_or_else(|error| {
-        memory_violation(context, format!("{error} wordBase={p} relativeWord={relative}"))
-    });
-    let span = checked_value(memory_checks::span(len, address, 4, 4), context);
-    unsafe { std::ptr::read_volatile(base.add(span.start) as *const u32) }
+// Kept self-contained so host tests can exercise the production reader with a
+// real Wasmtime SharedMemory without initializing the OHOS GPU backend.
+mod shared_memory_reader {
+    use super::{checked_value, memory_checks, memory_violation};
+    use std::{cell::Cell, ops::Range, sync::atomic::AtomicI32};
+    use wasmtime::SharedMemory;
+
+    pub(super) struct SharedReader {
+        memory: SharedMemory,
+        base: *mut u8,
+        bounds: Bounds,
+    }
+
+    struct Bounds {
+        confirmed_len: Cell<usize>,
+        fast: bool,
+    }
+
+    impl Bounds {
+        #[inline]
+        fn span(&self, addr: u64, size: u64, alignment: u64, exact_len: impl FnOnce() -> usize) -> Result<Range<usize>, String> {
+            if self.fast {
+                // A cached length is only a lower bound. Preserve all native
+                // usize / isize, memory64, overflow and alignment checks.
+                if let Ok(span) = memory_checks::span(self.confirmed_len.get(), addr, size, alignment) {
+                    return Ok(span);
+                }
+            }
+            // Growth may have made a stale-cache miss legal. Recheck against
+            // the current committed size before rejecting, including errors.
+            let current = exact_len();
+            self.confirmed_len.set(current);
+            memory_checks::span(current, addr, size, alignment)
+        }
+    }
+
+    impl SharedReader {
+        pub(super) fn new(memory: &SharedMemory, fast: bool) -> Self {
+            let data = memory.data();
+            // Wasmtime 49 guarantees shared memories never relocate and never
+            // shrink. Keeping an owning clone pins the allocation for every
+            // cached pointer; only this GPU thread accesses the Cell cache.
+            Self { memory: memory.clone(), base: data.as_ptr() as *mut u8,
+                bounds: Bounds { confirmed_len: Cell::new(data.len()), fast } }
+        }
+
+        #[inline]
+        pub(super) fn span(&self, addr: u64, size: u64, alignment: u64, context: &str) -> Range<usize> {
+            checked_value(self.bounds.span(addr, size, alignment, || self.memory.data_size()), context)
+        }
+
+        #[inline]
+        pub(super) fn word(&self, p: u64, relative: u64, context: &str) -> u32 {
+            let address = memory_checks::word(p, relative).unwrap_or_else(|error| {
+                memory_violation(context, format!("{error} wordBase={p} relativeWord={relative}"))
+            });
+            let span = self.span(address, 4, 4, context);
+            unsafe { std::ptr::read_volatile(self.base.add(span.start) as *const u32) }
+        }
+
+        #[inline]
+        pub(super) fn atomic(&self, addr: u64) -> &AtomicI32 {
+            let span = self.span(addr, 4, 4, "atomic i32 load/store");
+            unsafe { &*(self.base.add(span.start) as *const AtomicI32) }
+        }
+
+        /// Caller must prove the trusted producer has published this entire
+        /// inline range and cannot mutate/reuse it before consumer tail ack.
+        /// The owning reader pins memory; bounds alone do not prove exclusion.
+        pub(super) unsafe fn published_inline_bytes(&self, addr: u64, size: u64) -> &[u8] {
+            let span = self.span(addr, size, 1, "command bytes");
+            unsafe { std::slice::from_raw_parts(self.base.add(span.start), span.len()) }
+        }
+    }
 }
+use shared_memory_reader::SharedReader;
 
 const RING_DATA: u64 = 64;
 const BIND_SRV: u32 = 0x8;
@@ -669,7 +751,7 @@ struct TexDesc { w: u32, h: u32, d: u32, mips: u32, samples: u32, dim: TextureDi
 struct Proxy {
     tex: Texture,
     format: TextureFormat,
-    dirty: bool,
+    dirty: proxy_subresources::Dirty,
     passes: Vec<(TextureView, BindGroup)>,
 }
 struct Tex {
@@ -720,6 +802,7 @@ struct Program {
     variants: RefCell<HashMap<String, Option<ShaderModule>>>,
     label: String,
     uid: u64,
+    source: PsoShader,
     vid: bool,
     iid: bool,
     out_locs: Vec<u32>,
@@ -830,6 +913,26 @@ struct Pl {
     vb_req: Vec<VbReq>,
     vertex_bindings: vertex_bindings::Plan,
     label: String,
+    recipe: Option<Rc<PsoRecipe>>,
+    observed: Cell<bool>,
+    warmed: bool,
+}
+
+// The same explicit inputs drive both first-use compilation and replay. No
+// guest object IDs, live attachments, or draw-time resources are replayed.
+struct PipelineInputs {
+    signature: Vec<SigEl>,
+    blend: Option<Rc<StateObj>>,
+    depth: Option<Rc<StateObj>>,
+    raster: Option<Rc<StateObj>>,
+    masks: [(u128, u128); 2],
+}
+
+#[derive(Default)]
+struct PsoStats {
+    loaded: usize, built: usize, rejected: usize, failed: usize,
+    warm_hits: u64, warm_first_draws: u64, loading_ns: u64,
+    draw_compiles: u64, draw_compile_total_ns: u64, draw_compile_max_ns: u64,
 }
 
 struct PipeJob {
@@ -842,8 +945,111 @@ struct PipeJob {
     depth_stencil: Option<DepthStencilState>,
     multisample: MultisampleState,
     targets: Vec<Option<ColorTargetState>>,
+    cache: Option<PipelineCache>,
 }
 enum PipeEntry { Pending, Done(Option<Rc<Pl>>) }
+
+fn cache_source_digest(parts: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in parts { digest.update((part.len() as u64).to_be_bytes()); digest.update(part); }
+    format!("{:x}", digest.finalize())
+}
+
+fn pipeline_build_digests() -> (String, String) {
+    // These are compiled source BYTES, not a stale Git label. Include every
+    // current renderer/format/bounds patch and the pinned core/HAL cache paths.
+    let runtime_source_sha256 = cache_source_digest(&[
+        b"muguet-native-pipeline-cache-source-v1", env!("CARGO_PKG_VERSION").as_bytes(),
+        &[cfg!(feature = "frame-interpolation") as u8],
+        include_bytes!("gpu.rs"), include_bytes!("pipeline_cache_store.rs"), include_bytes!("pso_warmup.rs"),
+        include_bytes!("native_render_fastpath.rs"), include_bytes!("inline_upload.rs"), include_bytes!("native_command_fastpath.rs"),
+        include_bytes!("frame_readback_rows.rs"),
+        include_bytes!("gpu_memory.rs"), include_bytes!("proxy_subresources.rs"),
+        include_bytes!("depth_downsample.rs"), include_bytes!("luminance_init.rs"), include_bytes!("vertex_bindings.rs"),
+        include_bytes!("lib.rs"), include_bytes!("config.rs"), include_bytes!("../Cargo.toml"), include_bytes!("../Cargo.lock"), include_bytes!("../build.rs"),
+    ]);
+    let wgpu_build_sha256 = cache_source_digest(&[
+        b"wgpu-30.0.1-vulkan-abi64-cache-header1",
+        include_bytes!("../vendor/wgpu-core/Cargo.toml"), include_bytes!("../vendor/wgpu-core/src/pipeline.rs"),
+        include_bytes!("../vendor/wgpu-core/src/pipeline_cache.rs"), include_bytes!("../vendor/wgpu-core/src/device/resource.rs"),
+        include_bytes!("../vendor/wgpu-core/src/device/queue.rs"), include_bytes!("../vendor/wgpu-core/src/command/render.rs"),
+        include_bytes!("../vendor/wgpu-core/src/command/compute.rs"), include_bytes!("../vendor/wgpu-core/src/command/memory_init.rs"),
+        include_bytes!("../vendor/wgpu-core/src/command/mod.rs"), include_bytes!("../vendor/wgpu-core/src/command/empty_render_prepass.rs"),
+        include_bytes!("../vendor/wgpu-core/src/track/buffer.rs"), include_bytes!("../vendor/wgpu-core/src/track/texture.rs"),
+        include_bytes!("../vendor/wgpu-hal/Cargo.toml"), include_bytes!("../vendor/wgpu-hal/src/lib.rs"),
+        include_bytes!("../vendor/wgpu-hal/src/vulkan/mod.rs"), include_bytes!("../vendor/wgpu-hal/src/vulkan/adapter.rs"),
+        include_bytes!("../vendor/wgpu-hal/src/vulkan/device.rs"), include_bytes!("../vendor/wgpu-hal/src/vulkan/command.rs"),
+        include_bytes!("../vendor/wgpu-hal/src/vulkan/conv.rs"), include_bytes!("../vendor/wgpu-hal/src/vulkan/instance.rs"),
+        include_bytes!("../vendor/wgpu-hal/src/vulkan/spirv_layout_sanitizer.rs"), include_bytes!("../vendor/wgpu-hal/src/vulkan/spirv_sample_mask_sanitizer.rs"),
+        include_bytes!("../vendor/wgpu-hal/src/vulkan/swapchain/native.rs"),
+    ]);
+    (runtime_source_sha256, wgpu_build_sha256)
+}
+
+fn scoped_pipeline_cache(device: &Device, data: Option<&[u8]>) -> Option<PipelineCache> {
+    let validation = device.push_error_scope(ErrorFilter::Validation);
+    let allocation = device.push_error_scope(ErrorFilter::OutOfMemory);
+    // data is exclusively ValidatedData::bytes() from our private store, or None.
+    // Keep its owner alive until this synchronous driver creation has returned.
+    let cache = unsafe { device.create_pipeline_cache(&PipelineCacheDescriptor {
+        label: Some("muguet-private-native-pipeline-cache"), data, fallback: true,
+    }) };
+    let oom = pollster::block_on(allocation.pop());
+    let invalid = pollster::block_on(validation.pop());
+    if oom.is_some() || invalid.is_some() {
+        log(&format!("pipeline-cache create rejected: allocation={oom:?}, validation={invalid:?}"));
+        None
+    } else { Some(cache) }
+}
+
+fn initialize_pipeline_cache(adapter: &Adapter, device: &Device, shader_dir: &std::path::Path,
+    index_text: &str) -> (Option<PipelineCache>, Option<crate::pipeline_cache_store::Store>) {
+    if !device.features().contains(Features::PIPELINE_CACHE) {
+        log("pipeline-cache bypass: feature is not enabled on the actual device"); return (None, None);
+    }
+    let raw_properties = unsafe { adapter.as_hal::<hal::api::Vulkan>() }.map(|raw| unsafe {
+        raw.shared_instance().raw_instance().get_physical_device_properties(raw.raw_physical_device())
+    });
+    let Some(properties) = raw_properties else {
+        log("pipeline-cache bypass: actual Vulkan adapter properties are unavailable"); return (None, None);
+    };
+    let info = adapter.get_info();
+    if info.backend != Backend::Vulkan || properties.vendor_id != info.vendor || properties.device_id != info.device {
+        log("pipeline-cache bypass: current adapter identities disagree"); return (None, None);
+    }
+    let Some(files_dir) = std::env::var_os("MUGUET_SUPPORT").map(PathBuf::from) else {
+        log("pipeline-cache bypass: current app private directory is unavailable"); return (None, None);
+    };
+    let build = shader_dir.parent();
+    let resource_build = build.and_then(|build| build.file_name()).and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && name.len() <= 128 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+    if shader_dir.file_name().and_then(|name| name.to_str()) != Some("shaders") ||
+        build.and_then(|build| build.parent()).and_then(|parent| parent.file_name()).and_then(|name| name.to_str()) != Some("b") || resource_build.is_none() {
+        log("pipeline-cache bypass: actual shader resource build identity is unavailable"); return (None, None);
+    }
+    let (runtime_source_sha256, wgpu_build_sha256) = pipeline_build_digests();
+    let identity = crate::pipeline_cache_store::Identity {
+        vendor: properties.vendor_id, device: properties.device_id, adapter_name: info.name,
+        driver: info.driver, driver_info: info.driver_info, driver_version: properties.driver_version,
+        pipeline_cache_uuid: Some(properties.pipeline_cache_uuid), runtime_source_sha256, wgpu_build_sha256,
+        resource_build: resource_build.expect("checked resource identity").to_string(),
+        shader_index_sha256: { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(index_text.as_bytes())) },
+        target_abi: "aarch64-unknown-linux-ohos".into(),
+    };
+    let store = crate::pipeline_cache_store::Store::new(true, &files_dir, identity);
+    log(&format!("pipeline-cache startup: {}", store.status()));
+    if !store.enabled() { return (None, Some(store)); }
+    let loaded = match store.load() {
+        Ok(Some(data)) => { log(&format!("pipeline-cache verified warm payload {} bytes", data.bytes().len())); Some(data) },
+        Ok(None) => { log("pipeline-cache cold start: no matching private cache"); None },
+        Err(error) => { log(&format!("pipeline-cache rejected private cache; using fresh data=None: {error}")); None },
+    };
+    let cache = scoped_pipeline_cache(device, loaded.as_ref().map(|data| data.bytes()))
+        .or_else(|| if loaded.is_some() { scoped_pipeline_cache(device, None) } else { None });
+    if cache.is_none() { log("pipeline-cache unavailable: ordinary cache=None pipeline creation retained"); }
+    (cache, Some(store))
+}
 
 fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
     let _slow=slow_trace::span("pipeline_compile_and_scope_pop",&job.label);
@@ -857,12 +1063,14 @@ fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
         multisample: job.multisample,
         fragment: job.fmod.as_ref().map(|m| FragmentState { module: m, entry_point: Some("main"), compilation_options: Default::default(), targets: &job.targets }),
         multiview_mask: None,
-        cache: None,
+        cache: job.cache.as_ref(),
     };
     let scope = device.push_error_scope(ErrorFilter::Validation);
+    let allocation = device.push_error_scope(ErrorFilter::OutOfMemory);
     let p = { let _span = cpu_profile::span(CpuMetric::PipelineCreate); device.create_render_pipeline(&desc) };
+    let oom = { let _span = cpu_profile::span(CpuMetric::ScopePop); pollster::block_on(allocation.pop()) };
     let error = { let _span = cpu_profile::span(CpuMetric::ScopePop); pollster::block_on(scope.pop()) };
-    match error {
+    match error.or(oom) {
         None => Some(p),
         Some(e) => {
             let msg = error_chain(&e);
@@ -889,7 +1097,7 @@ struct PendingMap {
 }
 enum MapKind {
     Readback { flag: u64, rows: Vec<(u64, u64, u64)>, recycle: bool, error_generation: u64 },
-    Occlusion { list: Vec<(u64, u32, u64, bool, usize)> },
+    Occlusion { list: Vec<(u64, u32, u64, bool, usize)>, resolve: Buffer, recycle: bool, error_generation: u64 },
 }
 
 struct AstcJob { tex_id: u32, tex: Texture, mip: u32, origin: Origin3d, bx: u32, by: u32, layers: u32, dst_row: u32, src_word: u32, dst_byte: u64, first_block: u32 }
@@ -948,9 +1156,32 @@ struct OutputCache {
 pub struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
+    shared_reader: Rc<SharedReader>,
+    inline_upload_borrow: bool,
+    inline_upload_counters: inline_upload::Counters,
+    upload_trace_path: Option<std::ffi::OsString>,
+    native_command_fastpath: native_command_fastpath::StartupOptions,
+    native_command_counters: native_command_fastpath::Counters,
+    native_render_fastpath: bool,
+    proxy_sampled_views: native_render_fastpath::ViewCache<ProxySampledViewKey, TextureView>,
+    proxy_view_error_generation: u64,
+    repeat_copies_avoided: u64,
+    repeat_copy_logical_bytes_avoided: u64,
+    fallback_bindings_avoided: u64,
+    subresource_proxies: bool,
+    proxy_requests: u64,
+    proxy_conversions: u64,
+    proxy_available: u64,
+    proxy_fallbacks: u64,
     ring: u64,
+    ring_size: u64,
     device: Device,
     queue: Queue,
+    pipeline_cache: Option<PipelineCache>,
+    pipeline_cache_store: RefCell<Option<crate::pipeline_cache_store::Store>>,
+    pso_store: Option<pso_warmup::Store>,
+    warm_pipelines: HashMap<PsoRecipe, Rc<Pl>>,
+    pso_stats: PsoStats,
     live_queries: std::collections::HashSet<u64>,
     query_done: Arc<Mutex<Vec<(u64, u64, u32)>>>,
     stale_query_writes: u64,
@@ -969,7 +1200,7 @@ pub struct Gpu {
     enc: Option<CommandEncoder>,
     enc_epoch: u64,
     pass: Option<RenderPass<'static>>,
-    pass_key: Option<Vec<u32>>,
+    pass_key: Option<native_command_fastpath::PassKey>,
     pass_info: Option<PassInfo>,
     pass_st: PassSt,
     s: State,
@@ -979,12 +1210,12 @@ pub struct Gpu {
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
     next_uid: u64,
-    bgl_cache: FxHashMap<(u64, u128, u32, u32), (BindGroupLayout, u64)>,
+    bgl_cache: FxHashMap<(u64, u128, u128, u32, u32), (BindGroupLayout, u64)>,
     empty_bgl: Option<(BindGroupLayout, u64)>,
     pipelines: FxHashMap<Vec<i64>, PipeEntry>,
     pipe_jobs: Option<std::sync::mpsc::Sender<(u64, PipeJob)>>,
     pipe_results: std::sync::mpsc::Receiver<(u64, Option<RenderPipeline>)>,
-    pipe_pending: HashMap<u64, (Vec<i64>, Vec<VbReq>, vertex_bindings::Plan, String)>,
+    pipe_pending: HashMap<u64, (Vec<i64>, Vec<VbReq>, vertex_bindings::Plan, String, Option<Rc<PsoRecipe>>)>,
     pending_skips: u64,
     pending_skips0: u64,
     pipe_wait_left: Duration,
@@ -1024,9 +1255,12 @@ pub struct Gpu {
     pending_events: Vec<(u32, u32, u64)>,
     pending_maps: Vec<PendingMap>,
     readback_pool: Option<readback_pool::Pool<Buffer>>,
+    occlusion_pool: Option<occlusion_pool::Pool<Buffer>>,
     frame_capture: Option<crate::frame_capture::Capture>,
     native_render_audit: Option<native_render_audit::Audit>,
-    frame_interpolation: Option<crate::frame_interpolation::Interpolator>,
+    // The per-opcode tick takes and restores ownership. Keep the large worker
+    // state at a stable address instead of copying it through the GPU stack.
+    frame_interpolation: Option<Box<crate::frame_interpolation::Interpolator>>,
     interpolation_spatial: Option<crate::spatial_upscale::Spatial>,
     interpolation_sr_slot: usize,
     interpolation_sr_fences: Vec<Option<SubmissionIndex>>,
@@ -1075,7 +1309,8 @@ pub fn max_msaa() -> u32 {
 }
 
 impl Gpu {
-    fn new(mem: SharedMemory, ring: u64, _size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
+    fn new(mem: SharedMemory, ring: u64, ring_size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
+        cpu_profile::frame_intervals::initialize();
         slow_trace::initialize();
         if let Some(root) = std::env::var_os("MUGUET_SUPPORT") {
             let _ = std::fs::remove_file(std::path::Path::new(&root).join("gpu-memory-violation.txt"));
@@ -1086,6 +1321,9 @@ impl Gpu {
             guest_span(&mem, dbg, 428, 4, "GPU debug record");
         }
         let (base, _) = mem_base_len(&mem);
+        let shared_memory_fastpath = std::env::var_os("MUGUET_SHARED_MEMORY_FASTPATH").is_none_or(|value| value != "0");
+        let shared_reader = Rc::new(SharedReader::new(&mem, shared_memory_fastpath));
+        log(&format!("shared memory bounds fastpath={} (MUGUET_SHARED_MEMORY_FASTPATH=0 selects exact-size checks)", shared_memory_fastpath));
         let (instance, surface) = match handoff {
             Some(h) => (h.instance, Some((h.surface, h.window))),
             None => anyhow::bail!("OHOS GPU requires an XComponent surface before guest startup"),
@@ -1101,7 +1339,14 @@ impl Gpu {
             | Features::BGRA8UNORM_STORAGE | Features::DEPTH_CLIP_CONTROL | Features::CLIP_DISTANCES | Features::DUAL_SOURCE_BLENDING
 
             | Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | Features::TEXTURE_COMPRESSION_ASTC;
-        let features = (want & adapter.features()) | gpu_profile::features(&adapter);
+        let mut features = (want & adapter.features()) | gpu_profile::features(&adapter);
+        let cache_requested = cfg!(target_env = "ohos") &&
+            std::env::var_os("MUGUET_PIPELINE_CACHE").is_some_and(|value| value == "1");
+        if cache_requested && adapter.features().contains(Features::PIPELINE_CACHE) {
+            features |= Features::PIPELINE_CACHE;
+        } else if cache_requested {
+            log("pipeline-cache bypass: adapter does not expose PIPELINE_CACHE");
+        }
         if !features.contains(Features::FLOAT32_FILTERABLE) {
             F32_HALF.store(true, Ordering::Relaxed);
             log("this GPU can't filter 32-bit float textures: sampling them as 16-bit");
@@ -1156,6 +1401,12 @@ impl Gpu {
         });
         let shader_index: HashMap<String, serde_json::Value> = serde_json::from_str(&index_text).unwrap_or_default();
         log(&format!("shader index: {} entries from {}", shader_index.len(), shader_dir.display()));
+        let (pipeline_cache, pipeline_cache_store) = if cache_requested && !shader_index.is_empty() {
+            initialize_pipeline_cache(&adapter, &device, &shader_dir, &index_text)
+        } else {
+            if cache_requested { log("pipeline-cache bypass: actual shader index is unavailable"); }
+            (None, None)
+        };
 
         let (res_tx, pipe_results) = std::sync::mpsc::channel::<(u64, Option<RenderPipeline>)>();
         let pipe_jobs = if cfg!(target_env = "ohos") {
@@ -1181,12 +1432,29 @@ impl Gpu {
             Some(job_tx)
         };
         let spatial = crate::spatial_upscale::Spatial::new(&device, FRAME_SLOTS);
-        let mut frame_interpolation=crate::frame_interpolation::Interpolator::from_env();
+        let mut frame_interpolation=crate::frame_interpolation::Interpolator::from_env().map(Box::new);
         if let Some(interpolation)=frame_interpolation.as_mut(){interpolation.validate_adapter(&adapter);}
+        let native_render_fastpath = native_render_fastpath::requested();
+        log(&format!("native render fastpath={native_render_fastpath} (startup A/B; identical SR, content and synchronization)"));
+        let inline_upload_borrow = std::env::var_os("MUGUET_INLINE_UPLOAD_BORROW").is_some_and(|value| value == "1");
+        log(&format!("inline upload borrow={inline_upload_borrow} (trusted published inline op12/47 only; hazard snapshots retained)"));
+        let native_command_fastpath = native_command_fastpath::StartupOptions::requested();
+        log(&format!("native command fastpath={} vertexDiagnostics={} (startup A/B; complete pass fields, unchanged GPU commands)",
+            native_command_fastpath.enabled, native_command_fastpath.vertex_diagnostics));
         Ok(Gpu {
             live_queries: Default::default(), query_done: Default::default(), stale_query_writes: 0, bc_live: HashMap::new(),
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
-            base, mem, ring, device, queue, adapter, render_attachment_usages: RefCell::new(HashMap::new()), gpu_profile, profile_finish_pending: false, surface, surface_format, surface_size: (0, 0),
+            base, mem, shared_reader, native_render_fastpath,
+            inline_upload_borrow, inline_upload_counters: inline_upload::Counters::default(),
+            upload_trace_path: std::env::var_os("MUGUET_GPU_UPLOAD_TRACE"),
+            native_command_fastpath, native_command_counters: native_command_fastpath::Counters::default(),
+            proxy_sampled_views: native_render_fastpath::ViewCache::new(native_render_fastpath::VIEW_LIMIT),
+            proxy_view_error_generation: 0, repeat_copies_avoided: 0, repeat_copy_logical_bytes_avoided: 0, fallback_bindings_avoided: 0,
+            subresource_proxies: std::env::var_os("MUGUET_SUBRESOURCE_PROXIES").is_some_and(|v|v=="1"),
+            proxy_requests: 0, proxy_conversions: 0, proxy_available: 0, proxy_fallbacks: 0,
+            ring, ring_size, device, queue, pipeline_cache, pipeline_cache_store: RefCell::new(pipeline_cache_store),
+            pso_store: None, warm_pipelines: HashMap::new(), pso_stats: PsoStats::default(),
+            adapter, render_attachment_usages: RefCell::new(HashMap::new()), gpu_profile, profile_finish_pending: false, surface, surface_format, surface_size: (0, 0),
             spatial, spatial_slot_ready: [true; FRAME_SLOTS], submit_prefix: Vec::new(),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             map_programs: HashMap::new(), s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
@@ -1197,6 +1465,7 @@ impl Gpu {
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(),
             readback_pool: std::env::var_os("MUGUET_READBACK_POOL").is_some_and(|v|v=="1").then(readback_pool::Pool::new),
+            occlusion_pool: std::env::var_os("MUGUET_OCCLUSION_POOL").is_some_and(|v|v=="1").then(occlusion_pool::Pool::new),
             frame_capture: crate::frame_capture::Capture::from_env(),
             native_render_audit: native_render_audit::Audit::from_env(),
             frame_interpolation,
@@ -1211,18 +1480,18 @@ impl Gpu {
 
     #[inline]
     fn u(&self, w: u64) -> u32 {
-        read_word(self.base, self.mem.data_size(), w, 0, "command u32")
+        self.shared_reader.word(w, 0, "command u32")
     }
     #[inline]
     fn f(&self, w: u64) -> f32 {
         f32::from_bits(self.u(w))
     }
     fn bytes(&self, addr: u64, n: u64) -> &[u8] {
-        let span = guest_span(&self.mem, addr, n, 1, "command bytes");
+        let span = self.shared_reader.span(addr, n, 1, "command bytes");
         unsafe { std::slice::from_raw_parts(self.base.add(span.start), span.len()) }
     }
     fn hdr(&self, w: u64) -> &AtomicI32 {
-        atomic(&self.mem, self.ring + 4 * w)
+        self.shared_reader.atomic(self.ring + 4 * w)
     }
     fn uid(&mut self) -> u64 {
         self.next_uid += 1;
@@ -1244,6 +1513,7 @@ impl Gpu {
         if self.objs.len() <= i {
             self.objs.resize_with(i + 1, || None);
         }
+        if self.native_render_fastpath { self.proxy_sampled_views.invalidate(|key| key.resource == id || key.srv == id); }
         self.objs[i] = Some(Box::new(o));
         cpu_profile::invalidate_binding_observations();
     }
@@ -1363,12 +1633,18 @@ impl Gpu {
     }
 
     fn run(&mut self) -> ! {
+        // The guest waits for hdr(2). Compile prior observed graphics PSOs on
+        // this GPU thread during loading, before accepting any guest commands.
+        self.warmup_pipelines();
         cpu_profile::begin_gpu_window();
         let mut tail = RING_DATA as i32;
         self.hdr(1).store(tail, Ordering::SeqCst);
         self.hdr(2).store(1, Ordering::SeqCst);
         log("running");
         loop {
+            if cpu_profile::frame_intervals::enabled() {
+                cpu_profile::frame_intervals::lifecycle(crate::ffi::app_presentation_generation(),SUSPENDED.load(Ordering::Relaxed));
+            }
             if slow_trace::enabled(){slow_trace::command(None,None,self.hdr(0).load(Ordering::SeqCst),tail);}
             let _slow_loop=slow_trace::span("gpu_run_iteration","");
             if SUSPENDED.load(Ordering::Relaxed) {
@@ -1382,6 +1658,9 @@ impl Gpu {
                 while SUSPENDED.load(Ordering::Acquire) {
                     let _ = self.device.poll(PollType::Poll);
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                if cpu_profile::frame_intervals::enabled() {
+                    cpu_profile::frame_intervals::lifecycle(crate::ffi::app_presentation_generation(),false);
                 }
             }
             self.process_maps(false);
@@ -1441,11 +1720,14 @@ impl Gpu {
             let p = base + 2;
             let command_addr = checked_value(memory_checks::word(p, 0), "ring command payload address");
             let command_bytes = checked_value(memory_checks::mul(n, 4), "ring command payload length");
-            guest_span(&self.mem, command_addr, command_bytes, 4, "ring command payload");
+            self.shared_reader.span(command_addr, command_bytes, 4, "ring command payload");
             {
                 // Keep opcode context for targeted driver/wait spans without
                 // sampling four clocks for every ordinary guest command.
-                self.exec(op, p, n);
+                let inline_command = if self.inline_upload_borrow && matches!(op, 12 | 47) {
+                    inline_upload::published_buffer_command(self.ring, self.ring_size, tail, head, p, n)
+                } else { None };
+                self.exec(op, p, n, inline_command);
                 if let Some(interpolation)=self.frame_interpolation.as_ref(){interpolation.update_slow_trace_context();}
                 if slow_trace::enabled(){slow_trace::command(Some(op),Some(n),self.hdr(0).load(Ordering::SeqCst),tail);}
             }
@@ -1472,10 +1754,9 @@ impl Gpu {
         tail
     }
 
-    fn exec(&mut self, op: u32, p: u64, n: u64) {
-        let mb = self.base;
-        let memory_len = self.mem.data_size();
-        let u = move |w: u64| read_word(mb, memory_len, p, w, "exec command field");
+    fn exec(&mut self, op: u32, p: u64, n: u64, inline_command: Option<inline_upload::Command>) {
+        let reader = self.shared_reader.clone();
+        let u = move |w: u64| reader.word(p, w, "exec command field");
         match op {
             0 | 2 => {}
             3 => self.create_texture(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(8), u(9)),
@@ -1506,7 +1787,7 @@ impl Gpu {
                 if text == "stats" { self.log_stats(); } else { log(&text); }
             }
             11 => self.create_buffer(u(0), u(1), u(2), u(3), u(4)),
-            12 | 47 => self.upload_buffer(u(0), u(1) as u64, u(2) as u64, (p + 3) * 4, op == 47),
+            12 | 47 => self.upload_buffer(u(0), u(1) as u64, u(2) as u64, (p + 3) * 4, op == 47, inline_command),
             13 => self.upload_texture(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(8), u(9), u(10), u(11) as u64, (p + 12) * 4),
             14 => self.create_shader(p),
             15 => self.create_layout(p),
@@ -1601,12 +1882,14 @@ impl Gpu {
     }
 
     fn reset_state(&mut self) {
+        if self.native_render_fastpath { self.proxy_sampled_views.clear(); }
         self.pdirty = true;
         self.s = State::new();
         self.end_pass();
     }
 
     fn destroy(&mut self, id: u32) {
+        if self.native_render_fastpath { self.proxy_sampled_views.invalidate(|key| key.resource == id || key.srv == id); }
         if self.astc_pending.contains(&id) { self.flush_astc(); }
         self.pending_clears.remove(&id);
         if self.is_bound(id) { self.pdirty = true; }
@@ -1702,12 +1985,26 @@ impl Gpu {
         self.set_obj(id, Obj::Buf(b));
     }
 
-    fn upload_buffer(&mut self, id: u32, offset: u64, size: u64, data_addr: u64, no_overwrite: bool) {
+    fn upload_buffer(&mut self, id: u32, offset: u64, size: u64, data_addr: u64, no_overwrite: bool, inline_command: Option<inline_upload::Command>) {
+        let _upload_profile=cpu_profile::span(CpuMetric::Upload);
         static UPLOADS: AtomicU64 = AtomicU64::new(0);
-        let trace = std::env::var_os("MUGUET_GPU_UPLOAD_TRACE");
+        let trace = self.upload_trace_path.clone();
         let sequence = trace.as_ref().map(|_| UPLOADS.fetch_add(1, Ordering::Relaxed) + 1);
-        let data = self.bytes(data_addr, size).to_vec();
         let used = self.used(id);
+        let borrowed = inline_upload::borrow_allowed(self.inline_upload_borrow, used, no_overwrite, inline_command, data_addr, size);
+        // This Rc is independent of &mut self and pins the shared allocation.
+        // The audited producer's current command remains unacknowledged until
+        // exec returns. There are no flush/poll/tick callbacks on the borrowed
+        // branch, and write_buffer synchronously copies into owned staging.
+        let reader = borrowed.then(|| self.shared_reader.clone());
+        let data = if borrowed {
+            std::borrow::Cow::Borrowed(unsafe { reader.as_ref().unwrap().published_inline_bytes(data_addr, size) })
+        } else {
+            // Preserve the original snapshot BEFORE any hazard-triggered
+            // flush. Unknown shape/separate addresses also use this path.
+            std::borrow::Cow::Owned(self.bytes(data_addr, size).to_vec())
+        };
+        self.inline_upload_counters.record(borrowed, size);
         let Some(b) = self.buf_mut(id) else { return };
         if let Some(sh) = b.shadow.as_mut() {
             let end = ((offset + size) as usize).min(sh.len());
@@ -1731,14 +2028,19 @@ impl Gpu {
 
     #[allow(clippy::too_many_arguments)]
     fn upload_texture(&mut self, id: u32, mip: u32, slice: u32, x: u32, y: u32, z: u32, w: u32, h: u32, d: u32, bpr: u32, rows: u32, size: u64, data_addr: u64) {
+        let _upload_profile=cpu_profile::span(CpuMetric::Upload);
         if self.tex(id).is_none() { return; }
         if self.pending_clears.contains_key(&id) { self.materialize_clears(id); self.flush(); }
         if self.used(id) { self.flush(); }
         let t = self.tex_mut(id).unwrap();
         if mip < t.desc.skip { return; }
         let mip = mip - t.desc.skip;
-        if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; }
-        if let Some(p) = t.proxy_half.as_mut() { p.dirty = true; }
+        // Upload aspect/dimension validity is established by WGPU. Unknown
+        // depth/stencil upload coverage must not leave an old proxy clean.
+        if let Some(p) = t.proxy_depth.as_mut() { p.dirty.invalidate(None); }
+        if let Some(p) = t.proxy_stencil.as_mut() { p.dirty.invalidate(None); }
+        if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty.invalidate(None); }
+        if let Some(p) = t.proxy_half.as_mut() { p.dirty.invalidate(None); }
         let three = t.desc.dim == TextureDimension::D3;
         let (tex, a8, bc, half, astc) = (t.tex.clone(), t.a8, t.bc, t.half, t.astc);
         if astc {
@@ -2044,7 +2346,8 @@ impl Gpu {
         let out_locs = if stage == 0 { locations_in(&text, true) } else { vec![] };
         let in_locs = if stage == 1 { locations_in(&text, false) } else { vec![] };
         let clip = text.contains("@builtin(clip_distances)");
-        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, vid, iid, out_locs, in_locs, clip, full_write_workgroup, luminance_full_write }))
+        let source = PsoShader { hash: hash.to_string(), pause, source_sha256: cache_source_digest(&[text.as_bytes()]) };
+        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, source, vid, iid, out_locs, in_locs, clip, full_write_workgroup, luminance_full_write }))
     }
 
     fn variant(&self, prog: &Program, key: &str, make: impl FnOnce(&str) -> String) -> Option<ShaderModule> {
@@ -2144,7 +2447,11 @@ impl Gpu {
 
     fn bgl_for(&mut self, prog: &Program, stage: u32, group: u32) -> (BindGroupLayout, u64) {
         let mask = self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0));
-        let key = (prog.uid, mask.0, stage, group);
+        self.bgl_for_mask(prog, stage, group, mask)
+    }
+
+    fn bgl_for_mask(&mut self, prog: &Program, stage: u32, group: u32, mask: (u128, u128)) -> (BindGroupLayout, u64) {
+        let key = (prog.uid, mask.0, mask.1, stage, group);
         if let Some(b) = self.bgl_cache.get(&key) { return b.clone(); }
         let entries: Vec<_> = prog.info.bindings.iter().filter(|b| b.group == group).map(|b| Self::layout_entry_masked(b, stage, mask)).collect();
         let bgl = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: None, entries: &entries });
@@ -2205,23 +2512,42 @@ impl Gpu {
     }
 
     fn mark_color_dirty(&mut self, id: u32) {
+        self.mark_color_range_dirty(id, None);
+    }
+    fn mark_color_range_dirty(&mut self, id: u32, range: Option<proxy_subresources::Span>) {
         if let Some(t) = self.tex_mut(id) {
-            if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; }
-            if let Some(p) = t.proxy_half.as_mut() { p.dirty = true; }
+            if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty.invalidate(range); }
+            if let Some(p) = t.proxy_half.as_mut() { p.dirty.invalidate(range); }
         }
     }
     fn mark_depth_dirty(&mut self, id: u32) {
+        self.mark_depth_range_dirty(id, None, true, true);
+    }
+    fn mark_depth_range_dirty(&mut self, id: u32, range: Option<proxy_subresources::Span>, depth: bool, stencil: bool) {
         if let Some(t) = self.tex_mut(id) {
-            if let Some(p) = t.proxy_depth.as_mut() { p.dirty = true; }
-            if let Some(p) = t.proxy_stencil.as_mut() { p.dirty = true; }
+            if depth { if let Some(p) = t.proxy_depth.as_mut() { p.dirty.invalidate(range); } }
+            if stencil { if let Some(p) = t.proxy_stencil.as_mut() { p.dirty.invalidate(range); } }
         }
     }
 
     fn ensure_pass(&mut self) -> bool {
-        let mut key = Vec::with_capacity(37);
-        for r in &self.s.rt { key.extend([r.tex, r.mip, r.slice, r.fmt]); }
         let d = &self.s.ds;
-        key.extend([d.tex, d.mip, d.slice, d.fmt, d.flags]);
+        let depth = [d.tex, d.mip, d.slice, d.fmt, d.flags];
+        let key = if self.native_command_fastpath.enabled && self.s.rt.len() == native_command_fastpath::RENDER_TARGETS {
+            let targets: [[u32; 4]; native_command_fastpath::RENDER_TARGETS] = std::array::from_fn(|i| {
+                let r = &self.s.rt[i]; [r.tex, r.mip, r.slice, r.fmt]
+            });
+            self.native_command_counters.inline_pass_keys += 1;
+            self.native_command_counters.pass_key_requested_bytes_avoided += (native_command_fastpath::PASS_WORDS * 4) as u64;
+            native_command_fastpath::PassKey::new(true, &targets, depth)
+        } else {
+            // OFF and unexpected lengths keep the original full Vec path.
+            let mut words = Vec::with_capacity(37);
+            for r in &self.s.rt { words.extend([r.tex, r.mip, r.slice, r.fmt]); }
+            words.extend(depth);
+            self.native_command_counters.heap_pass_keys += 1;
+            native_command_fastpath::PassKey::Heap(words)
+        };
         if self.pass.is_some() && self.pass_key.as_ref() == Some(&key) { return true; }
         self.end_pass();
         let mut colors: Vec<Option<(TextureView, TextureFormat)>> = Vec::new();
@@ -2233,7 +2559,7 @@ impl Gpu {
             if r.tex == 0 || self.tex(r.tex).is_none() { colors.push(None); continue; }
             match self.target_view(r.tex, r.fmt, r.mip, r.slice) {
                 Some(v) => {
-                    self.mark_color_dirty(r.tex);
+                    self.mark_color_range_dirty(r.tex, Some(proxy_subresources::Span::one(r.mip, r.slice)));
                     let t = self.tex(r.tex).unwrap();
                     samples = t.desc.samples;
                     pw = (t.desc.w >> r.mip).max(1);
@@ -2254,7 +2580,8 @@ impl Gpu {
         let (ro_d, ro_s) = (ds.flags & 1 != 0, ds.flags & 2 != 0);
         if ds.tex != 0 && self.tex(ds.tex).is_some() {
             if let Some((v, f)) = self.target_view(ds.tex, 0, ds.mip, ds.slice) {
-                if !ro_d && !ro_s { self.mark_depth_dirty(ds.tex); }
+                self.mark_depth_range_dirty(ds.tex, Some(proxy_subresources::Span::one(ds.mip, ds.slice)),
+                    !ro_d, has_stencil(f) && !ro_s);
                 let t = self.tex(ds.tex).unwrap();
                 ds_format = Some(f);
                 samples = t.desc.samples;
@@ -2345,7 +2672,7 @@ impl Gpu {
 
     fn simple_pipeline(&self, module: &ShaderModule, color: Option<TextureFormat>, depth: Option<DepthStencilState>) -> RenderPipeline {
         let targets = [color.map(|f| ColorTargetState { format: f, blend: None, write_mask: ColorWrites::ALL })];
-        self.device.create_render_pipeline(&RenderPipelineDescriptor {
+        let pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
             label: None, layout: None,
             vertex: VertexState { module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             primitive: PrimitiveState::default(),
@@ -2353,14 +2680,25 @@ impl Gpu {
             multisample: MultisampleState::default(),
             fragment: Some(FragmentState { module, entry_point: Some("fs"), compilation_options: Default::default(), targets: if color.is_some() { &targets } else { &[] } }),
             multiview_mask: None,
-            cache: None,
-        })
+            cache: self.pipeline_cache.as_ref(),
+        });
+        // Existing helpers return their pipeline directly; preserve that error
+        // protocol. This marks a cache mutation request, not rendering success.
+        self.note_pipeline_cache_change();
+        pipeline
     }
 
-    fn depth_proxy(&mut self, id: u32, stencil: bool) -> Option<(Texture, TextureFormat)> {
+    fn note_pipeline_cache_change(&self) {
+        if self.pipeline_cache.is_some() {
+            if let Some(store) = self.pipeline_cache_store.borrow_mut().as_mut() { store.note_pipeline_created(); }
+        }
+    }
+
+    fn depth_proxy(&mut self, id: u32, stencil: bool, requested: Option<proxy_subresources::Span>) -> Option<(Texture, TextureFormat)> {
         self.materialize_clears(id);
         let pl = self.proxy_pipeline(if stencil { "stencil" } else { "depth" });
         let (desc, tex) = { let t = self.tex(id)?; (t.desc, t.tex.clone()) };
+        let subresources = self.subresource_proxies && desc.dim == TextureDimension::D2 && desc.samples == 1;
         let dev = self.device.clone();
         let t = self.tex_mut(id).unwrap();
         let slot = if stencil { &mut t.proxy_stencil } else { &mut t.proxy_depth };
@@ -2382,13 +2720,18 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            *slot = Some(Proxy { tex: ptex, format: fmt, dirty: true, passes });
+            *slot = Some(Proxy { tex: ptex, format: fmt, dirty: proxy_subresources::Dirty::new(desc.mips, desc.d, subresources), passes });
         }
         let px = slot.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
-        if px.dirty {
-            px.dirty = false;
-            let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
+        let available = px.passes.len();
+        let pending = px.dirty.pending(available, requested);
+        let passes: Vec<_> = pending.iter().map(|&index| { let (v, b) = &px.passes[index]; (v.clone(), b.clone()) }).collect();
+        self.proxy_requests += 1;
+        self.proxy_conversions += pending.len() as u64;
+        self.proxy_available += available as u64;
+        self.proxy_fallbacks += u64::from(!subresources || requested.is_none());
+        if !pending.is_empty() {
             self.end_pass();
             for (dst, bg) in &passes {
                 let timestamp = self.profile_pair("proxy", || format!("depth-proxy tex={id}"));
@@ -2403,11 +2746,14 @@ impl Gpu {
                 p.draw(0..3, 0..1);
             }
             self.use_tex(id);
+            let t = self.tex_mut(id)?;
+            let slot = if stencil { &mut t.proxy_stencil } else { &mut t.proxy_depth };
+            slot.as_mut()?.dirty.recorded(&pending);
         }
         Some(out)
     }
 
-    fn float_to_depth_proxy(&mut self, id: u32) -> Option<(Texture, TextureFormat)> {
+    fn float_to_depth_proxy(&mut self, id: u32, requested: Option<proxy_subresources::Span>) -> Option<(Texture, TextureFormat)> {
         self.materialize_clears(id);
         if self.f2d_pipeline.is_none() {
             let module = self.device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(
@@ -2419,6 +2765,7 @@ impl Gpu {
         }
         let pl = self.f2d_pipeline.clone().unwrap();
         let (desc, tex) = { let t = self.tex(id)?; (t.desc, t.tex.clone()) };
+        let subresources = self.subresource_proxies && desc.dim == TextureDimension::D2 && desc.samples == 1;
         let dev = self.device.clone();
         let t = self.tex_mut(id).unwrap();
         if t.proxy_fdepth.is_none() {
@@ -2435,13 +2782,18 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            t.proxy_fdepth = Some(Proxy { tex: ptex, format: TextureFormat::Depth32Float, dirty: true, passes });
+            t.proxy_fdepth = Some(Proxy { tex: ptex, format: TextureFormat::Depth32Float, dirty: proxy_subresources::Dirty::new(desc.mips, desc.d, subresources), passes });
         }
         let px = t.proxy_fdepth.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
-        if px.dirty {
-            px.dirty = false;
-            let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
+        let available = px.passes.len();
+        let pending = px.dirty.pending(available, requested);
+        let passes: Vec<_> = pending.iter().map(|&index| { let (v, b) = &px.passes[index]; (v.clone(), b.clone()) }).collect();
+        self.proxy_requests += 1;
+        self.proxy_conversions += pending.len() as u64;
+        self.proxy_available += available as u64;
+        self.proxy_fallbacks += u64::from(!subresources || requested.is_none());
+        if !pending.is_empty() {
             self.end_pass();
             for (dst, bg) in &passes {
                 let timestamp = self.profile_pair("proxy", || format!("float-depth-proxy tex={id}"));
@@ -2456,6 +2808,7 @@ impl Gpu {
                 p.draw(0..3, 0..1);
             }
             self.use_tex(id);
+            self.tex_mut(id)?.proxy_fdepth.as_mut()?.dirty.recorded(&pending);
         }
         Some(out)
     }
@@ -2464,10 +2817,11 @@ impl Gpu {
         b.sample == Sample::Float && F32_HALF.load(Ordering::Relaxed) && half_of(format).is_some()
     }
 
-    fn half_proxy(&mut self, id: u32) -> Option<(Texture, TextureFormat)> {
+    fn half_proxy(&mut self, id: u32, requested: Option<proxy_subresources::Span>) -> Option<(Texture, TextureFormat)> {
         self.materialize_clears(id);
         let (desc, tex, format) = { let t = self.tex(id)?; (t.desc, t.tex.clone(), t.format) };
         if desc.dim == TextureDimension::D3 || desc.samples > 1 { return None; }
+        let subresources = self.subresource_proxies && desc.dim == TextureDimension::D2;
         let (half, _) = half_of(format)?;
         let key: &'static str = match half { TextureFormat::R16Float => "half_r", TextureFormat::Rg16Float => "half_rg", _ => "half_rgba" };
         if !self.proxy_pipelines.contains_key(key) {
@@ -2507,13 +2861,18 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            t.proxy_half = Some(Proxy { tex: ptex, format: half, dirty: true, passes });
+            t.proxy_half = Some(Proxy { tex: ptex, format: half, dirty: proxy_subresources::Dirty::new(desc.mips, desc.d, subresources), passes });
         }
         let px = t.proxy_half.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
-        if px.dirty {
-            px.dirty = false;
-            let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
+        let available = px.passes.len();
+        let pending = px.dirty.pending(available, requested);
+        let passes: Vec<_> = pending.iter().map(|&index| { let (v, b) = &px.passes[index]; (v.clone(), b.clone()) }).collect();
+        self.proxy_requests += 1;
+        self.proxy_conversions += pending.len() as u64;
+        self.proxy_available += available as u64;
+        self.proxy_fallbacks += u64::from(!subresources || requested.is_none());
+        if !pending.is_empty() {
             self.end_pass();
             for (dst, bg) in &passes {
                 let timestamp = self.profile_pair("proxy", || format!("half-proxy tex={id}"));
@@ -2528,8 +2887,24 @@ impl Gpu {
                 p.draw(0..3, 0..1);
             }
             self.use_tex(id);
+            self.tex_mut(id)?.proxy_half.as_mut()?.dirty.recorded(&pending);
         }
         Some(out)
+    }
+
+    fn proxy_srv_range(&self, srv_id: u32, b: &Binding) -> Option<proxy_subresources::Span> {
+        let v = self.view_obj(srv_id)?;
+        if v.is_buf { return None; }
+        let desc = self.tex(v.res)?.desc;
+        if desc.dim != TextureDimension::D2 || desc.samples != 1 { return None; }
+        let view = match b.dim {
+            TextureViewDimension::D2 => proxy_subresources::View::D2,
+            TextureViewDimension::D2Array => proxy_subresources::View::D2Array,
+            TextureViewDimension::Cube => proxy_subresources::View::Cube,
+            TextureViewDimension::CubeArray => proxy_subresources::View::CubeArray,
+            _ => return None,
+        };
+        proxy_subresources::srv(desc.mips, desc.d, desc.skip, v.a, v.b, v.c, v.d, view)
     }
 
     fn prepare_depth_proxies(&mut self, prog: &Program, stage: usize) {
@@ -2540,6 +2915,7 @@ impl Gpu {
             let res = v.res;
             let Some(t) = self.tex(res) else { continue };
             let (tformat, tdesc) = (t.format, t.desc);
+            let requested = self.proxy_srv_range(id, b);
             let point = F32_HALF.load(Ordering::Relaxed) && b.sample == Sample::Float && b.binding < 128
                 && (is_depth(tformat) || (half_of(tformat).is_some() && (tdesc.dim == TextureDimension::D3 || tdesc.samples > 1)));
             if point {
@@ -2553,34 +2929,36 @@ impl Gpu {
                 }
             }
             if is_depth(tformat) && b.sample != Sample::Depth {
-                self.depth_proxy(res, b.sample == Sample::Uint);
+                self.depth_proxy(res, b.sample == Sample::Uint, requested);
             } else if !is_depth(tformat) && b.sample == Sample::Depth {
-                self.float_to_depth_proxy(res);
+                self.float_to_depth_proxy(res, requested);
             } else if self.needs_half(tformat, b) {
-                self.half_proxy(res);
+                self.half_proxy(res, requested);
             }
         }
     }
 
     fn srv_view(&mut self, srv_id: u32, b: &Binding) -> Option<TextureView> {
+        let requested = self.proxy_srv_range(srv_id, b);
         let (res, fmt, a, bb, c, d) = { let v = self.view_obj(srv_id)?; (v.res, v.fmt, v.a, v.b, v.c, v.d) };
         if self.astc_pending.contains(&res) { self.flush_astc(); }
         let t = self.tex(res)?;
         let (tformat, desc, astc) = (t.format, t.desc, t.astc);
         let (a, bb) = if desc.skip == 0 || bb == 0xffff_ffff || bb == 0 { (a.saturating_sub(desc.skip), bb) } else { (a.saturating_sub(desc.skip), bb.saturating_sub(desc.skip.saturating_sub(a)).max(1)) };
-        let mut proxied = false;
+        let mut proxy_kind = None;
         let (tex, format) = if is_depth(tformat) && b.sample != Sample::Depth {
-            proxied = true;
-            self.depth_proxy(res, b.sample == Sample::Uint)?
+            proxy_kind = Some(if b.sample == Sample::Uint { native_render_fastpath::ProxyKind::Stencil } else { native_render_fastpath::ProxyKind::Depth });
+            self.depth_proxy(res, b.sample == Sample::Uint, requested)?
         } else if !is_depth(tformat) && b.sample == Sample::Depth {
-            proxied = true;
-            self.float_to_depth_proxy(res)?
+            proxy_kind = Some(native_render_fastpath::ProxyKind::FloatDepth);
+            self.float_to_depth_proxy(res, requested)?
         } else if self.needs_half(tformat, b) && desc.dim != TextureDimension::D3 && desc.samples == 1 {
-            proxied = true;
-            self.half_proxy(res)?
+            proxy_kind = Some(native_render_fastpath::ProxyKind::Half);
+            self.half_proxy(res, requested)?
         } else {
             (self.tex(res)?.tex.clone(), tformat)
         };
+        let proxied = proxy_kind.is_some();
         let key = format!("{:?}{}", b.dim, if proxied { ":p" } else { "" });
         if let Some(v) = self.view_obj(srv_id).and_then(|v| v.views.get(&key)) { return Some(v.clone()); }
         let total = desc.mips;
@@ -2597,9 +2975,18 @@ impl Gpu {
             ..Default::default()
         };
         if matches!(b.dim, TextureViewDimension::D2Array | TextureViewDimension::Cube | TextureViewDimension::CubeArray | TextureViewDimension::D2) {
-            let cnt = match b.dim { TextureViewDimension::Cube => 6, TextureViewDimension::D2 => 1, _ => if d != 0 { d } else { layers - c } };
+            let cnt = match b.dim { TextureViewDimension::Cube => 6, TextureViewDimension::D2 => 1, _ => if d != 0 { d } else { layers.saturating_sub(c) } };
             vd.base_array_layer = c.min(layers - 1);
             vd.array_layer_count = Some(cnt.min(layers.saturating_sub(c)).max(1));
+        }
+        // For qualified D2 views the exact same normalized range selects proxy
+        // conversions and constructs the sampled view. Unknown/invalid cases
+        // retain the legacy descriptor and whole-proxy conversion path.
+        if let Some(range) = requested {
+            vd.base_mip_level = range.mip;
+            vd.mip_level_count = Some(range.mips);
+            vd.base_array_layer = range.layer;
+            vd.array_layer_count = Some(range.layers);
         }
         if fmt != 0 && !is_depth(format) && !proxied {
             let mf = map_format(fmt, 0).format;
@@ -2611,7 +2998,29 @@ impl Gpu {
         if is_depth(format) && !proxied {
             vd.aspect = if fmt == 47 || fmt == 22 { TextureAspect::StencilOnly } else { TextureAspect::DepthOnly };
         }
+        // Conversion/materialization above ALWAYS runs before this lookup.
+        // Unknown descriptors keep the original uncached validation path.
+        let proxy_key = if self.native_render_fastpath && requested.is_some() {
+            proxy_kind.map(|kind| ProxySampledViewKey {
+                resource: res, srv: srv_id, texture: tex.clone(), texture_bytes: native_render_fastpath::texture_bytes(tex.width(),tex.height(),tex.depth_or_array_layers(),tex.mip_level_count(),match format {
+                    TextureFormat::R32Float | TextureFormat::Depth32Float | TextureFormat::Rg16Float => 4,
+                    TextureFormat::Rg8Uint | TextureFormat::R16Float => 2, TextureFormat::Rgba16Float => 8, _ => 0,
+                }).unwrap_or(0), kind,
+                format: vd.format.unwrap_or(format), dimension: b.dim,
+                usage: vd.usage.unwrap_or(tex.usage()).bits(), aspect: vd.aspect,
+                mip: vd.base_mip_level, mips: vd.mip_level_count.expect("normalized proxy mip count"),
+                layer: vd.base_array_layer, layers: vd.array_layer_count.expect("normalized proxy layer count"),
+            })
+        } else { None };
+        if let Some(key) = proxy_key.as_ref() {
+            let generation = self.errors.load(Ordering::Acquire);
+            if generation != self.proxy_view_error_generation {
+                self.proxy_sampled_views.clear(); self.proxy_view_error_generation = generation;
+            }
+            if let Some(view) = self.proxy_sampled_views.get(key) { return Some(view); }
+        }
         let v = self.scoped("SRV view", |_| tex.create_view(&vd))?;
+        if let Some(key) = proxy_key { self.proxy_sampled_views.insert(key, v.clone()); }
         if !proxied {
             if let Some(vo) = self.view_obj_mut(srv_id) { vo.views.insert(key, v.clone()); }
         }
@@ -2893,6 +3302,124 @@ impl Gpu {
         Some(BgResult { bg, uid, dyn_off })
     }
 
+    fn pipeline_recipe(&self, vs: &Program, ps: Option<&Rc<Program>>, layout: &LayoutObj,
+        strides: &[u32], strip: Option<IndexFormat>, pi: &PassInfo, inputs: &PipelineInputs) -> Option<PsoRecipe> {
+        let recipe = PsoRecipe {
+            vs: vs.source.clone(), ps: ps.map(|p| p.source.clone()),
+            signature: inputs.signature.iter().map(|s| [s.sem, s.idx, s.reg]).collect(),
+            elements: layout.els.iter().map(|e| [e.sem, e.idx, e.fmt, e.slot, e.offset, e.cls]).collect(),
+            strides: strides.try_into().ok()?, topology: self.s.topo,
+            strip: match strip { None => 0, Some(IndexFormat::Uint16) => 1, Some(IndexFormat::Uint32) => 2 },
+            blend: inputs.blend.as_ref().map(|s| s.words.clone()),
+            depth: inputs.depth.as_ref().map(|s| s.words.clone()),
+            raster: inputs.raster.as_ref().map(|s| s.words.clone()),
+            colors: pi.rt_formats.clone(), depth_format: pi.ds_format, samples: pi.samples,
+            read_only_depth: pi.ro_depth, read_only_stencil: pi.ro_stencil,
+            masks: inputs.masks.map(|(t, s)| [t as u64, (t >> 64) as u64, s as u64, (s >> 64) as u64]),
+        };
+        recipe.valid().then_some(recipe)
+    }
+
+    fn retain_pso(&mut self, pl: &Rc<Pl>) {
+        if self.warm_pipelines.len() < pso_warmup::LIMIT {
+            if let Some(recipe) = &pl.recipe { self.warm_pipelines.insert(recipe.as_ref().clone(), pl.clone()); }
+        }
+    }
+
+    fn warmup_program(&mut self, source: &PsoShader, stage: u32,
+        programs: &mut HashMap<(String, u32, bool), Option<Rc<Program>>>) -> Option<Rc<Program>> {
+        let key = (source.hash.clone(), stage, source.pause);
+        if !programs.contains_key(&key) {
+            let program = self.load_map_program(&source.hash, stage, source.pause);
+            programs.insert(key.clone(), program);
+        }
+        programs.get(&key)?.as_ref().filter(|p| p.source == *source).cloned()
+    }
+
+    fn warmup_pipelines(&mut self) {
+        if !cfg!(target_env = "ohos") || std::env::var_os("MUGUET_PSO_WARMUP").is_some_and(|v| v == "0") {
+            log("pso-warmup disabled (MUGUET_PSO_WARMUP=0 selects first-use compilation)"); return;
+        }
+        let Some(root) = std::env::var_os("MUGUET_SUPPORT") else { log("pso-warmup bypass: no app private directory"); return; };
+        if self.shader_index.is_empty() { log("pso-warmup bypass: no shader index"); return; }
+        let Ok(index) = std::fs::read(self.shader_dir.join("index.json")) else { return; };
+        let (runtime, wgpu) = pipeline_build_digests();
+        let device = format!("{:?}|{:?}|{:?}|compact={COMPACT_VERTEX_BINDINGS}",
+            self.adapter.get_info(), self.device.features(), self.device.limits());
+        let build = self.shader_dir.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy();
+        let identity = cache_source_digest(&[b"graphics-pso-recipes-v1", runtime.as_bytes(), wgpu.as_bytes(),
+            device.as_bytes(), build.as_bytes(), &index]);
+        let read_only = ["MUGUET_PSO_WARMUP_READ_ONLY", "MUGUET_PIPELINE_CACHE_READ_ONLY"].iter()
+            .any(|key| std::env::var_os(key).is_some_and(|v| v == "1"));
+        let mut store = pso_warmup::Store::new(std::path::Path::new(&root), identity, read_only);
+        let recipes = match store.load() {
+            Ok(recipes) => recipes,
+            Err(error) => { log(&format!("pso-warmup rejected saved recipes: {error}")); Vec::new() },
+        };
+        self.pso_stats.loaded = recipes.len();
+        let began = Instant::now();
+        let _loading = slow_trace::span("pso_loading_warmup", "before_guest_ring_ready");
+        let mut programs = HashMap::new();
+        for recipe in recipes {
+            if SUSPENDED.load(Ordering::Acquire) {
+                // Stay in loading while backgrounded; never replay leftovers
+                // opportunistically on an interactive idle frame.
+                while SUSPENDED.load(Ordering::Acquire) { std::thread::sleep(Duration::from_millis(50)); }
+            }
+            let Some(vs) = self.warmup_program(&recipe.vs, 0, &mut programs) else { self.pso_stats.rejected += 1; continue; };
+            let ps = match &recipe.ps {
+                Some(source) => match self.warmup_program(source, 1, &mut programs) {
+                    Some(p) => Some(p), None => { self.pso_stats.rejected += 1; continue; },
+                },
+                None => None,
+            };
+            let els: Vec<_> = recipe.elements.iter().map(|e| El { sem:e[0], idx:e[1], fmt:e[2], slot:e[3], offset:e[4], cls:e[5] }).collect();
+            let mut slots = Vec::new();
+            for e in &els { if !slots.iter().any(|&(s, _)| s == e.slot) { slots.push((e.slot, e.cls)); } }
+            let layout = Rc::new(LayoutObj { els, slots });
+            let state = |words: &Option<Vec<u32>>| words.as_ref().map(|w| Rc::new(StateObj { words:w.clone(), sampler:None }));
+            let inputs = PipelineInputs {
+                signature: recipe.signature.iter().map(|s| SigEl { sem:s[0], idx:s[1], reg:s[2] }).collect(),
+                blend:state(&recipe.blend), depth:state(&recipe.depth), raster:state(&recipe.raster),
+                masks:recipe.masks.map(|m| (m[0] as u128 | (m[1] as u128) << 64, m[2] as u128 | (m[3] as u128) << 64)),
+            };
+            let pi = PassInfo { rt_formats:recipe.colors.clone(), ds_format:recipe.depth_format, samples:recipe.samples,
+                ro_depth:recipe.read_only_depth, ro_stencil:recipe.read_only_stencil, width:1, height:1 };
+            let (topo, _) = topology(recipe.topology);
+            let strip = match recipe.strip { 1 => Some(IndexFormat::Uint16), 2 => Some(IndexFormat::Uint32), _ => None };
+            self.pipe_creates += 1;
+            let Some((job, vb_req, vertex_bindings)) = self.create_pipeline(&vs, ps.as_ref(), &layout, &recipe.strides, topo, strip, &pi, &inputs) else {
+                self.pso_stats.failed += 1; continue;
+            };
+            let compiled = { let _slow = slow_trace::span("pso_warmup_compile", &job.label); compile_pipeline(&self.device, &job) };
+            match compiled {
+                Some(pipeline) => {
+                    self.note_pipeline_cache_change();
+                    let uid = self.uid();
+                    let pl = Rc::new(Pl { pipeline, uid, vb_req, vertex_bindings, label:job.label,
+                        recipe:Some(Rc::new(recipe)), observed:Cell::new(false), warmed:true });
+                    self.retain_pso(&pl); self.pso_stats.built += 1;
+                },
+                None => self.pso_stats.failed += 1,
+            }
+        }
+        self.pso_stats.loading_ns = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        // BGLs are explicit and pooled by descriptor entries in wgpu-core.
+        // New guest Program UIDs can bind structurally identical layouts.
+        log(&format!("pso-warmup store: {}", store.status()));
+        self.pso_store = Some(store);
+        log(&format!("pso-warmup loading complete: {}", self.pso_status()));
+    }
+
+    fn pso_status(&self) -> serde_json::Value {
+        let s = &self.pso_stats;
+        serde_json::json!({"enabled":self.pso_store.is_some(),"loaded":s.loaded,"built":s.built,"rejected":s.rejected,
+            "failed":s.failed,"loadingWallNs":s.loading_ns,"warmLookupHits":s.warm_hits,"warmFirstDraws":s.warm_first_draws,
+            "drawCompileCalls":s.draw_compiles,"drawCompileWallTotalNs":s.draw_compile_total_ns,
+            "drawCompileWallMaxNs":s.draw_compile_max_ns,"retained":self.warm_pipelines.len(),"limit":pso_warmup::LIMIT,
+            "scope":"previously_observed_graphics_draw_PSOs; host_wall_time_not_GPU_time_or_stutter_acceptance"})
+    }
+
     fn get_pipeline(&mut self, vs_id: u32, ps_id: u32, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>) -> Option<Rc<Pl>> {
         let pi = self.pass_info.clone()?;
         let (topo, strip) = topology(self.s.topo);
@@ -2912,14 +3439,29 @@ impl Gpu {
             Some(PipeEntry::Pending) => { self.pending_skips += 1; return None; }
             None => {}
         }
+        let state = |id| if id != 0 { self.state(id) } else { None };
+        let inputs = PipelineInputs {
+            signature: self.vs_sig()?, blend: state(self.s.blend.0),
+            depth: state(self.s.dss.0), raster: state(self.s.rs),
+            masks: [self.unfilt.get(&vs.uid).copied().unwrap_or_default(),
+                ps.and_then(|p| self.unfilt.get(&p.uid).copied()).unwrap_or_default()],
+        };
+        let recipe = self.pso_store.as_ref().and_then(|_| {
+            self.pipeline_recipe(vs, ps, layout, &strides, strip_fmt, &pi, &inputs)
+        }).map(Rc::new);
+        if let Some(pl) = recipe.as_ref().and_then(|r| self.warm_pipelines.get(r.as_ref())).cloned() {
+            self.pso_stats.warm_hits += u64::from(pl.warmed);
+            self.pipelines.insert(key, PipeEntry::Done(Some(pl.clone())));
+            return Some(pl);
+        }
         self.pipe_creates += 1;
-        let Some((job, vb_req, vertex_bindings)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi) else {
+        let Some((job, vb_req, vertex_bindings)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi, &inputs) else {
             self.pipelines.insert(key, PipeEntry::Done(None));
             return None;
         };
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
-            self.pipe_pending.insert(id, (key.clone(), vb_req, vertex_bindings, job.label.clone()));
+            self.pipe_pending.insert(id, (key.clone(), vb_req, vertex_bindings, job.label.clone(), recipe));
             self.pipelines.insert(key.clone(), PipeEntry::Pending);
             let _ = tx.send((id, job));
             let start = Instant::now();
@@ -2933,17 +3475,26 @@ impl Gpu {
             self.pending_skips += 1;
             return None;
         }
-        let pl = compile_pipeline(&self.device, &job).map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, vertex_bindings, label: job.label }) });
+        let began = Instant::now();
+        let compiled = { let _slow = slow_trace::span("pso_draw_miss", &job.label); compile_pipeline(&self.device, &job) };
+        let elapsed = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.pso_stats.draw_compiles += 1;
+        self.pso_stats.draw_compile_total_ns = self.pso_stats.draw_compile_total_ns.saturating_add(elapsed);
+        self.pso_stats.draw_compile_max_ns = self.pso_stats.draw_compile_max_ns.max(elapsed);
+        if compiled.is_some() { self.note_pipeline_cache_change(); }
+        let pl = compiled.map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, vertex_bindings, label: job.label,
+            recipe, observed: Cell::new(false), warmed: false }) });
+        if let Some(p) = &pl { self.retain_pso(p); }
         self.pipelines.insert(key, PipeEntry::Done(pl.clone()));
         pl
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_pipeline(&mut self, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>, strides: &[u32], topo: PrimitiveTopology, strip_fmt: Option<IndexFormat>, pi: &PassInfo) -> Option<(PipeJob, Vec<VbReq>, vertex_bindings::Plan)> {
-        let vs_obj_sig = self.vs_sig()?;
+    fn create_pipeline(&mut self, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>, strides: &[u32], topo: PrimitiveTopology, strip_fmt: Option<IndexFormat>, pi: &PassInfo, inputs: &PipelineInputs) -> Option<(PipeJob, Vec<VbReq>, vertex_bindings::Plan)> {
+        let vs_obj_sig = &inputs.signature;
         let label = format!("{} + {}", vs.label, ps.map(|p| p.label.as_str()).unwrap_or("-"));
-        let bgl0 = if vs.info.bindings.iter().any(|b| b.group == 0) { self.bgl_for(vs, 0, 0).0 } else { self.empty_bgl() };
-        let bgl1 = match ps { Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for(p, 1, 1).0, _ => self.empty_bgl() };
+        let bgl0 = if vs.info.bindings.iter().any(|b| b.group == 0) { self.bgl_for_mask(vs, 0, 0, inputs.masks[0]).0 } else { self.empty_bgl() };
+        let bgl1 = match ps { Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for_mask(p, 1, 1, inputs.masks[1]).0, _ => self.empty_bgl() };
         let pl_layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl0), Some(&bgl1)], immediate_size: 0 });
         let remap = self.inter_stage_remap(vs, ps.map(|p| p.as_ref()));
         let vmod = self.vertex_module(vs, ps.map(|p| p.flat.as_slice()).unwrap_or(&[]), remap.as_ref(), vs.label == "im::VS_Blit" && ps.map(|p| p.label == "im::PS_BlitDepthToAlpha").unwrap_or(false))?;
@@ -2975,9 +3526,7 @@ impl Gpu {
         let actual_active_bindings: Vec<u32> = vb_layouts.iter().enumerate().filter_map(|(binding, layout)| layout.as_ref().map(|_| binding as u32)).collect();
         vertex_bindings::trace_pipeline(&vertex_bindings, &label, &actual_active_bindings);
 
-        let rs = if self.s.rs != 0 { self.state(self.s.rs) } else { None };
-        let blend = if self.s.blend.0 != 0 { self.state(self.s.blend.0) } else { None };
-        let dss = if self.s.dss.0 != 0 { self.state(self.s.dss.0) } else { None };
+        let (rs, blend, dss) = (&inputs.raster, &inputs.blend, &inputs.depth);
         let mut primitive = PrimitiveState { topology: topo, strip_index_format: strip_fmt, ..Default::default() };
         match &rs {
             Some(r) => {
@@ -3025,7 +3574,7 @@ impl Gpu {
             None => None,
         };
         let multisample = MultisampleState { count: pi.samples.max(1), mask: !0, alpha_to_coverage_enabled: pi.samples > 1 && blend.as_ref().map(|b| b.words.first().copied().unwrap_or(0) != 0).unwrap_or(false) };
-        Some((PipeJob { label, layout: pl_layout, vmod, fmod, vbs: vb_layouts, primitive, depth_stencil, multisample, targets }, vb_req, vertex_bindings))
+        Some((PipeJob { label, layout: pl_layout, vmod, fmod, vbs: vb_layouts, primitive, depth_stencil, multisample, targets, cache: self.pipeline_cache.clone() }, vb_req, vertex_bindings))
     }
 
     fn collect_pipelines(&mut self) {
@@ -3035,8 +3584,10 @@ impl Gpu {
     }
 
     fn finish_pipeline(&mut self, id: u64, pipeline: Option<RenderPipeline>) {
-        let Some((key, vb_req, vertex_bindings, label)) = self.pipe_pending.remove(&id) else { return };
-        let entry = pipeline.map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, vertex_bindings, label }) });
+        let Some((key, vb_req, vertex_bindings, label, recipe)) = self.pipe_pending.remove(&id) else { return };
+        let entry = pipeline.map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, vertex_bindings, label,
+            recipe, observed: Cell::new(false), warmed: false }) });
+        if let Some(pl) = &entry { self.retain_pso(pl); }
         self.pipelines.insert(key, PipeEntry::Done(entry));
         self.pdirty = true;
     }
@@ -3055,9 +3606,8 @@ impl Gpu {
             let lim = atomic(&self.mem, self.dbg_idx).load(Ordering::Relaxed);
             if lim >= 0 { }
         }
-        let mb = self.base;
-        let memory_len = self.mem.data_size();
-        let u = move |w: u64| read_word(mb, memory_len, p, w, "draw command field");
+        let reader = self.shared_reader.clone();
+        let u = move |w: u64| reader.word(p, w, "draw command field");
         let (kind, count, inst, start, base_vertex, start_instance) = (u(0), u(1), u(2), u(3), u(4) as i32, u(5));
         self.collect_pipelines();
         let vs_id = self.s.shader[0];
@@ -3161,17 +3711,24 @@ impl Gpu {
                 self.use_buf(ibid);
             }
         }
-        let pi = self.pass_info.clone().unwrap();
+        // Keep the original owned clone/lifetime on OFF. ON only reads geometry;
+        // no render-target format, pipeline or resource ownership is changed.
+        let reference_pass_info = if self.native_command_fastpath.enabled {
+            self.native_command_counters.geometry_clones_avoided += 1;
+            None
+        } else { Some(self.pass_info.clone().unwrap()) };
+        let pi = reference_pass_info.as_ref().unwrap_or_else(|| self.pass_info.as_ref().unwrap());
+        let (pass_width, pass_height) = (pi.width, pi.height);
         let rs_scissor = self.s.rs != 0 && self.state(self.s.rs).map(|r| r.words.get(7).copied().unwrap_or(0) != 0).unwrap_or(false);
         let scissor = if rs_scissor && !self.s.scissors.is_empty() {
             let c = self.s.scissors[0];
-            let x0 = pi.width.min(c[0]);
-            let y0 = pi.height.min(c[1]);
-            let x1 = pi.width.min(x0.max(c[2]));
-            let y1 = pi.height.min(y0.max(c[3]));
+            let x0 = pass_width.min(c[0]);
+            let y0 = pass_height.min(c[1]);
+            let x1 = pass_width.min(x0.max(c[2]));
+            let y1 = pass_height.min(y0.max(c[3]));
             [x0, y0, x1 - x0, y1 - y0]
         } else {
-            [0, 0, pi.width, pi.height]
+            [0, 0, pass_width, pass_height]
         };
         let viewport = self.s.viewports.first().copied();
         let bf = self.s.blend.1;
@@ -3194,6 +3751,7 @@ impl Gpu {
             match self.buf(u(1)).and_then(|b| b.gpu.clone()) { Some(g) => { self.use_buf(u(1)); Some((g, u(2) as u64)) } None => { self.skip(); return } }
         } else { None };
 
+        let trace_vertex_bind = self.native_command_fastpath.should_trace_vertex_bind();
         let st = &mut self.pass_st;
         let pass = self.pass.as_mut().unwrap();
         if st.pl != Some(pl.uid) { pass.set_pipeline(&pl.pipeline); st.pl = Some(pl.uid); }
@@ -3210,7 +3768,11 @@ impl Gpu {
         for (slot, binding, g, off, ident) in &vb_binds {
             let key = (*ident, *off);
             let issued = st.vb[*binding as usize] != Some(key);
-            vertex_bindings::trace_bind(&pl.vertex_bindings, pl.uid, *slot, *binding, *ident, *off, issued);
+            if trace_vertex_bind {
+                vertex_bindings::trace_bind(&pl.vertex_bindings, pl.uid, *slot, *binding, *ident, *off, issued);
+            } else {
+                self.native_command_counters.disabled_vertex_trace_calls_avoided += 1;
+            }
             if issued {
                 pass.set_vertex_buffer(*binding, g.slice(*off..));
                 st.vb[*binding as usize] = Some(key);
@@ -3243,6 +3805,12 @@ impl Gpu {
             }
         }
         self.draws += 1;
+        // Creation alone does not prove use: bindings/arguments may have made
+        // do_draw return early. Record once, only after draw* was recorded.
+        if !pl.observed.replace(true) {
+            if pl.warmed { self.pso_stats.warm_first_draws += 1; }
+            if let (Some(store), Some(recipe)) = (self.pso_store.as_mut(), pl.recipe.as_ref()) { store.record(recipe); }
+        }
         if self.native_render_audit.is_some() {
             self.audit_native_render_draw(&pl,&vs,ps.as_deref(),kind,indexed,d_count,d_inst,start,v_first,i_first,
                 if fold_v{0}else{base_vertex},pl.vb_req.iter().any(|required|!required.instance&&required.stride>0&&
@@ -3330,7 +3898,7 @@ impl Gpu {
                         for b in &info.bindings { gb.entry(b.group).or_default().push(b.clone()); }
                         for v in gb.values_mut() { v.sort_by_key(|b| b.binding); }
                         let uid = self.uid();
-                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false, full_write_workgroup: prog.full_write_workgroup, luminance_full_write: prog.luminance_full_write })
+                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, source: prog.source.clone(), vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false, full_write_workgroup: prog.full_write_workgroup, luminance_full_write: prog.luminance_full_write })
                     }
                     None => { self.compute.insert(key.clone(), None); self.skipped += 1; return; }
                 }
@@ -3348,8 +3916,9 @@ impl Gpu {
                 log_once("luminance-auto-zero", &format!("luminance pipeline={label} sourceSHA={} fullWriteVerified=true zeroInitializeWorkgroupMemory={zero_initialize_workgroup_memory}", luminance_init::SOURCE_SHA256));
             }
             let pl = self.scoped(&format!("compute pipeline {label}"), |d| d.create_compute_pipeline(&ComputePipelineDescriptor {
-                label: Some(&label), layout: Some(&layout), module: &cprog.module, entry_point: Some("main"), compilation_options: PipelineCompilationOptions { zero_initialize_workgroup_memory, ..Default::default() }, cache: None,
+                label: Some(&label), layout: Some(&layout), module: &cprog.module, entry_point: Some("main"), compilation_options: PipelineCompilationOptions { zero_initialize_workgroup_memory, ..Default::default() }, cache: self.pipeline_cache.as_ref(),
             }));
+            if pl.is_some() { self.note_pipeline_cache_change(); }
             let uid = self.uid();
             self.compute.insert(key.clone(), pl.map(|p| (p, bgl, uid, cprog)));
         }
@@ -3377,7 +3946,7 @@ impl Gpu {
     }
     fn clear_rt(&mut self, id: u32, mip: u32, slice: u32, c: [f32; 4]) {
         let Some(three) = self.tex(id).map(|t| t.desc.dim == TextureDimension::D3) else { return };
-        self.mark_color_dirty(id);
+        self.mark_color_range_dirty(id, Some(proxy_subresources::Span::one(mip, slice)));
         if three { self.materialize_clears(id); self.clear_rt_now(id, mip, slice, Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: c[3] as f64 }); return; }
         if self.in_open_pass(id) { self.end_pass(); }
         let list = self.pending_clears.entry(id).or_default();
@@ -3389,10 +3958,10 @@ impl Gpu {
     }
     fn clear_ds(&mut self, id: u32, mip: u32, slice: u32, flags: u32, depth: f32, stencil: u32) {
         let Some((fmt, three)) = self.tex(id).map(|t| (t.format, t.desc.dim == TextureDimension::D3)) else { return };
-        self.mark_depth_dirty(id);
         let d = (flags & 1 != 0).then(|| depth.clamp(0.0, 1.0));
         let st = (flags & 2 != 0 && has_stencil(fmt)).then_some(stencil);
         if d.is_none() && st.is_none() { return; }
+        self.mark_depth_range_dirty(id, Some(proxy_subresources::Span::one(mip, slice)), d.is_some(), st.is_some());
         if three { self.materialize_clears(id); self.clear_ds_now(id, mip, slice, d, st); return; }
         if self.in_open_pass(id) { self.end_pass(); }
         let list = self.pending_clears.entry(id).or_default();
@@ -3494,6 +4063,8 @@ impl Gpu {
                 Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
         }
+        // Nonzero clears must invalidate existing float/half proxies too.
+        self.mark_color_dirty(res);
     }
 
     fn sub_of(desc: &TexDesc, sub: u32) -> (u32, u32) {
@@ -3685,9 +4256,8 @@ impl Gpu {
     }
 
     fn readback(&mut self, p: u64) {
-        let mb = self.base;
-        let memory_len = self.mem.data_size();
-        let u = move |w: u64| read_word(mb, memory_len, p, w, "readback command field");
+        let reader = self.shared_reader.clone();
+        let u = move |w: u64| reader.word(p, w, "readback command field");
         let (src, sub, has_box) = (u(0), u(1), u(2) != 0);
         let (l, t, f, r, b, bk) = (u(3), u(4), u(5), u(6), u(7), u(8));
         let addr = u(9) as u64 + u(10) as u64 * 4294967296;
@@ -3861,6 +4431,9 @@ impl Gpu {
             if !self.pending_maps[i].done.load(Ordering::SeqCst) { i += 1; continue; }
             let pm = self.pending_maps.swap_remove(i);
             if pm.failed.load(Ordering::SeqCst) {
+                if matches!(&pm.kind, MapKind::Occlusion { .. }) {
+                    if let Some(pool) = self.occlusion_pool.as_mut() { pool.invalidate_failed_map(); }
+                }
                 // Preserve the existing fatal failure protocol: no mapped view,
                 // no guest completion notification and no return to the pool.
                 let error = "GPU readback mapping failed; guest completion was not published";
@@ -3887,22 +4460,27 @@ impl Gpu {
                             }
                         }
                     }
-                    MapKind::Occlusion { list } => {
+                    MapKind::Occlusion { list, .. } => {
                         for &(byte, cnt, addr, consecutive, seq) in list {
-                            let mut sum = 0u64;
+                            // Nonprecise Vulkan occlusion queries may return any
+                            // nonzero u64. The existing guest result is boolean;
+                            // combine visibility without overflowing a sum, and
+                            // still validate/read every slot after one is visible.
+                            let mut visible = false;
                             for k in 0..cnt as u64 {
                                 let offset = checked_value(memory_checks::mul(k, if consecutive { 8 } else { 256 }), "occlusion readback slot offset");
                                 let at = checked_value(memory_checks::add(byte, offset), "occlusion readback address");
                                 let source = checked_value(memory_checks::span(range.len(), at, 8, 8), "occlusion mapped result");
-                                sum = checked_value(memory_checks::add(sum, u64::from_le_bytes(range[source].try_into().unwrap())), "occlusion result sum");
+                                visible |= u64::from_le_bytes(range[source].try_into().unwrap()) != 0;
                             }
-                            self.query_store(addr, if sum != 0 { OCCLUSION_VISIBLE_COUNT } else { 0 }, seq as u32);
+                            self.query_store(addr, if visible { OCCLUSION_VISIBLE_COUNT } else { 0 }, seq as u32);
                         }
                     }
                 }
             }
             pm.buf.unmap();
-            if let MapKind::Readback { flag, recycle, error_generation, .. } = pm.kind {
+            match pm.kind {
+            MapKind::Readback { flag, recycle, error_generation, .. } => {
                 if flag != 0 { atomic(&self.mem, flag).store(0, Ordering::SeqCst); let _ = self.mem.atomic_notify(flag, u32::MAX); }
                 // Keep the existing copy -> view drop -> unmap -> guest flag/
                 // notify sequence. Only then may this uniquely owned buffer
@@ -3919,6 +4497,21 @@ impl Gpu {
                         pool.return_unmapped(key, pm.buf);
                     }
                 }
+            }
+            MapKind::Occlusion { resolve, recycle, error_generation, .. } => {
+                // query_store (including stale/deleted-query skips), mapped
+                // view destruction and unmap have all completed. Both handles
+                // stay in this lease until that entire sequence finishes.
+                let current_generation = self.errors.load(Ordering::Acquire);
+                if let Some(pool) = self.occlusion_pool.as_mut() {
+                    let size = pm.buf.size();
+                    let exact_usages = resolve.usage() == (BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST)
+                        && pm.buf.usage() == (BufferUsages::COPY_DST | BufferUsages::MAP_READ)
+                        && resolve.size() == size;
+                    pool.return_completed(size, occlusion_pool::Pair { resolve, map: pm.buf },
+                        error_generation, current_generation, recycle && exact_usages, guest_copies_complete);
+                }
+            }
             }
         }
     }
@@ -3990,11 +4583,25 @@ impl Gpu {
         }
         if self.occlusion_next > OCCLUSION_CAPACITY - 256 && self.occlusion_active.is_none() { self.occlusion_next = 0; }
         if bytes == 0 { return None; }
-        let size = bytes.next_power_of_two().max(256);
-        let rb = self.device.create_buffer(&BufferDescriptor { label: Some("occlusion resolve"), size, usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let map = self.device.create_buffer(&BufferDescriptor { label: Some("occlusion map"), size, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
         let set = self.occlusion_set.clone()?;
+        let recycle = self.occlusion_pool.is_some();
+        // Exact allocations avoid an untouched power-of-two bucket tail. The
+        // entire resolve allocation is cleared before sparse query writes so
+        // 256-byte alignment gaps cannot expose bytes from an earlier lease.
+        let size = if recycle { bytes } else { bytes.next_power_of_two().max(256) };
+        let error_generation = self.errors.load(Ordering::Acquire);
+        let cached = self.occlusion_pool.as_mut().and_then(|pool| pool.take(size, error_generation));
+        let occlusion_pool::Pair { resolve: rb, map } = cached.unwrap_or_else(|| {
+            if let Some(pool) = self.occlusion_pool.as_mut() { pool.created(); }
+            let usage = BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC
+                | if recycle { BufferUsages::COPY_DST } else { BufferUsages::empty() };
+            occlusion_pool::Pair {
+                resolve: self.device.create_buffer(&BufferDescriptor { label: Some("occlusion resolve"), size, usage, mapped_at_creation: false }),
+                map: self.device.create_buffer(&BufferDescriptor { label: Some("occlusion map"), size, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false }),
+            }
+        });
         let enc = self.encoder();
+        if recycle { enc.clear_buffer(&rb, 0, Some(size)); }
         let mut out = Vec::new();
         for (slots, at, addr, consecutive, seq) in &layout {
             if *consecutive {
@@ -4006,7 +4613,8 @@ impl Gpu {
         }
         enc.copy_buffer_to_buffer(&rb, 0, &map, 0, bytes);
         let done = Arc::new(AtomicBool::new(false));
-        Some(PendingMap { buf: map, done, failed: Arc::new(AtomicBool::new(false)), kind: MapKind::Occlusion { list: out } })
+        Some(PendingMap { buf: map, done, failed: Arc::new(AtomicBool::new(false)),
+            kind: MapKind::Occlusion { list: out, resolve: rb, recycle, error_generation } })
     }
     fn apply_query_results(&mut self) {
         let done = std::mem::take(&mut *self.query_done.lock().unwrap());
@@ -4071,11 +4679,12 @@ impl Gpu {
     fn present_interpolated_source(&mut self, id: u32) -> bool {
         if !self.frame_interpolation.as_ref().is_some_and(|v|v.active()) { return false; }
         let _slow=slow_trace::span("guest_interpolation_source_boundary","");
-        // Guest frameLimit is coarse. Explicit FG paces the real GPU source
-        // boundary at half its configured output rate as well.
+        // The positive-fps legacy branch retains its source pacing. Unlimited
+        // native mode returns zero here; neither AI nor its output budget gates sources.
         // Keep servicing the output clock during this bounded per-frame wait.
         {
         let _slow=slow_trace::span("source_pacing_with_output_ticks","");
+        let _pacing_profile=cpu_profile::span(CpuMetric::SourcePacing);
         while !OCCLUDED.load(Ordering::Relaxed) && !SUSPENDED.load(Ordering::Relaxed) {
             let wait = self.frame_interpolation.as_ref().map(|v|v.source_wait()).unwrap_or(Duration::ZERO);
             if wait.is_zero() { break; }
@@ -4090,7 +4699,7 @@ impl Gpu {
                 if let Some(tex) = self.tex(id).map(|t|t.tex.clone()) {
                     // Complete all guest writes before the private snapshot.
                     self.flush_astc(); self.end_pass(); self.flush_uniforms(); self.use_tex(id);
-                    let command={let _slow=slow_trace::span("source_snapshot_record","");let command=interpolation.record(&self.device, &tex, self.presents+1);
+                    let command={let _slow=slow_trace::span("source_snapshot_record","");let _snapshot_profile=cpu_profile::span(CpuMetric::SourceSnapshot);let command=interpolation.record(&self.device, &tex, self.presents+1);
                         interpolation.update_slow_trace_context();command};
                     if let Some(command) = command {
                         if let Some(before) = self.enc.take() { self.submit_prefix.push(before.finish()); }
@@ -4112,13 +4721,19 @@ impl Gpu {
         }
         self.finish_gpu_profile_frame(); self.flush();
         self.tick_frame_interpolation();
-        true
+        self.frame_interpolation.as_ref().is_some_and(|value|value.active())
     }
 
     fn invalidate_output_cache(&mut self) {
         if self.interpolation_output_cache.take().is_some() {
             OUTPUT_CACHE_INVALIDATIONS.fetch_add(1,Ordering::Relaxed);
         }
+    }
+    fn source_output_binding(device:&Device,texture:&Texture,blit:&RenderPipeline)->(TextureView,BindGroup) {
+        let view=texture.create_view(&TextureViewDescriptor::default());
+        let binding=device.create_bind_group(&BindGroupDescriptor{label:Some("game-AI-source-output"),layout:&blit.get_bind_group_layout(0),
+            entries:&[BindGroupEntry{binding:0,resource:BindingResource::TextureView(&view)}]});
+        (view,binding)
     }
     fn output_cache_candidate(&self,key:OutputCacheKey,source:&Texture,blit:&RenderPipeline,sr_active:bool)->Option<OutputCache> {
         if (source.width(),source.height())!=key.output_size || source.format()!=key.output_format ||
@@ -4160,6 +4775,7 @@ impl Gpu {
         interpolation.update_slow_trace_context();
         if !visible || !interpolation.active() { self.invalidate_output_cache(); }
         let Some(display) = display else {self.frame_interpolation=Some(interpolation);return;};
+        let _output_profile=cpu_profile::span(CpuMetric::OutputOther);
         // This wrapper runs between guest opcodes. Read the SR settings mutex
         // only for an actual output deadline, after the interpolator poll gate.
         let epoch=interpolation.cache_epoch();
@@ -4171,21 +4787,35 @@ impl Gpu {
             self.blit=Some(crate::spatial_upscale::blit_pipeline(&self.device,self.surface_format));
         }
         let Some(blit)=self.blit.clone() else {self.frame_interpolation=Some(interpolation);return;};
-        let cache_key=OutputCacheKey::for_display(&display,epoch,cache_signature,self.surface_format);
+        let keep_repeat_cache=native_render_fastpath::cache_repeats(self.native_render_fastpath,interpolation.unlimited_native());
+        if !keep_repeat_cache { self.invalidate_output_cache(); }
+        let cache_key=if keep_repeat_cache {OutputCacheKey::for_display(&display,epoch,cache_signature,self.surface_format)}else{None};
         let cache_eligible=cache_key.is_some();
         let cache_hit=repeat_output_cache_hit(display.kind,self.interpolation_output_cache.as_ref().map(|cache|&cache.key),
             cache_key.as_ref(),cache_key.as_ref().is_some_and(|key|key.output_size==self.surface_size));
         let slot=self.interpolation_sr_slot;
         if !cache_hit && self.interpolation_spatial.is_none() {self.interpolation_spatial=crate::spatial_upscale::Spatial::new(&self.device,FRAME_SLOTS);}
+        let preserve_native_sr=interpolation.unlimited_native()&&display.kind=="source"&&cache_signature.requested();
+        if !cache_hit&&preserve_native_sr&&self.interpolation_spatial.is_none() {
+            interpolation.output_failed("unlimited native SR initialization failed; interpolation disabled for original presentation recovery".into());
+            self.invalidate_output_cache();self.frame_interpolation=Some(interpolation);return;
+        }
         if !cache_hit && self.interpolation_spatial.is_some() {
             if let Some(index)=self.interpolation_sr_fences[slot].as_ref() {
                 // This is an OUTPUT slot, independent of the guest UBO
                 // slots. Never replace a raw SR context/view while pending.
-                let completion={let _slow=slow_trace::span("output_sr_slot_wait_1ms","");
-                    self.device.poll(PollType::Wait{submission_index:Some(index.clone()),timeout:Some(Duration::from_millis(1))})};
+                let completion={let _slow=slow_trace::span("output_sr_slot_wait",if preserve_native_sr{"native_fence_bounded_50ms"}else{"optional_output_1ms"});
+                    let _wait_profile=cpu_profile::span(CpuMetric::OutputWait);
+                    self.device.poll(PollType::Wait{submission_index:Some(index.clone()),timeout:Some(if interpolation.unlimited_native()&&display.kind=="source"{Duration::from_millis(50)}else{Duration::from_millis(1)})})};
                 match completion {
                     Ok(_)=>{self.interpolation_sr_fences[slot]=None;},
-                    Err(error)=>{interpolation.output_skipped(&format!("output SR slot {slot} not completed: {error:?}"));self.frame_interpolation=Some(interpolation);return;}
+                    Err(error)=>{
+                        interpolation.output_skipped(&format!("output SR slot {slot} not completed: {error:?}"));
+                        if interpolation.unlimited_native()&&!matches!(error,PollError::Timeout) {
+                            interpolation.output_failed(format!("unlimited native SR fence failed: {error:?}"));
+                        }else {interpolation.presented(&display,false,None,None);}
+                        self.frame_interpolation=Some(interpolation);return;
+                    }
                 }
             }
         }
@@ -4200,23 +4830,31 @@ impl Gpu {
             let mut before=self.device.create_command_encoder(&CommandEncoderDescriptor{label:Some("game-AI-output-tracked-before")});
             let texture={let _slow=slow_trace::span("output_prepare_warp",display.kind);interpolation.prepare_output(&self.device,&self.queue,&display,&mut before)};
             let Some(texture)=texture else {
-                self.invalidate_output_cache();crate::spatial_upscale::note_frame_generation(false);self.frame_interpolation=Some(interpolation);return;
+                self.invalidate_output_cache();crate::spatial_upscale::note_frame_generation(false);interpolation.presented(&display,false,None,None);self.frame_interpolation=Some(interpolation);return;
             };
             let mut size=(texture.width(),texture.height());
-            let source_view=texture.create_view(&TextureViewDescriptor::default());
-            let mut binding=self.device.create_bind_group(&BindGroupDescriptor{label:Some("game-AI-source-output"),layout:&blit.get_bind_group_layout(0),
-                entries:&[BindGroupEntry{binding:0,resource:BindingResource::TextureView(&source_view)}]});
+            let original=native_render_fastpath::initial_binding(self.native_render_fastpath,||Self::source_output_binding(&self.device,&texture,&blit));
+            // Preserve OFF's eager allocation and retained view lifetime.
+            let (_source_view,mut binding)=match original {Some((view,binding))=>(Some(view),Some(binding)),None=>(None,None)};
             let mut raw=None;let mut final_texture=texture.clone();let mut sr=false;
             if let Some(spatial)=self.interpolation_spatial.as_mut() {
                 let _slow=slow_trace::span("output_xeg_sr_record",display.kind);
                 match spatial.record(&texture,slot,&blit,&mut before) {
                     Ok((command,output_binding,output_size))=>{
-                        raw=Some(command);binding=output_binding;size=output_size;sr=true;
+                        raw=Some(command);binding=Some(output_binding);size=output_size;sr=true;
                         if let Some(output)=spatial.output_texture(slot) {final_texture=output;}
                     },
-                    Err(error)=>spatial.report_fallback(&format!("AI output SR: {error:#}"),(texture.width(),texture.height())),
+                    Err(error)=>{
+                        spatial.report_fallback(&format!("AI output SR: {error:#}"),(texture.width(),texture.height()));
+                        if preserve_native_sr {
+                            interpolation.output_failed(format!("unlimited native SR recording failed; interpolation disabled for original presentation recovery: {error:#}"));
+                            self.invalidate_output_cache();self.frame_interpolation=Some(interpolation);return;
+                        }
+                    },
                 }
             }
+            if self.native_render_fastpath && sr { self.fallback_bindings_avoided+=1; }
+            let binding=native_render_fastpath::finish_binding(binding,||Self::source_output_binding(&self.device,&texture,&blit).1);
             (Some(before),raw,binding,final_texture,size,sr)
         };
         crate::spatial_upscale::note_frame_generation(sr_active);
@@ -4236,13 +4874,14 @@ impl Gpu {
                     crate::ffi::set_error(&reason);
                     interpolation.output_skipped(&reason);
                     self.surface_size=(0,0);
+                    interpolation.presented(&display,false,None,None);
                     self.frame_interpolation=Some(interpolation);
                     return;
                 }
                 self.surface_size=(w,h);log(&format!("combined AI/SR game surface configured {w}x{h}, SR={sr_active}"));
             }
         }
-        let frame={let _slow=slow_trace::span("output_surface_acquire",display.kind);self.surface.as_ref().and_then(|(surface,_)|match surface.get_current_texture(){
+        let frame={let _slow=slow_trace::span("output_surface_acquire",display.kind);let _acquire_profile=cpu_profile::span(CpuMetric::Acquire);self.surface.as_ref().and_then(|(surface,_)|match surface.get_current_texture(){
             CurrentSurfaceTexture::Success(f)|CurrentSurfaceTexture::Suboptimal(f)=>Some(f),
             other=>{log_once("AI-surface",&format!("AI surface unavailable: {other:?}"));None}
         })};
@@ -4283,6 +4922,9 @@ impl Gpu {
             let view=frame.texture.create_view(&TextureViewDescriptor::default());
             let mut after=self.device.create_command_encoder(&CommandEncoderDescriptor{label:Some("game-AI-output-tracked-after")});
             let cache_candidate=if cache_hit {None}else{cache_key.and_then(|key|self.output_cache_candidate(key,&final_texture,&blit,sr_active))};
+            let repeat_copy_avoided=!keep_repeat_cache && OutputCacheKey::for_display(&display,epoch,cache_signature,self.surface_format).is_some_and(|key|
+                (final_texture.width(),final_texture.height())==key.output_size && final_texture.format()==key.output_format &&
+                final_texture.usage().contains(TextureUsages::COPY_SRC) && sr_active==key.spatial.requested());
             if let Some(cache)=cache_candidate.as_ref() {
                 // before (warp/init) -> raw XEG -> optional readback -> tracked
                 // full-image copy -> final blit, all in this SAME queue submit.
@@ -4299,12 +4941,16 @@ impl Gpu {
                 pass.set_pipeline(&blit);pass.set_bind_group(0,&binding,&[]);pass.draw(0..3,0..1);
             }
             let mut commands=Vec::new();
-            if let Some(before)=before {let _slow=slow_trace::span("output_before_encoder_finish",display.kind);commands.push(before.finish());}
+            if let Some(before)=before {let _slow=slow_trace::span("output_before_encoder_finish",display.kind);let _finish_profile=cpu_profile::span(CpuMetric::EncoderFinish);commands.push(before.finish());}
             if let Some(raw)=raw {commands.push(raw);}
             if let Some(capture)=capture_command {commands.push(capture);}
-            {let _slow=slow_trace::span("output_after_encoder_finish",display.kind);commands.push(after.finish());}
-            let index={let _slow=slow_trace::span("output_queue_submit",display.kind);self.queue.submit(commands)};
+            {let _slow=slow_trace::span("output_after_encoder_finish",display.kind);let _finish_profile=cpu_profile::span(CpuMetric::EncoderFinish);commands.push(after.finish());}
+            let index={let _slow=slow_trace::span("output_queue_submit",display.kind);let _submit_profile=cpu_profile::span(CpuMetric::Submit);self.queue.submit(commands)};
             self.submits+=1;self.last_submit=Some(index.clone());
+            if repeat_copy_avoided {
+                self.repeat_copies_avoided+=1;
+                self.repeat_copy_logical_bytes_avoided=self.repeat_copy_logical_bytes_avoided.saturating_add(u64::from(w)*u64::from(h)*8);
+            }
             if cache_hit {OUTPUT_CACHE_HITS.fetch_add(1,Ordering::Relaxed);}else if cache_eligible {OUTPUT_CACHE_MISSES.fetch_add(1,Ordering::Relaxed);}
             // Publish a new content key only after its copy was submitted. An
             // acquire/encode failure must never relabel old pixels as new ones.
@@ -4313,9 +4959,16 @@ impl Gpu {
             // Do not on_submitted(): pending guest completion queries belong
             // to its STILL OPEN encoder, not to this independent output graph.
             let present_begin=crate::frame_interpolation::monotonic_ns();
-            {let _slow=slow_trace::span("output_queue_present",display.kind);self.queue.present(frame);}
+            {let _slow=slow_trace::span("output_queue_present",display.kind);let _present_profile=cpu_profile::span(CpuMetric::Present);self.queue.present(frame);}
             let present_complete=crate::frame_interpolation::monotonic_ns();
-            PRESENTS.fetch_add(1,Ordering::Relaxed);interpolation.presented(&display,true,present_begin,present_complete);
+            PRESENTS.fetch_add(1,Ordering::Relaxed);
+            if display.kind == "source" {
+                crate::native_telemetry::source_presented_key(crate::ffi::app_presentation_generation(), epoch, display.source_sequence);
+                if cpu_profile::frame_intervals::enabled() {
+                    cpu_profile::frame_intervals::source_boundary(crate::ffi::app_presentation_generation(),Some(epoch),display.source_sequence,self.presents);
+                }
+            }
+            interpolation.presented(&display,true,present_begin,present_complete);
         }else{
             self.invalidate_output_cache();self.surface_size=(0,0);interpolation.presented(&display,false,None,None);
         }
@@ -4443,6 +5096,10 @@ impl Gpu {
                 self.flush();
                 { let _span = cpu_profile::span(CpuMetric::Present); self.queue.present(frame); }
                 PRESENTS.fetch_add(1, Ordering::Relaxed);
+                crate::native_telemetry::source_presented();
+                if cpu_profile::frame_intervals::enabled() {
+                    cpu_profile::frame_intervals::source_boundary(crate::ffi::app_presentation_generation(),None,self.presents+1,self.presents);
+                }
             } else {
                 self.finish_gpu_profile_frame();
                 self.flush();
@@ -4456,7 +5113,11 @@ impl Gpu {
         self.presents += 1;
         self.pipe_wait_left = PIPELINE_WAIT;
         GUEST_PRESENTS.store(self.presents, Ordering::Relaxed);
+        if cpu_profile::frame_intervals::enabled() {
+            cpu_profile::frame_intervals::guest_boundary(crate::ffi::app_presentation_generation(),self.presents);
+        }
         self.log_fps();
+        if let Some(store) = self.pso_store.as_mut() { store.checkpoint(); }
 
         self.frame_slot_done[self.ubo_slot] = self.last_submit.clone();
         self.ubo_slot = (self.ubo_slot + 1) % FRAME_SLOTS;
@@ -4475,6 +5136,17 @@ impl Gpu {
         let now = Instant::now();
         let dt = now.duration_since(self.fps_t0).as_secs_f64();
         if dt >= 10.0 {
+            log(&format!("pso-warmup: {}", self.pso_status()));
+            if let Some(store) = self.pso_store.as_mut() { log(&format!("pso-warmup store: {}", store.status())); }
+            if let (Some(cache), Some(store)) = (self.pipeline_cache.as_ref(), self.pipeline_cache_store.borrow_mut().as_mut()) {
+                if let Err(error) = store.checkpoint(|| {
+                    let _slow=slow_trace::span("pipeline_cache_get_data","serialized_GPU_caller");
+                    cache.get_data()
+                }) {
+                    log(&format!("pipeline-cache checkpoint rejected: {error}"));
+                }
+                log(&format!("pipeline-cache: {}", store.status()));
+            }
             let frames = self.presents - self.fps_n0;
             let resident = if *MEM_STATS { format!(" ({} MB resident)", crate::heap_resident_mb()) } else { String::new() };
             let malloc = if *MEM_STATS { format!(", malloc {} MB", crate::malloc_mb()) } else { String::new() };
@@ -4497,6 +5169,48 @@ impl Gpu {
                     "scope":"cumulative readback counts and idle-cache capacity; in-flight buffers are not cached"
                 })));
             }
+            if let Some(pool) = self.occlusion_pool.as_ref() {
+                let s = pool.stats();
+                log(&format!("occlusion-pool: {}", serde_json::json!({
+                    "createdPairs":s.created,"reusedPairs":s.reused,"returnedPairs":s.returned,"rejectedPairs":s.rejected,
+                    "cachedBuffers":s.cached_buffers,"cachedBytes":s.cached_bytes,
+                    "peakCachedBuffers":s.peak_buffers,"peakCachedBytes":s.peak_bytes,
+                    "bufferLimit":occlusion_pool::BUFFER_LIMIT,"byteLimit":occlusion_pool::BYTE_LIMIT,
+                    "errorInvalidations":s.error_invalidations,"errorInvalidatedBuffers":s.error_invalidated_buffers,
+                    "scope":"idle resolve/map pairs only; both buffers held until map, query writes and unmap complete; exact sizes fully cleared/copied; in-flight leases are not cached"
+                })));
+            }
+            let view_stats=self.proxy_sampled_views.stats();
+            log(&format!("native-render-fastpath: {}",serde_json::json!({
+                "enabled":self.native_render_fastpath,"repeatCopiesAvoided":self.repeat_copies_avoided,
+                "repeatCopyLogicalBytesAvoided":self.repeat_copy_logical_bytes_avoided,"fallbackBindingsAvoided":self.fallback_bindings_avoided,
+                "proxyViewHits":view_stats.hits,"proxyViewMisses":view_stats.misses,"proxyViewEvictions":view_stats.evictions,
+                "proxyViewsInvalidated":view_stats.invalidated,"cachedProxyViews":self.proxy_sampled_views.len(),"proxyViewLimit":native_render_fastpath::VIEW_LIMIT,
+                "cachedProxyTextureBytes":self.proxy_sampled_views.bytes(),"proxyTextureByteLimit":native_render_fastpath::TEXTURE_BYTE_LIMIT,
+                "proxyViewCacheRejected":view_stats.rejected,
+                "scope":"cumulative host/command removals only; logical copy bytes are not measured DRAM traffic, GPU time or FPS"
+            })));
+            let uploads = &self.inline_upload_counters;
+            log(&format!("inline-upload: {}",serde_json::json!({
+                "enabled":self.inline_upload_borrow,"calls":uploads.calls,
+                "borrowedCalls":uploads.borrowed_calls,"borrowedBytes":uploads.borrowed_bytes,
+                "snapshotCalls":uploads.snapshot_calls,"snapshotBytes":uploads.snapshot_bytes,
+                "scope":"GPU-thread cumulative checked payload decisions, including shadow-only or absent destination; borrowed bytes remove one explicit host Vec copy only, not WGPU staging, required shadow copies or GPU transfers; no measured time or bandwidth claim"
+            })));
+            let commands = &self.native_command_counters;
+            log(&format!("native-command-fastpath: {}",serde_json::json!({
+                "enabled":self.native_command_fastpath.enabled,"vertexDiagnostics":self.native_command_fastpath.vertex_diagnostics,
+                "inlinePassKeys":commands.inline_pass_keys,"heapPassKeys":commands.heap_pass_keys,
+                "passKeyRequestedBytesAvoided":commands.pass_key_requested_bytes_avoided,
+                "geometryClonesAvoided":commands.geometry_clones_avoided,
+                "disabledVertexTraceCallsAvoided":commands.disabled_vertex_trace_calls_avoided,
+                "scope":"cumulative host key/metadata/disabled trace removals; requested Vec bytes are not measured allocator/DRAM traffic or GPU work; draw, format, pass order and completion unchanged"
+            })));
+            log(&format!("proxy-subresources: {}", serde_json::json!({
+                "enabled":self.subresource_proxies,"requests":self.proxy_requests,"convertedSubresources":self.proxy_conversions,
+                "availableSubresourcesAcrossRequests":self.proxy_available,"wholeFallbackRequests":self.proxy_fallbacks,
+                "scope":"cumulative CPU conversion plans; skipped clean requests included; not GPU completion, pixel equivalence or measured bandwidth"
+            })));
             log(&format!("unsupported-render-attachments: {} (rejected uses; no substitute format or successful rendering is implied)", UNSUPPORTED_RENDER_ATTACHMENTS.load(Ordering::Relaxed)));
             if *MEM_STATS {
                 let mut by: Vec<(TextureFormat, u64, u64, u64)> = Vec::new();

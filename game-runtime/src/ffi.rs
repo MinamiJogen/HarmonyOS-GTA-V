@@ -91,6 +91,7 @@ fn publish_app_lifecycle(state: app_lifecycle::State) {
     // Prevent new worker admission while publishing a generation. In particular
     // foreground=true must never expose the previous background generation.
     APP_PRESENTATION_ALLOWED.store(false, Ordering::Release);
+    crate::native_telemetry::reset_source_window();
     APP_PRESENTATION_GENERATION.store(state.generation, Ordering::Release);
     crate::gpu::SUSPENDED.store(!state.allowed(), Ordering::Release);
     crate::gpu::OCCLUDED.store(!state.allowed(), Ordering::Release);
@@ -103,6 +104,7 @@ pub extern "C" fn mg_game_app_foreground(foreground: bool) {
     let mut state = APP_LIFECYCLE.lock().unwrap();
     if state.foreground(foreground) {
         publish_app_lifecycle(*state);
+        crate::status_sampler::notify();
         eprintln!("[game-lifecycle] foreground={foreground} presentationAllowed={} generation={} terminalStop={} surfaceLost={}",
             state.allowed(), state.generation, state.terminal_stop, state.surface_lost);
     }
@@ -115,6 +117,7 @@ pub extern "C" fn mg_game_surface_lost() {
     // Preserve the guest in memory. A replacement wgpu Surface is not attached
     // yet, so resuming this window or silently restarting would be dishonest.
     set_stage("surface-recovery-required");
+    crate::status_sampler::notify();
 }
 static TOUCHES: Mutex<Vec<(u32,f32,f32)>> = Mutex::new(Vec::new());
 static INPUTS: AtomicU64 = AtomicU64::new(0);
@@ -505,7 +508,7 @@ pub(crate) fn observe_engine_line(line: &str) {
         eprintln!("[game] world player task observed; game scene may now be reported");
     }
 }
-pub fn set_error(e: impl ToString) { abort_selected_load("加载期间游戏运行时发生错误，未确认恢复成功；请返回首页重试。"); SESSION_RESTART_STATE.lock().unwrap().cancel_active(); let e=e.to_string(); eprintln!("[game] ERROR {e}"); *ERROR.lock().unwrap() = e; *STAGE.lock().unwrap() = "error".into(); crate::heapcheck::request_snapshot("game-error"); }
+pub fn set_error(e: impl ToString) { abort_selected_load("加载期间游戏运行时发生错误，未确认恢复成功；请返回首页重试。"); SESSION_RESTART_STATE.lock().unwrap().cancel_active(); let e=e.to_string(); eprintln!("[game] ERROR {e}"); *ERROR.lock().unwrap() = e; *STAGE.lock().unwrap() = "error".into(); crate::heapcheck::request_snapshot("game-error"); crate::status_sampler::notify(); }
 fn render_size(width:u32,height:u32)->(u32,u32) {
     crate::config::render_size(width,height)
 }
@@ -549,6 +552,12 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     PHYSICAL_SIZE.store(pack_size(width,height),Ordering::Relaxed);
     let window=window as usize;
     let result=std::thread::Builder::new().name("game-main".into()).stack_size(32<<20).spawn(move|| {
+        // Owned by game-main, including startup failure and normal return. Its
+        // Drop stops/joins off the UI thread and exports a final cached state.
+        let _status_worker = crate::status_sampler::start(PathBuf::from(&path), sample_status_metrics,
+            status_sampling_mode, poll_selected_load, status_value).map_err(|error| {
+                eprintln!("[game-status] sampler unavailable: {error}");
+            }).ok();
         let run=||->anyhow::Result<()> {
             let root=PathBuf::from(&path);
             if let Ok(log)=std::fs::OpenOptions::new().create(true).append(true).open(root.join("game-runtime.log")) {
@@ -579,6 +588,7 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
             let mode=if action==2 { "2" } else { "1" };
             std::env::set_var("MUGUET_START",mode);
             std::env::set_var("MUGUET_START_MODE",mode);
+            crate::fivestar_state::set_story_mode(mode == "1");
             eprintln!("[game-launch] action={} mode={} save={}",action,mode,LAUNCH_SAVE_ID.lock().unwrap());
             // Read before setup can create a default config: a missing field
             // retains marker-only opt-in, while explicit true defaults to NPU.
@@ -630,7 +640,7 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
                 std::env::set_var("MUGUET_HEAPCHECK", "1");
                 crate::heapcheck::start();
             }
-            let mut args:Vec<String>=["./this.program","-rootdir=/game/","-nodisplaycalibration","-noSocialClub","-pc:nosocialclub","-nonetwork","-output","-forceResolution","-Script_all=warning","-replay_all=warning","-fastscriptcore","-FrameQueueLimit=3"].iter().map(|v|v.to_string()).collect();
+            let mut args:Vec<String>=["./this.program","-rootdir=/game/","-nodisplaycalibration","-noSocialClub","-pc:nosocialclub","-nonetwork","-output","-forceResolution","-Script_all=warning","-replay_all=warning","-fastscriptcore"].iter().map(|v|v.to_string()).collect();
             let (guest_width,guest_height)=crate::input::size();
             args.extend(["-wgpu".into(),format!("-width={guest_width}"),format!("-height={guest_height}")]);
             args.extend(startup.engine_args);
@@ -661,6 +671,7 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     let mut state = APP_LIFECYCLE.lock().unwrap();
     STOP.store(true,Ordering::Release);state.stop();publish_app_lifecycle(*state);drop(state);
     mg_game_release_inputs();crate::input::set_focus(false);crate::mp::shutdown();set_stage("stop-requested");
+    crate::status_sampler::notify();
 }
 #[no_mangle] pub unsafe extern "C" fn mg_game_key_name(name:*const c_char,pressed:bool){if let Ok(name)=string(name){let accepted=crate::input::key(&name,pressed,false,None,false);if pressed&&accepted{crate::mp::key_pressed(&name);}INPUTS.fetch_add(1,Ordering::Relaxed);}}
 #[no_mangle] pub unsafe extern "C" fn mg_game_raw_key(name:*const c_char,pressed:bool,source:*const c_char)->bool {
@@ -678,8 +689,10 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
 }
 #[no_mangle] pub extern "C" fn mg_game_release_semantic_inputs() {
     crate::touch_controls::release();
+    crate::virtual_pad::release();
 }
 #[no_mangle] pub extern "C" fn mg_game_release_inputs() {
+    crate::virtual_pad::release();
     TOUCHES.lock().unwrap().clear(); crate::pad::release_all();
     crate::pad::HORN_TOUCH.store(false,Ordering::Relaxed);
     crate::pad::INJECT.lock().unwrap().clear();
@@ -692,6 +705,37 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     TOUCH_STATUS.with(|slot|{*slot.borrow_mut()=CString::new(json).unwrap();slot.borrow().as_ptr()})
 }
 #[no_mangle] pub extern "C" fn mg_game_key(code:u32,pressed:bool){mg_game_key_event(code,pressed,0,false);}
+#[no_mangle] pub extern "C" fn mg_game_virtual_pad(buttons:u32,lx:f32,ly:f32,rx:f32,ry:f32,lt:f32,rt:f32,active:bool)->bool {
+    if !active {crate::virtual_pad::release();return true;}
+    if !crate::pad::FOCUSED.load(Ordering::Relaxed) || ![lx,ly,rx,ry,lt,rt].iter().all(|v|v.is_finite()) {return false;}
+    let accepted=crate::virtual_pad::update(buttons,lx,ly,rx,ry,lt,rt,true);
+    if accepted {INPUTS.fetch_add(1,Ordering::Relaxed);} accepted
+}
+#[no_mangle] pub extern "C" fn mg_game_virtual_pad_state_json()->*const c_char {
+    thread_local! {static FIVE_STAR_STATUS:std::cell::RefCell<CString>=std::cell::RefCell::new(CString::new("{}").unwrap());}
+    let mut value=crate::fivestar_state::snapshot_json();
+    value["transport"]=crate::virtual_pad::health_json();
+    if crate::RT.get().is_some() {
+        if let Some(rect)=crate::resource_view::minimap_rect() {value["minimapRect"]=rect;}
+    }
+    FIVE_STAR_STATUS.with(|slot|{*slot.borrow_mut()=CString::new(value.to_string()).unwrap();slot.borrow().as_ptr()})
+}
+#[no_mangle] pub extern "C" fn mg_game_release_virtual_pad(){crate::virtual_pad::release();}
+#[no_mangle] pub extern "C" fn mg_game_virtual_radio(x:f32,y:f32,active:bool){crate::virtual_pad::set_radio(x,y,active);}
+#[no_mangle] pub extern "C" fn mg_game_camera_swipe(x:f32,y:f32){
+    if crate::pad::FOCUSED.load(Ordering::Relaxed){crate::virtual_pad::queue_camera_swipe(x,y);}
+}
+#[no_mangle] pub extern "C" fn mg_game_virtual_pause(){
+    if crate::RT.get().is_some() {
+        let snapshot=crate::fivestar_state::snapshot_json();
+        if snapshot["hookReady"].as_bool()==Some(true) && snapshot["pauseMenu"].as_bool()!=Some(true) {
+            crate::virtual_pad::request_pause();
+        }
+    }
+}
+#[no_mangle] pub extern "C" fn mg_game_virtual_mouse_mode(active:bool){crate::input::set_locked(active);}
+#[no_mangle] pub extern "C" fn mg_game_next_aircraft_weapon(){crate::virtual_pad::request_next_aircraft_weapon();}
+#[no_mangle] pub extern "C" fn mg_game_virtual_targeting_mode(mode:i32)->bool{crate::virtual_pad::set_targeting_mode(mode)}
 #[no_mangle] pub extern "C" fn mg_game_key_event(code:u32,pressed:bool,unicode:u32,suppress_text:bool)->bool {
     let Some(name)=harmony_keys::key_name(code) else { return false; };
     let repeat=pressed && crate::input::is_held(&name);
@@ -739,24 +783,46 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     INPUTS.fetch_add(1,Ordering::Relaxed);
 }
 #[no_mangle] pub extern "C" fn mg_game_control(control:i32,value:f32){let mut inject=crate::pad::INJECT.lock().unwrap();inject.retain(|(c,_)|*c!=control);if value!=0.0{inject.push((control,value.clamp(-1.0,1.0)));}crate::pad::ACTIVE.store(true,Ordering::Relaxed);INPUTS.fetch_add(1,Ordering::Relaxed);}
-#[no_mangle] pub extern "C" fn mg_game_status_json()->*const c_char {
-    // ArkUI polls this every second. Checking also on engine log events keeps
-    // a silent failure bounded without creating a watchdog thread.
+fn status_sampling_mode() -> crate::status_sampler::Mode {
+    let lifecycle = *APP_LIFECYCLE.lock().unwrap();
+    crate::status_sampler::Mode { foreground: lifecycle.allowed(), generation: lifecycle.generation,
+        terminal: stop_requested() || !ERROR.lock().unwrap().is_empty() }
+}
+fn poll_selected_load() {
+    let completion = SAVE_LOAD_STATE.lock().unwrap().poll(std::time::Instant::now());
+    publish_selected_load_completion(completion);
+}
+fn sample_status_metrics() -> Result<serde_json::Value, String> {
+    let rss = crate::sample_footprint_mb().map_err(|error| format!("VmRSS sample: {error}"))?;
+    let resident = crate::sample_heap_resident_mb().map_err(|error| format!("mincore sample: {error}"))?;
+    Ok(serde_json::json!({"rssMB":rss,"heapVirtualMB":crate::RT.get().map(|rt|rt.mem.data_size()>>20),
+        "heapResidentMB":resident,"gameHostCalls":crate::RT.get().map(|rt|rt.counts.iter().map(|count|count.load(Ordering::Relaxed)).sum::<u64>())}))
+}
+fn status_value() -> serde_json::Value {
     let (save_pending, save_succeeded, save_error, save_elapsed_ms) = {
-        let mut state = SAVE_LOAD_STATE.lock().unwrap();
-        publish_selected_load_completion(state.poll(std::time::Instant::now()));
+        let state = SAVE_LOAD_STATE.lock().unwrap();
         (crate::fs::bootstrap_save_pending(), state.succeeded, state.error, state.elapsed_ms)
     };
     let input_health = crate::input::health_json();
     let gameplay_observed = WORLD_PLAYER_OBSERVED.load(Ordering::Acquire);
-    let mut value=serde_json::json!({"stage":STAGE.lock().unwrap().clone(),"error":ERROR.lock().unwrap().clone(),"started":STARTED.load(Ordering::Relaxed),"stopRequested":stop_requested(),"presents":crate::gpu::PRESENTS.load(Ordering::Relaxed),"guestPresents":crate::gpu::GUEST_PRESENTS.load(Ordering::Relaxed),"gpuStarted":crate::gpu::STARTED.load(Ordering::Relaxed),"renderSize":crate::input::size(),"inputEvents":INPUTS.load(Ordering::Relaxed),"inputHealth":input_health,"rssMB":crate::footprint_mb(),"heapVirtualMB":crate::RT.get().map(|rt|rt.mem.data_size()>>20),"heapResidentMB":crate::heap_resident_mb(),"gameHostCalls":crate::RT.get().map(|rt|rt.counts.iter().map(|c|c.load(Ordering::Relaxed)).sum::<u64>()),"target":"aarch64-unknown-linux-ohos","source":"muguet-1a0300d"});
+    let lifecycle = *APP_LIFECYCLE.lock().unwrap();
+    let error = ERROR.lock().unwrap().clone();
+    let stopped = stop_requested();
+    let diagnostics = crate::status_sampler::snapshot(crate::status_sampler::Mode {
+        foreground:lifecycle.allowed(), generation:lifecycle.generation, terminal:stopped || !error.is_empty(),
+    });
+    let mut value=serde_json::json!({"stage":STAGE.lock().unwrap().clone(),"error":error,"started":STARTED.load(Ordering::Relaxed),"stopRequested":stopped,"presents":crate::gpu::PRESENTS.load(Ordering::Relaxed),"guestPresents":crate::gpu::GUEST_PRESENTS.load(Ordering::Relaxed),"gpuStarted":crate::gpu::STARTED.load(Ordering::Relaxed),"renderSize":crate::input::size(),"inputEvents":INPUTS.load(Ordering::Relaxed),"inputHealth":input_health,"rssMB":diagnostics["values"]["rssMB"],"heapVirtualMB":diagnostics["values"]["heapVirtualMB"],"heapResidentMB":diagnostics["values"]["heapResidentMB"],"gameHostCalls":diagnostics["values"]["gameHostCalls"],"target":"aarch64-unknown-linux-ohos","source":"muguet-1a0300d"});
+    value["diagnostics"] = diagnostics;
+    value["nativeTelemetry"] = crate::native_telemetry::snapshot();
+    value["frameIntervalTrace"] = crate::cpu_profile::frame_intervals::status();
+    value["nativeCapabilities"] = crate::native_capabilities::snapshot();
     value["worldPlayerObserved"] = gameplay_observed.into();
     value["processId"] = std::process::id().into();
     value["frameGenerationAvailable"] = (mg_game_frame_generation_available()==1).into();
     value["frameGenerationLive"] = crate::frame_interpolation::live_status();
     value["touchControlTransport"] = crate::touch_controls::health_json();
+    value["virtualPadTransport"] = crate::virtual_pad::health_json();
     {
-        let lifecycle = *APP_LIFECYCLE.lock().unwrap();
         value["appForeground"] = lifecycle.foreground.into();
         value["presentationPaused"] = (!lifecycle.allowed()).into();
         value["presentationGeneration"] = lifecycle.generation.into();
@@ -783,5 +849,9 @@ pub unsafe extern "C" fn mg_game_start(window:*mut c_void,width:u32,height:u32,f
     }
     value["spatialUpscale"] = crate::spatial_upscale::status();
     value["worldPlayerObservationSource"] = "engine TASK_PLAYER_ON_FOOT constructed log".into();
+    value
+}
+#[no_mangle] pub extern "C" fn mg_game_status_json()->*const c_char {
+    let value = status_value();
     STATUS.with(|s|{*s.borrow_mut()=CString::new(value.to_string()).unwrap();s.borrow().as_ptr()})
 }

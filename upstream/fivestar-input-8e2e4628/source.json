@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/kevinerikjs/gta5-ios-port",
+  "commit": "8e2e46281159d09005fea4748b5b9926e919fc0a",
+  "license": "MIT",
+  "scope": "Original project touch/input implementation references only. Excludes game code/data/assets and build-time third-party sources. ControlIcons assets not copied.",
+  "adaptation": "Native HarmonyOS ArkTS/ArkUI, C++ NAPI and Rust/Wasmtime implementation. No Swift sources, runtime or bridge are shipped.",
+  "nativeFiles": [
+    "harmony/entry/src/main/ets/controls/FiveStarInput.ts",
+    "harmony/entry/src/main/ets/controls/FiveStarLayout.ts",
+    "harmony/entry/src/main/ets/controls/FiveStarSettings.ts",
+    "harmony/entry/src/main/ets/controls/FiveStarTouchControls.ets",
+    "harmony/entry/src/main/ets/controls/FiveStarMotion.ets",
+    "harmony/entry/src/main/cpp/fivestar_gamepad.cpp",
+    "game-runtime/src/virtual_pad.rs",
+    "game-runtime/src/fivestar_state.rs"
+  ],
+  "referenceFilesShipped": false,
+  "controlIcons": "HarmonyOS text and geometry adaptation; upstream PNG and Apple SF Symbols assets are not distributed."
+}

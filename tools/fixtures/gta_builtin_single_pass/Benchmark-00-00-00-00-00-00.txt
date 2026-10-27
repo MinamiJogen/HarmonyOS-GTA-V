@@ -1,0 +1,19 @@
+Frames Per Second (Higher is better) Min, Max, Avg
+Pass 0, 12.500000, 50.000000, 31.335616
+
+Time in milliseconds(ms). (Lower is better). Min, Max, Avg
+Pass 0, 20.000000, 80.000000, 32.000000
+
+Frames under 16ms (for 60fps):
+Pass 0: 0/219 frames (0.00%)
+
+Frames under 33ms (for 30fps):
+Pass 0: 110/219 frames (50.23%)
+
+Percentiles in ms for pass 0
+50%, 20.00
+95%, 75.00
+99%, 75.00
+
+=== SETTINGS ===
+MotionBlurStrength: 0.000000

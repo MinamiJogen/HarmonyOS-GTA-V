@@ -480,6 +480,23 @@ impl TextureTracker {
         self.metadata.contains(texture.tracker_index().as_usize())
     }
 
+    #[cfg(all(target_env = "ohos", feature = "std"))]
+    pub(crate) fn pending_transitions_are_empty(&self) -> bool { self.temp.is_empty() }
+
+    /// Read-only sufficient proof only. Complex/unknown cases keep the old path.
+    #[cfg(all(target_env = "ohos", feature = "std"))]
+    pub(crate) fn scope_proves_no_transitions(&self, scope: &TextureUsageScope) -> bool {
+        self.temp.is_empty() && scope.metadata.owned_indices().all(|index| {
+            let simple = |set: &TextureStateSet| set.simple.get(index)
+                .filter(|usage| !usage.intersects(TextureUses::COMPLEX | TextureUses::UNKNOWN | TextureUses::UNINITIALIZED))
+                .map(|usage| u64::from(usage.bits()));
+            crate::command::empty_render_prepass::resource_proves_no_transition(
+                self.metadata.contains(index), simple(&self.end_set), simple(&scope.set),
+                u64::from(self.ordered_uses_mask.bits()),
+            )
+        })
+    }
+
     /// Returns a list of all textures tracked.
     pub fn used_resources(&self) -> impl Iterator<Item = &Arc<Texture>> + '_ {
         self.metadata.owned_resources()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small host fixtures for actual FG build guards; never build target code."""
+"""Host fixtures for FG build guards and NPU-only bridge behavior."""
 import importlib.util
 import json
 import os
@@ -123,8 +123,8 @@ class BuildGuard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory)/"sdk"; (sdk/"include").mkdir(parents=True); (sdk/"lib").mkdir()
             (sdk/"include/harmony_rife_c.h").write_text("fixture"); (sdk/"lib/libharmony_rife_full.a").write_text("fixture")
-            for shell, probe, supplied_sdk, succeeds, checked in [("1","0","",True,False),("1","1","",True,False),("0","0","",False,True),("0","0",str(sdk),True,True)]:
-                env=os.environ.copy(); env.update(HARMONY_BUILD_STAGE=directory+"/stage",HARMONY_SHELL_ONLY=shell,HARMONY_FG_PROBE_ONLY=probe,HARMONY_COPY_BUILD_OUTPUT="0",HARMONY_GAME_EXPERIMENT_BUNDLE="",HARMONY_RIFE_SDK=supplied_sdk)
+            for shell, probe, supplied_sdk, npu_only, succeeds, checked in [("1","0","","0",True,False),("1","1","","0",True,False),("0","0","","0",False,True),("0","0",str(sdk),"0",True,True),("0","0","","1",True,True),("0","0",str(sdk),"1",False,False),("0","0","","bad",False,False)]:
+                env=os.environ.copy(); env.update(HARMONY_BUILD_STAGE=directory+"/stage",HARMONY_SHELL_ONLY=shell,HARMONY_FG_PROBE_ONLY=probe,HARMONY_COPY_BUILD_OUTPUT="0",HARMONY_GAME_EXPERIMENT_BUNDLE="",HARMONY_RIFE_SDK=supplied_sdk,HARMONY_FG_NPU_ONLY=npu_only)
                 result=subprocess.run(["zsh","-c",fake_python+prefix,str(ROOT/"harmony/build_unsigned.sh")],env=env,text=True,capture_output=True)
                 self.assertEqual(result.returncode==0,succeeds,result.stderr)
                 self.assertEqual("checked-runtime" in result.stdout,checked)
@@ -136,19 +136,35 @@ class BuildGuard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile=Path(directory)/"profile.json"
             runtime=Path(directory)/"stage/game-runtime/artifacts/libmuguet_game_runtime.a"
-            old={"buildOption":{"externalNativeOptions":{"arguments":"-DKEEP=ON -DMUGUET_RIFE_SDK=/old -DGAME_RUNTIME_LIBRARY:FILEPATH=/stale/runtime.a -DMUGUET_SHELL_ONLY=ON"}}}
+            aot=Path(directory)/"stage/game-runtime/artifacts/game-embedded.o"
+            old={"buildOption":{"externalNativeOptions":{"arguments":"-DKEEP=ON -DMUGUET_RIFE_SDK=/old -DGAME_RUNTIME_LIBRARY:FILEPATH=/stale/runtime.a -DGAME_AOT_OBJECT:FILEPATH=/stale/game.o -DMUGUET_SHELL_ONLY=ON"}}}
             profile.write_text(json.dumps(old))
-            subprocess.run(["python3","-c",script,str(profile),"0",directory+"/sdk",str(runtime)],check=True)
+            subprocess.run(["python3","-c",script,str(profile),"0",directory+"/sdk",str(runtime),str(aot),"0"],check=True)
             arguments=json.loads(profile.read_text())["buildOption"]["externalNativeOptions"]["arguments"]
             self.assertIn("-DKEEP=ON",arguments)
             self.assertIn("-DMUGUET_SHELL_ONLY=OFF",arguments)
+            self.assertIn("-DMUGUET_FG_NPU_ONLY=OFF",arguments)
             self.assertEqual(arguments.count("-DGAME_RUNTIME_LIBRARY="),1)
             self.assertIn("-DGAME_RUNTIME_LIBRARY="+str(runtime),arguments)
+            self.assertEqual(arguments.count("-DGAME_AOT_OBJECT="),1)
+            self.assertIn("-DGAME_AOT_OBJECT="+str(aot),arguments)
             self.assertNotIn("/stale/",arguments)
-            subprocess.run(["python3","-c",script,str(profile),"1","",str(runtime)],check=True)
+            subprocess.run(["python3","-c",script,str(profile),"1","",str(runtime),str(aot),"1"],check=True)
             arguments=json.loads(profile.read_text())["buildOption"]["externalNativeOptions"]["arguments"]
             self.assertNotIn("GAME_RUNTIME_LIBRARY",arguments)
+            self.assertNotIn("GAME_AOT_OBJECT",arguments)
             self.assertIn("-DMUGUET_SHELL_ONLY=ON",arguments)
+            self.assertEqual(arguments.count("-DMUGUET_FG_NPU_ONLY="),1)
+            self.assertIn("-DMUGUET_FG_NPU_ONLY=ON",arguments)
+
+    def test_npu_only_bridge_rejects_rife_and_keeps_npu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory)/"npu-only-test"
+            subprocess.run(["c++", "-std=c++17", "-DMUGUET_INTERPOLATION_HAS_RIFE=0",
+                "-I"+str(ROOT/"native-platform/include"), "-I"+str(ROOT/"native-diagnostics/src"),
+                str(ROOT/"native-platform/src/fg_interpolation_bridge.cpp"),
+                str(ROOT/"tools/test_fg_npu_only.cpp"), "-o", str(binary)], check=True)
+            subprocess.run([str(binary)], check=True)
 
 
 if __name__ == "__main__":

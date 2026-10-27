@@ -80,4 +80,5 @@ local.properties
 # Device captures can contain game assets, shader dumps and private metadata.
 evidence/
 /releases/
+/game-runtime/experiments/pso-warmup-*/
 /native-diagnostics/isolated-driver-snapshot/feasibility-report.json

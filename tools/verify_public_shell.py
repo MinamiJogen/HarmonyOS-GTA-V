@@ -9,6 +9,8 @@ import sys
 import tempfile
 import zipfile
 
+from verify_app_icon import verify_app_icon
+
 
 def main():
     if len(sys.argv) != 5:
@@ -17,7 +19,6 @@ def main():
     forbidden_symbols = re.compile(r"\b(?:mg_game_\w*|mg_(?:depth|luminance|readback|wgpu)_\w*|rp_embedded_\w*|rp_(?:memory64|shared)[\w_]*|muguet_game_runtime)\b")
     native_reports = {}
     repo = Path(__file__).resolve().parents[1]
-    icon_path = "resources/base/media/app_icon_gta5.png"
     with zipfile.ZipFile(hap) as package:
         assert package.testzip() is None, "HAP ZIP CRC failure"
         names = package.namelist()
@@ -51,9 +52,7 @@ def main():
         pack_info = json.loads(package.read("pack.info"))
         assert pack_info["summary"]["app"]["bundleName"] == bundle_name, "Package metadata bundle name differs from module.json"
         assert app["versionName"] == "1.0.1" and app["versionCode"] == 1000101, "Unexpected application version"
-        icon = package.read(icon_path)
-        assert icon == (repo / "harmony/AppScope/resources/base/media/app_icon_gta5.png").read_bytes(), "Packaged app icon differs from the selected source icon"
-        assert icon == (repo / "harmony/entry/src/main/resources/base/media/app_icon_gta5.png").read_bytes(), "Entry and AppScope app icons differ"
+        icon_report = verify_app_icon(package, repo)
     # Confirm build-system inputs rather than relying only on stripped symbols.
     entry_root = next((parent for parent in native_root.parents if (parent / "src/main/cpp/CMakeLists.txt").is_file()), None)
     assert entry_root is not None, "Cannot locate source entry for native build evidence"
@@ -90,7 +89,7 @@ def main():
         "gameRuntimeLinked": False, "embeddedGameAot": False, "embeddedProbeAot": False,
         "externalGameAssetsIncluded": False, "freshNativeBuild": True,
         "cmakeShellMode": True, "nativeLinkInputsChecked": True,
-        "selectedAppIconMatches": True, "appIconSha256": hashlib.sha256(icon).hexdigest(),
+        **icon_report,
         "members": names, "nativeLibraries": native_reports,
         "scope": "Fresh source build and static package verification only; installation and device behavior are not established."
     }

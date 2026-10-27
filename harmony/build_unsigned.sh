@@ -43,14 +43,24 @@ fi
 task_runtime_archive="$task_repo_dir/game-runtime/artifacts/libmuguet_game_runtime.a"
 task_runtime_manifest="$task_repo_dir/game-runtime/artifacts/libmuguet_game_runtime.features.json"
 task_stage_runtime="$task_stage_root/game-runtime/artifacts/libmuguet_game_runtime.a"
+task_game_aot_object="${HARMONY_GAME_AOT_OBJECT:-$task_stage_root/game-runtime/artifacts/game-embedded.o}"
 task_rife_sdk="${HARMONY_RIFE_SDK:-}"
+task_npu_only="${HARMONY_FG_NPU_ONLY:-0}"
+if [[ "$task_npu_only" != 0 && "$task_npu_only" != 1 ]]; then
+  print -u2 'HARMONY_FG_NPU_ONLY must be 0 or 1.'
+  exit 2
+fi
+if [[ "$task_npu_only" == 1 && -n "$task_rife_sdk" ]]; then
+  print -u2 'HARMONY_FG_NPU_ONLY=1 cannot be combined with HARMONY_RIFE_SDK.'
+  exit 2
+fi
 if [[ "$task_shell_only" == 0 ]]; then
   # A configured UI switch cannot enable code absent from the linked runtime.
   # Public shell/probe builds intentionally have no runtime and bypass this.
   python3 "$task_repo_dir/tools/verify_frame_generation_build.py" check-archive \
     --archive "$task_runtime_archive" --manifest "$task_runtime_manifest"
-  if [[ -z "$task_rife_sdk" || ! -f "$task_rife_sdk/include/harmony_rife_c.h" || ! -f "$task_rife_sdk/lib/libharmony_rife_full.a" ]]; then
-    print -u2 'Full-game FG requires HARMONY_RIFE_SDK with include/harmony_rife_c.h and lib/libharmony_rife_full.a (local SDK: /private/tmp/harmony-rife-20261019/sdk).'
+  if [[ "$task_npu_only" == 0 && ( -z "$task_rife_sdk" || ! -f "$task_rife_sdk/include/harmony_rife_c.h" || ! -f "$task_rife_sdk/lib/libharmony_rife_full.a" ) ]]; then
+    print -u2 'Full-game FG requires HARMONY_RIFE_SDK with include/harmony_rife_c.h and lib/libharmony_rife_full.a.'
     exit 2
   fi
 fi
@@ -63,7 +73,7 @@ fi
 /usr/bin/rsync -a --delete --exclude '/build-profile.json5' --exclude 'build-profile.local.json5' --exclude '.signing' --exclude '.idea' --exclude 'local.properties' --exclude '.hvigor' --exclude 'node_modules' --exclude 'oh_modules' --exclude 'entry/oh_modules' --exclude 'entry/build' --exclude 'build' --exclude 'logs' "$task_project_dir/" "$task_stage_dir/"
 # Mutate only the private ASCII mirror. Explicit ON/OFF also prevents a cached
 # shell mode from leaking into a later complete-game build in the same stage.
-python3 - "$task_stage_dir/entry/build-profile.json5" "$task_shell_only" "$task_rife_sdk" "$task_stage_runtime" <<'PYSHELL'
+python3 - "$task_stage_dir/entry/build-profile.json5" "$task_shell_only" "$task_rife_sdk" "$task_stage_runtime" "$task_game_aot_object" "$task_npu_only" <<'PYSHELL'
 import json
 import re
 import sys
@@ -73,16 +83,22 @@ rife_sdk = str(Path(sys.argv[3]).resolve()) if sys.argv[3] else ''
 if not rife_sdk.isascii() or any(c.isspace() for c in rife_sdk):
     raise SystemExit('HARMONY_RIFE_SDK requires an ASCII build path without whitespace.')
 runtime = str(Path(sys.argv[4]).absolute())
+aot_object = str(Path(sys.argv[5]).absolute())
 if sys.argv[2] == '0' and (not runtime.isascii() or any(c.isspace() for c in runtime)):
     raise SystemExit('Full-game runtime requires an ASCII build stage without whitespace.')
+if sys.argv[2] == '0' and (not aot_object.isascii() or any(c.isspace() for c in aot_object)):
+    raise SystemExit('Full-game AOT object requires an ASCII build path without whitespace.')
 profile = json.loads(path.read_text())
 options = profile.setdefault('buildOption', {}).setdefault('externalNativeOptions', {})
 arguments = re.sub(r'(?<!\S)-DMUGUET_SHELL_ONLY(?::[^=\s]+)?=[^\s]+', '', str(options.get('arguments', ''))).strip()
 arguments = re.sub(r'(?<!\S)-DMUGUET_RIFE_SDK(?::[^=\s]+)?=[^\s]*', '', arguments).strip()
+arguments = re.sub(r'(?<!\S)-DMUGUET_FG_NPU_ONLY(?::[^=\s]+)?=[^\s]*', '', arguments).strip()
 arguments = re.sub(r'(?<!\S)-DGAME_RUNTIME_LIBRARY(?::[^=\s]+)?=[^\s]*', '', arguments).strip()
+arguments = re.sub(r'(?<!\S)-DGAME_AOT_OBJECT(?::[^=\s]+)?=[^\s]*', '', arguments).strip()
 options['arguments'] = (arguments + ' -DMUGUET_SHELL_ONLY=' + ('ON' if sys.argv[2] == '1' else 'OFF') +
+                        ' -DMUGUET_FG_NPU_ONLY=' + ('ON' if sys.argv[6] == '1' else 'OFF') +
                         ' -DMUGUET_RIFE_SDK=' + rife_sdk +
-                        (' -DGAME_RUNTIME_LIBRARY=' + runtime if sys.argv[2] == '0' else '')).strip()
+                        (' -DGAME_RUNTIME_LIBRARY=' + runtime + ' -DGAME_AOT_OBJECT=' + aot_object if sys.argv[2] == '0' else '')).strip()
 path.write_text(json.dumps(profile, indent=2) + '\n')
 PYSHELL
 if [[ "$task_fg_probe_only" == 1 ]]; then

@@ -1,11 +1,17 @@
 // OHOS staticlib port of upstream Muguet 1a0300d. GPL-3.0-or-later.
 mod audio;
 mod config;
+mod engine_args;
+pub(crate) mod native_telemetry;
+mod native_capabilities;
+mod status_sampler;
 mod cpu_profile;
 mod compute_depth_probe;
 mod compute_luminance_probe;
 mod readback_pool_probe;
 mod resource_view;
+mod pipeline_cache_store;
+mod pso_warmup;
 mod spatial_upscale;
 mod spatial_dimensions;
 mod spatial_resize_policy;
@@ -22,6 +28,8 @@ mod mp;
 mod native_platform;
 mod opus;
 mod pad;
+mod virtual_pad;
+mod fivestar_state;
 mod touch_state;
 mod touch_controls;
 mod proto;
@@ -67,14 +75,24 @@ pub fn prepare_process_limits() {
     }
 }
 pub fn footprint_mb() -> u64 {
-    std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse::<u64>().ok())).unwrap_or(0) >> 10
+    sample_footprint_mb().unwrap_or(0)
+}
+pub(crate) fn sample_footprint_mb() -> std::io::Result<u64> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    status.lines().find(|line| line.starts_with("VmRSS:")).and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|number| number.parse::<u64>().ok()).map(|kb| kb >> 10)
+        .ok_or_else(|| std::io::Error::other("VmRSS missing or invalid in /proc/self/status"))
 }
 pub fn heap_resident_mb() -> u64 {
-    let Some(rt)=RT.get() else{return 0};let (base,len)=mem_base_len(&rt.mem);
+    sample_heap_resident_mb().ok().flatten().unwrap_or(0)
+}
+pub(crate) fn sample_heap_resident_mb() -> std::io::Result<Option<u64>> {
+    let Some(rt)=RT.get() else{return Ok(None)};let (base,len)=mem_base_len(&rt.mem);
+    if len == 0 { return Ok(Some(0)); }
     let page=unsafe{libc::sysconf(libc::_SC_PAGESIZE)}.max(4096) as usize;
     let start=(base as usize)&!(page-1);let len=len+(base as usize-start);let mut pages=vec![0u8;len.div_ceil(page)];
-    if unsafe{libc::mincore(start as *mut libc::c_void,len,pages.as_mut_ptr())}!=0{return 0;}
-    (pages.iter().filter(|p|**p&1!=0).count()*page>>20) as u64
+    if unsafe{libc::mincore(start as *mut libc::c_void,len,pages.as_mut_ptr())}!=0{return Err(std::io::Error::last_os_error());}
+    Ok(Some((pages.iter().filter(|p|**p&1!=0).count()*page>>20) as u64))
 }
 pub fn compressed_mb() -> u64 { 0 }
 pub fn malloc_mb() -> u64 { 0 }

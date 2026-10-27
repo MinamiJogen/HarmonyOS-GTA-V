@@ -1,4 +1,4 @@
-import { TouchFrame, touchSlotFrame } from './TouchGeometry';
+import { TouchFrame, touchSlotFrame, directionButtonFrame } from './TouchGeometry';
 import { TOUCH_SLOTS, TouchSlot } from './TouchLayout';
 
 export interface TouchSlotAdjustment { x: number; y: number; diameter: number; }
@@ -31,8 +31,11 @@ export function validateTouchSettings(width: number, height: number, settings: T
     const radius: number = f.diameter / 2;
     if (f.x - radius < 8 || f.y - radius < 8 || f.x + radius > width - 8 || f.y + radius > height - 8) { return '按键需要完整留在游戏安全区内。'; }
     if (f.x - radius < width * 0.22 + 12 && f.y - radius < height * 0.3 + 12) { return '此位置会遮挡左上小地图与玩家状态区。'; }
-    const joyDistance: number = Math.sqrt((f.x - 96) * (f.x - 96) + (f.y - (height - 96)) * (f.y - (height - 96)));
-    if (joyDistance < 64 + radius + 8) { return '此位置与左下摇杆触摸区重叠。'; }
+    for (const direction of ['left', 'right', 'up', 'down']) {
+      const key: TouchFrame = directionButtonFrame(direction, width, height);
+      const distance: number = Math.sqrt((f.x - key.x) * (f.x - key.x) + (f.y - key.y) * (f.y - key.y));
+      if (distance < radius + key.diameter / 2 + 8) { return '此位置与左下方向按键重叠。'; }
+    }
     for (let j = 0; j < frames.length; j++) {
       const old: TouchFrame = frames[j];
       const distance: number = Math.sqrt((f.x - old.x) * (f.x - old.x) + (f.y - old.y) * (f.y - old.y));

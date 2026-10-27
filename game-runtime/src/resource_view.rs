@@ -66,6 +66,11 @@ pub fn manifest() -> Option<&'static [u8]> { VIEW.manifest.as_deref() }
 
 pub fn files() -> &'static [(String, u64)] { &VIEW.files }
 
+pub fn minimap_rect() -> Option<serde_json::Value> {
+    let [x,y,width,height]=hud_layout::minimap_rect(VIEW.frontend.as_deref()?).ok()?;
+    Some(serde_json::json!({"x":x,"y":y,"width":width,"height":height}))
+}
+
 /// An override is either the exact complete derived file, or absent. Slice at
 /// the I/O boundary so arbitrary partial reads use the same length as HTTPFS.
 pub fn overridden(path: &str) -> Option<&'static [u8]> {

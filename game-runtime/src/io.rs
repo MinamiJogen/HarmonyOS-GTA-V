@@ -2,13 +2,16 @@
 // Constantin Clerc (c22dev) - 0.1
 
 use crate::mem_base_len;
-use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 use wasmtime::SharedMemory;
+
+#[path = "io_handle_cache.rs"]
+mod handle_cache;
+use handle_cache::{EvictionPolicy, HandleCache};
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 const MAX_OPEN: usize = 1024;
@@ -43,7 +46,13 @@ pub fn start(mem: &SharedMemory, table: u64) {
 fn serve_loop(mem: SharedMemory, table: u64) {
     let files = manifest_files();
     let root = data_dir();
-    let mut handles: HashMap<i32, File> = HashMap::new();
+    let policy = if std::env::var_os("MUGUET_IO_HANDLE_LRU").is_some_and(|value| value == "1") {
+        EvictionPolicy::Lru
+    } else {
+        EvictionPolicy::ClearAll
+    };
+    let mut handles = HandleCache::new(MAX_OPEN, policy);
+    eprintln!("[io] handle-cache policy={policy:?} capacity={MAX_OPEN}");
     let mut served: u64 = 0;
     let mut bytes: u64 = 0;
     loop {
@@ -92,20 +101,21 @@ fn serve_loop(mem: SharedMemory, table: u64) {
                             continue;
                         }
 
-                        if !handles.contains_key(&id) {
-                            if handles.len() >= MAX_OPEN { handles.clear(); }
-                            match File::open(root.join(path)) {
-                                Ok(f) => { handles.insert(id, f); }
-                                Err(e) => eprintln!("[io] open {path}: {e}"),
+                        let f = match handles.get_or_try_insert_with_resource_retry(id, || File::open(root.join(path)), |error| {
+                            let pressure = matches!(error.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE));
+                            if pressure { eprintln!("[io] open {path}: descriptor pressure; evict one LRU handle and retry once"); }
+                            pressure
+                        }) {
+                            Ok(file) => file,
+                            Err(error) => {
+                                eprintln!("[io] open {path}: {error}");
+                                atomic_i32(&mem, w + 28).store(-1, Ordering::SeqCst);
+                                atomic_i32(&mem, w).store(2, Ordering::SeqCst);
+                                let _ = mem.atomic_notify(w, 1);
+                                continue;
                             }
-                        }
-                        let (base, mlen) = mem_base_len(&mem);
-                        let Some(f) = handles.get(&id) else {
-                            atomic_i32(&mem, w + 28).store(-1, Ordering::SeqCst);
-                            atomic_i32(&mem, w).store(2, Ordering::SeqCst);
-                            let _ = mem.atomic_notify(w, 1);
-                            continue;
                         };
+                        let (base, mlen) = mem_base_len(&mem);
                         if let Some(range) = crate::host_memory::span(mlen, dst, len, 1, "io.file_destination") {
                             crate::heapcheck::note(dst, len, "file read");
                             let buf = unsafe { std::slice::from_raw_parts_mut(base.add(range.start), range.len()) };
@@ -123,6 +133,7 @@ fn serve_loop(mem: SharedMemory, table: u64) {
             if result > 0 { bytes += result as u64; }
             if served % 2000 == 0 {
                 eprintln!("[io] {served} reads, {} MB", bytes >> 20);
+                eprintln!("[io] handle-cache policy={policy:?} capacity={MAX_OPEN} stats={:?}", handles.stats());
             }
             atomic_i32(&mem, w + 28).store(result as i32, Ordering::SeqCst);
             atomic_i32(&mem, w).store(2, Ordering::SeqCst);

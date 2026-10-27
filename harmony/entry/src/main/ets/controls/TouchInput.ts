@@ -17,11 +17,13 @@ interface TouchInputOwner {
   nextWheelAt: number;
   value: number;
   group: number;
+  lookAxis?: string;
+  lookStep?: number;
 }
+export const TOUCH_MOUSE_REPEAT_MS: number = 100;
 export function clampTouch(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
 }
-export interface TouchVector { x: number; y: number; }
 /** Active points are authoritative during Move; edge events identify changed contacts. */
 export function touchEventPoints<T>(moving: boolean, changed: T[], active: T[]): T[] {
   if (moving && active.length > 0) { return active; }
@@ -48,18 +50,36 @@ export class TouchMoveTraceGate {
     return this.capture;
   }
 }
-export function joystickVector(dx: number, dy: number, radius: number = 64): TouchVector {
-  const magnitude: number = Math.sqrt(dx * dx + dy * dy) / radius;
-  if (magnitude <= 0.18) { return { x: 0, y: 0 }; }
-  const strength: number = Math.pow((Math.min(1, magnitude) - 0.18) / 0.82, 1.35);
-  return { x: dx / (magnitude * radius) * strength, y: dy / (magnitude * radius) * strength };
-}
+export interface TouchButtonContact { id: number; target: string; owner: string; epoch: number; startedAt: number; }
 
-export function taskJoystickVector(dx: number, dy: number, radius: number = 64): TouchVector {
-  const magnitude: number = Math.sqrt(dx * dx + dy * dy) / radius;
-  if (magnitude <= 0.12) { return { x: 0, y: 0 }; }
-  const strength: number = (Math.min(1, magnitude) - 0.12) / 0.88;
-  return { x: dx / (magnitude * radius) * strength, y: dy / (magnitude * radius) * strength };
+/** Button contacts begin only on Down. Multiple fingers may hold one target;
+ * ending one contact never releases another still-active contact or button. */
+export class TouchButtonTracker {
+  private contacts: TouchButtonContact[] = [];
+  contains(id: number): boolean { return this.contacts.some((c: TouchButtonContact): boolean => c.id === id); }
+  begin(target: string, id: number, epoch: number, timestamp: number = 0): TouchButtonContact | undefined {
+    if (this.contains(id)) { return undefined; }
+    const contact: TouchButtonContact = { id: id, target: target, owner: `button:${target}:${id}`,
+      epoch: epoch, startedAt: timestamp };
+    this.contacts.push(contact);
+    return contact;
+  }
+  current(target: string, id: number, epoch: number): TouchButtonContact | undefined {
+    return this.contacts.find((c: TouchButtonContact): boolean => c.target === target && c.id === id && c.epoch === epoch);
+  }
+  end(target: string, ending: boolean, cancelled: boolean, changed: TouchPointIdentity[],
+    active: TouchPointIdentity[], timestamp: number = Number.POSITIVE_INFINITY): TouchButtonContact[] {
+    if (!ending && !cancelled) { return []; }
+    const ended: TouchButtonContact[] = this.contacts.filter((c: TouchButtonContact): boolean => {
+      if (c.target !== target || timestamp < c.startedAt) { return false; }
+      if (cancelled) { return true; }
+      return changed.some((p: TouchPointIdentity): boolean => p.id === c.id) ||
+        !active.some((p: TouchPointIdentity): boolean => p.id === c.id);
+    });
+    this.contacts = this.contacts.filter((c: TouchButtonContact): boolean => ended.indexOf(c) < 0);
+    return ended;
+  }
+  reset(): void { this.contacts = []; }
 }
 
 export class TouchInputController {
@@ -67,6 +87,7 @@ export class TouchInputController {
   private owners: TouchInputOwner[] = [];
   private epoch: number = 0;
   private serial: number = 0;
+  private nextLookAt: number = 0;
   constructor(sink: TouchInputSink) { this.sink = sink; }
   getEpoch(): number { return this.epoch; }
   private existing(id: string): number {
@@ -124,11 +145,45 @@ export class TouchInputController {
     if (!accepted) { this.release(id); }
     return accepted;
   }
+  pressLookDirection(id: string, binding: string, axis: string, sign: number,
+    step: number = 6, wallMs: number = Date.now()): boolean {
+    if ((axis !== 'x' && axis !== 'y') || (sign !== -1 && sign !== 1) || !Number.isFinite(step) || step <= 0) { return false; }
+    if (this.existing(id) >= 0) { return true; }
+    this.owners.push({ id: id, binding: binding, control: '', rawKey: '', mouseButton: -1,
+      wheel: 0, nextWheelAt: 0, value: sign, group: 0, lookAxis: axis, lookStep: Math.min(24, step) });
+    this.repeatLookDirections(wallMs);
+    return true;
+  }
+  private repeatLookDirections(wallMs: number): void {
+    if (wallMs < this.nextLookAt) { return; }
+    let negativeX: boolean = false; let positiveX: boolean = false;
+    let negativeY: boolean = false; let positiveY: boolean = false;
+    let maxX: number = 0; let maxY: number = 0;
+    for (const owner of this.owners) {
+      const step: number = owner.lookStep || 0;
+      if (owner.lookAxis === 'x') {
+        if (owner.value < 0) { negativeX = true; } else { positiveX = true; }
+        maxX = Math.max(maxX, step);
+      }
+      if (owner.lookAxis === 'y') {
+        if (owner.value < 0) { negativeY = true; } else { positiveY = true; }
+        maxY = Math.max(maxY, step);
+      }
+    }
+    if (maxX === 0 && maxY === 0) { return; }
+    // Opposite directions cancel. Multiple fingers cannot multiply movement,
+    // and a delayed UI tick emits only one bounded step, never a catch-up burst.
+    this.nextLookAt = wallMs + TOUCH_MOUSE_REPEAT_MS;
+    const x: number = ((positiveX ? 1 : 0) - (negativeX ? 1 : 0)) * maxX;
+    const y: number = ((positiveY ? 1 : 0) - (negativeY ? 1 : 0)) * maxY;
+    if (x !== 0 || y !== 0) { this.sink.look(0, 0, x, y, true); }
+  }
   tick(wallMs: number): void {
     for (let i = 0; i < this.owners.length; i++) {
       const owner: TouchInputOwner = this.owners[i];
       if (owner.wheel !== 0 && wallMs >= owner.nextWheelAt) { this.sink.wheel(owner.wheel); owner.nextWheelAt = wallMs + 120; }
     }
+    this.repeatLookDirections(wallMs);
   }
   release(id: string): void {
     const ids: string[] = this.owners.filter((owner: TouchInputOwner): boolean => owner.id === id || owner.id.indexOf(`${id}:`) === 0).map((owner: TouchInputOwner): string => owner.id);
@@ -140,6 +195,7 @@ export class TouchInputController {
       if (old.mouseButton >= 0) { this.sink.mouse(old.mouseButton, false, `touch:${this.epoch}:${old.id}`); }
       if (old.control.length > 0) { this.sink.control(old.control, this.aggregate(old.control, old.group), old.group); }
     }
+    if (!this.owners.some((owner: TouchInputOwner): boolean => owner.lookAxis !== undefined)) { this.nextLookAt = 0; }
   }
   retainBindings(bindings: string[]): void {
     const releaseIds: string[] = [];

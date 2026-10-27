@@ -136,7 +136,8 @@ export function applyGameQuality(filesDir: string, selection: GameQualitySelecti
   config['texture_quality'] = selection.preset === 'low' ? 0 : (selection.preset === 'high' ? 2 : 1);
   config['no_msaa'] = true;
   config['scale'] = 1.0;
-  config['fps_limit'] = 24;
+  // Native source frames follow engine readiness; FG must not impose a source cap.
+  config['fps_limit'] = 0;
   config['spatial_upscale_mode'] = 'native_quality';
   config['spatial_upscale_match_display'] = true;
   config['spatial_upscale_native_short_edge'] = 800;

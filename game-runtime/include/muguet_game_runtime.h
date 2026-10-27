@@ -39,6 +39,17 @@ bool mg_game_raw_key(const char* name,bool pressed,const char* source);
 void mg_game_mouse_button_source(uint32_t button,bool pressed,const char* source);
 void mg_game_release_inputs(void);
 void mg_game_release_semantic_inputs(void);
+/* Native HarmonyOS adaptation of Five Star Port's complete engine ioPad sample.
+ * UI publication is atomic; only the guest's ioPad update hook writes game memory. */
+bool mg_game_virtual_pad(uint32_t buttons,float lx,float ly,float rx,float ry,float lt,float rt,bool active);
+const char* mg_game_virtual_pad_state_json(void);
+void mg_game_release_virtual_pad(void);
+void mg_game_virtual_radio(float x,float y,bool active);
+void mg_game_camera_swipe(float x,float y);
+void mg_game_virtual_mouse_mode(bool active);
+void mg_game_virtual_pause(void);
+void mg_game_next_aircraft_weapon(void);
+bool mg_game_virtual_targeting_mode(int32_t mode);
 /* Synchronous diagnostic worker call. Copy the returned thread-local JSON before
  * another call on the same thread. Does not start the game or create a surface. */
 const char* mg_wgpu_atlas_probe_json(const char* files_dir,uint32_t iterations);

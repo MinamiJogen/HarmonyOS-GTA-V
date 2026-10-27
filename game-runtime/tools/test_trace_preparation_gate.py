@@ -36,7 +36,12 @@ source = r'''
 extern crate alloc;
 use ash::vk;
 use ash::vk::Handle;
-use std::{collections::HashMap,sync::{Arc,Mutex,atomic::{AtomicU64,Ordering}}};
+use std::{collections::HashMap,rc::Rc,sync::{Arc,Mutex,atomic::{AtomicU64,Ordering}}};
+#[path="__INLINE_UPLOAD_PATH__"] mod inline_upload;
+enum CpuMetric {Upload}
+mod cpu_profile {pub fn span(_:super::CpuMetric){}}
+trait PublishedBytes {unsafe fn published_inline_bytes(&self,at:u64,n:u64)->&[u8];}
+impl PublishedBytes for Vec<u8> {unsafe fn published_inline_bytes(&self,at:u64,n:u64)->&[u8]{&self[at as usize..(at+n)as usize]}}
 static FORMATS:AtomicU64=AtomicU64::new(0);
 #[derive(Clone,Copy)] struct Number(u64);
 impl std::fmt::Display for Number {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{FORMATS.fetch_add(1,Ordering::Relaxed);self.0.fmt(f)}}
@@ -51,14 +56,15 @@ impl Backing {fn lock(&self)->&Allocation{self.locks.fetch_add(1,Ordering::Relax
 struct Queue {events:Arc<Mutex<Vec<Event>>>}
 impl Queue {fn write_buffer(&self,b:&Buffer,off:u64,data:&[u8]){self.events.lock().unwrap().push(Event::Upload(b.raw.as_raw(),off,data.to_vec()));}}
 struct Buf {gpu:Option<Buffer>,bytes:u64,shadow:Option<Vec<u8>>,version:u32}
-struct Gpu {memory:Vec<u8>,buffers:HashMap<u32,Buf>,queue:Queue,presents:Number,submits:Number,enc_epoch:Number}
+struct Gpu {memory:Vec<u8>,buffers:HashMap<u32,Buf>,queue:Queue,presents:Number,submits:Number,enc_epoch:Number,
+ upload_trace_path:Option<std::ffi::OsString>,shared_reader:Rc<Vec<u8>>,inline_upload_borrow:bool,inline_upload_counters:inline_upload::Counters}
 impl Gpu {
  fn bytes(&self,a:u64,n:u64)->&[u8]{&self.memory[a as usize..(a+n)as usize]}
  fn used(&self,_:u32)->bool{true}
  fn buf_mut(&mut self,id:u32)->Option<&mut Buf>{self.buffers.get_mut(&id)}
  fn flush(&mut self){self.queue.events.lock().unwrap().push(Event::Flush);}
  fn upload_before(&mut self,id:u32,offset:u64,size:u64,data_addr:u64,no_overwrite:bool){UPLOAD_BEFORE}
- fn upload_after(&mut self,id:u32,offset:u64,size:u64,data_addr:u64,no_overwrite:bool){UPLOAD_AFTER}
+ fn upload_after(&mut self,id:u32,offset:u64,size:u64,data_addr:u64,no_overwrite:bool){let inline_command=None;UPLOAD_AFTER}
 }
 static COPY_TRACE_COUNTS:Mutex<Vec<(u64,u64,u64)>>=Mutex::new(Vec::new());
 static COPY_TRACE_SEQUENCE:AtomicU64=AtomicU64::new(0);
@@ -86,7 +92,8 @@ fn pipeline_trace_thread_dir()->Option<std::path::PathBuf>{PIPELINE_DIR}
 fn pipeline_trace_begin(kind:&str,label:Label<'_>,config:impl FnOnce()->String)->Option<(std::path::PathBuf,String)>{PIPELINE_BEGIN}
 fn pipeline_trace_end(trace:&Option<(std::path::PathBuf,String)>,result:impl FnOnce()->String){PIPELINE_END}
 fn make_buffer(raw:u64)->(Buffer,Arc<AtomicU64>){let locks=Arc::new(AtomicU64::new(0));(Buffer{raw:vk::Buffer::from_raw(raw),size:128,usage:Number(3),ownership:BufferOwnership::Managed(Backing{allocation:Allocation{memory:vk::DeviceMemory::from_raw(66),offset:256,size:128},locks:locks.clone()})},locks)}
-fn gpu()->Gpu{let(b,_)=make_buffer(19);Gpu{memory:(0..128).collect(),buffers:HashMap::from([(1,Buf{gpu:Some(b),bytes:128,shadow:Some(vec![0;128]),version:0}),(2,Buf{gpu:None,bytes:0,shadow:Some(vec![0;128]),version:0})]),queue:Queue{events:Arc::new(Mutex::new(Vec::new()))},presents:Number(12),submits:Number(34),enc_epoch:Number(56)}}
+fn gpu()->Gpu{let(b,_)=make_buffer(19);Gpu{memory:(0..128).collect(),buffers:HashMap::from([(1,Buf{gpu:Some(b),bytes:128,shadow:Some(vec![0;128]),version:0}),(2,Buf{gpu:None,bytes:0,shadow:Some(vec![0;128]),version:0})]),queue:Queue{events:Arc::new(Mutex::new(Vec::new()))},presents:Number(12),submits:Number(34),enc_epoch:Number(56),
+ upload_trace_path:std::env::var_os("MUGUET_GPU_UPLOAD_TRACE"),shared_reader:Rc::new((0..128).collect()),inline_upload_borrow:false,inline_upload_counters:Default::default()}}
 fn encoder()->Encoder{Encoder{raw:vk::CommandPool::from_raw(10),active:vk::CommandBuffer::from_raw(11),pool_generation:2,device:Device{raw:Raw{events:Arc::new(Mutex::new(Vec::new()))}},submit_trace:None}}
 fn directory()->std::path::PathBuf{let p=std::env::temp_dir().join(format!("mg-trace-gate-{}",std::process::id()));std::fs::create_dir_all(&p).unwrap();p}
 fn region()->BufferCopy{BufferCopy{src_offset:4,dst_offset:12,size:std::num::NonZeroU64::new(8).unwrap()}}
@@ -137,6 +144,7 @@ fn region()->BufferCopy{BufferCopy{src_offset:4,dst_offset:12,size:std::num::Non
  pipeline_trace_end(&trace,||{calls.set(calls.get()+1);"Ok([nativePipeline])".into()});assert_eq!(calls.get(),2);let text=std::fs::read_to_string(dir.join("last-pipeline.txt")).unwrap();assert!(text.contains("phase=after"));assert!(text.contains("label=label"));assert!(text.contains("result=Ok([nativePipeline])"));std::fs::remove_dir_all(dir).unwrap();
 }
 '''
+source = source.replace('__INLINE_UPLOAD_PATH__', str(root / 'src/inline_upload.rs'))
 for key in ['before', 'after']:
     source = source.replace('UPLOAD_' + key.upper(), body(locals()[key]['gpu'], 'fn upload_buffer('))
     source = source.replace('COPY_' + key.upper(), body(locals()[key]['command'], 'unsafe fn copy_buffer_to_buffer<T>'))

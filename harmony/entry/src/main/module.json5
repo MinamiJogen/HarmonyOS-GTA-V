@@ -11,6 +11,10 @@
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
+    "requestPermissions": [
+      { "name": "ohos.permission.VIBRATE" },
+      { "name": "ohos.permission.GYROSCOPE" }
+    ],
     "metadata": [
       { "name": "ohos.arkui.UIMaterial.state", "value": "enable" }
     ],
@@ -19,7 +23,7 @@
         "name": "EntryAbility",
         "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:module_desc",
-        "icon": "$media:app_icon_gta5",
+        "icon": "$media:app_icon_gta5_layered",
         "label": "$string:app_name",
         "startWindowIcon": "$media:app_icon_gta5",
         "startWindowBackground": "$color:start_window_background",
@@ -39,7 +43,7 @@
         "name": "GraphicsFrameProbeAbility",
         "srcEntry": "./ets/graphicsframeprobe/GraphicsFrameProbeAbility.ets",
         "description": "$string:module_desc",
-        "icon": "$media:app_icon_gta5",
+        "icon": "$media:app_icon_gta5_layered",
         "label": "$string:app_name",
         "startWindowIcon": "$media:app_icon_gta5",
         "startWindowBackground": "$color:start_window_background",
