@@ -76,6 +76,8 @@ ArkTS 界面通过 C++ / Node-API 连接 Rust 运行时。运行时提供文件�
 
 本项目的思路灵感来源于 **[c22dev/muguet](https://github.com/c22dev/muguet)**，同时移植和修改了其运行时代码，并非仅参考概念。所用上游基线为 [`1a0300d3cfc5f87ce2fa1ccb365c013e5238e322`](https://github.com/c22dev/muguet/tree/1a0300d3cfc5f87ce2fa1ccb365c013e5238e322)。感谢原作者 Constantin Clerc（c22dev）及上游贡献者。
 
+触控按键布局与输入方案参考并改编自 **[Five Star Port（kevinerikjs/gta5-ios-port）](https://github.com/kevinerikjs/gta5-ios-port)**，所用参考基线为 [`8e2e462`](https://github.com/kevinerikjs/gta5-ios-port/tree/8e2e46281159d09005fea4748b5b9926e919fc0a)。感谢原作者及贡献者，相关 [MIT 许可证](upstream/fivestar-input-8e2e4628/LICENSE)已保留。
+
 相对于上游，本项目主要增加了 HarmonyOS 应用壳、签名 AOT 的链接与加载、Vulkan 窗口、OHAudio、输入与生命周期适配，以及针对华为设备的渲染优化和空间超分支持。
 
 ## 开源协议
